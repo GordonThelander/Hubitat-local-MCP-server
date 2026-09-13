@@ -752,6 +752,19 @@ def test_nested_non_map_parameter_shadows_a_typed_map_local():
     assert [f["line"] for f in sandbox_map_findings(source)] == [4]
 
 
+def test_alias_inference_uses_the_visible_shadowing_binding():
+    source = """@groovy.transform.Field Map CACHE = [:]
+def update(String key, List items) {
+ items.each { List CACHE ->
+  def alias = CACHE
+  alias[key] = 1
+ }
+ def alias = CACHE
+ alias[key] = 2
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [8]
+
+
 def test_map_property_is_not_an_alias_of_the_containing_map():
     source = """def update(int index) {
  def envelope = [ids: [1, 2]]

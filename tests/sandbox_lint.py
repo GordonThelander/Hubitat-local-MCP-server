@@ -5127,15 +5127,7 @@ def check_sandbox_map_subscripts(
             raw_body = source[opening + 1:end]
             explicit_maps = set(map_decl.findall(params))
             explicit_maps.update(map_decl.findall(body))
-            # Locals and parameters can shadow a typed script field. The
-            # field's type must not exempt accesses on the shadowing receiver.
-            shadowed = set(re.findall(
-                rf"\b(?:def|{ident}(?:<[^{{}};=]+>)?)\s+({ident})\s*(?==|;)", body
-            ))
-            shadowed.update(re.findall(
-                rf"\b({ident})\s*(?:=[^,]*)?(?=,|$)", params
-            ))
-            explicit_maps.update(field_maps - shadowed)
+            explicit_maps.update(field_maps)
             returns = map_returns[return_scope(path)]
             maps = explicit_maps | inferred_maps(params, body, returns)
             # Groovy scope, not method-wide membership: a declaration (typed
@@ -5160,29 +5152,54 @@ def check_sandbox_map_subscripts(
                         return site, max(enclosing)[1]
                 return site, len(body)
 
-            always = set(map_decl.findall(params)) | (field_maps - shadowed)
-            typed_sites = [(m.group(1), *visible_range(m.start(), True)) for m in map_decl.finditer(body)]
+            # Resolve the nearest visible declaration at each access. A later
+            # local cannot hide an earlier field use, and a closure parameter
+            # shadows the field only until that closure ends.
+            bindings = []
+            parameter_re = re.compile(rf"\b({ident})\s*(?:=[^,]*)?(?=,|$)")
+            typed_params = set(map_decl.findall(params))
+            bindings.extend((m[1], -1, len(body), m[1] in typed_params)
+                            for m in parameter_re.finditer(params))
+            local_re = re.compile(
+                rf"\b(?P<type>(?!(?:return|throw|new|case|else)\b){ident}(?:<[^{{}};=]+?>)?(?:\[\])?)"
+                rf"\s+(?P<name>{ident})\s*(?==|;|\n|\}})"
+            )
+            for declaration in local_re.finditer(body):
+                site = declaration.start("name")
+                bindings.append((declaration["name"], *visible_range(site, True),
+                                 bool(re.fullmatch(map_type, declaration["type"]))))
+            for closure in re.finditer(r"\{\s*([^{}]*?)->", body):
+                closure_params = closure[1]
+                typed = set(map_decl.findall(closure_params))
+                bindings.extend((m[1], closure.start(), close_brace(body, closure.start()), m[1] in typed)
+                                for m in parameter_re.finditer(closure_params))
+
+            def binding_at(receiver: str, pos: int, *, bindings=bindings):
+                return max((binding for binding in bindings
+                            if binding[0] == receiver and binding[1] <= pos < binding[2]),
+                           key=lambda binding: binding[1], default=None)
+
             inferred_sites = [(m.group(1), *visible_range(m.start(), False)) for m in checked_map.finditer(body)]
             for regex in (conditional_map, fallback_map, cast_map):
                 inferred_sites.extend(
                     (m.group(1), *visible_range(m.start(), declared(m.start())))
                     for m in regex.finditer(body)
                 )
-            inferred_sites.extend(
-                (dest, *visible_range(start, declared(start)))
-                for dest, expression, start in assignment_records(body)
-                if is_map_expression(expression, maps, returns)
-            )
-
-            def explicit_at(receiver: str, pos: int, *, always=always, typed_sites=typed_sites) -> bool:
-                return receiver in always or any(
-                    name == receiver and start < pos < stop for name, start, stop in typed_sites
-                )
+            def explicit_at(receiver: str, pos: int, *, field_maps=field_maps) -> bool:
+                binding = binding_at(receiver, pos)
+                return binding[3] if binding is not None else receiver in field_maps
 
             def map_at(receiver: str, pos: int, *, inferred_sites=inferred_sites) -> bool:
                 return explicit_at(receiver, pos) or any(
-                    name == receiver and start < pos < stop for name, start, stop in inferred_sites
+                    name == receiver and start < pos < stop
+                    and binding_at(receiver, start) == binding_at(receiver, pos)
+                    for name, start, stop in inferred_sites
                 )
+
+            for dest, expression, start in assignment_records(body):
+                visible_maps = {name for name in maps if map_at(name, start)}
+                if is_map_expression(expression, visible_maps, returns):
+                    inferred_sites.append((dest, *visible_range(start, declared(start))))
 
             bounded = []
             # A literal list is a finite key set, but only if its actual values

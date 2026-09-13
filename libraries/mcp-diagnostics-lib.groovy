@@ -375,7 +375,7 @@ private Map _hubReadSnapshot(Map query, Map args, Map deviceRead) {
             // Retention outlasts those HTTP deadlines; it is not a worker cancellation timer.
             long pendingTtl = value.work?.tool == "hub_get_device_health" ? 240000L : 90000L
             long ttl = value.pending == true ? pendingTtl : 30000L
-            now() - (value.at as Long) >= ttl
+            now() - (value.at as Long) >= ttl && ((value.readers ?: 0) as Integer) == 0
         }.collect { it.key }.each { NATIVE_LOG_SNAPSHOTS.remove(it) }
         if (deviceRead != null) {
             def current = NATIVE_LOG_SNAPSHOTS[key]

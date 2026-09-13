@@ -3463,7 +3463,7 @@ def _mrtrRecentOperations(int limit = 10) {
         if (status == "terminal" && rec.terminalResult instanceof Map) {
             Map result = rec.terminalResult as Map
             ["success", "appId", "ruleId", "newAppId", "deviceId", "driverId", "error"].each {
-                if (result.containsKey(it)) row[it] = result[it]
+                if (result.containsKey(it)) row.put(it, result.get(it))
             }
             if (result.device instanceof Map && result.device.id != null) row.deviceId = result.device.id
         }

@@ -7864,6 +7864,12 @@ class TestRunner:
             )
             replay_text = next(item["text"] for item in replay.get("content", []) if item.get("type") == "text")
             assert json.loads(replay_text) == result, "terminal replay changed the public mutation result"
+            info = self.client.call_tool("hub_get_info", {})
+            recent = [row for row in info.get("recentWrites", [])
+                      if row.get("tool") == "hub_set_rule" and str(row.get("appId")) == str(app_id)]
+            assert recent and recent[0].get("status") == "finished" and recent[0].get("success") is True, (
+                f"completed MRTR rule edit missing from recentWrites: {info.get('recentWrites')}"
+            )
             # Independent persisted-state proof, deliberately after the measured
             # logical call and through the ordinary repository client's read gateway.
             config = self.client.call_tool("hub_read_apps_code", {
