@@ -235,6 +235,8 @@ def toolGetHubInfo(args = null) {
         }
     }
 
+    // A client that saw only a generic error for a write can learn here whether it ran.
+    info.recentWrites = _mrtrRecentOperations()
     return info
 }
 

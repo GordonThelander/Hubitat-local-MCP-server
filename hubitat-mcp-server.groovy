@@ -1290,7 +1290,7 @@ def handleNotification(msg) {
 // body, while the hub keeps running the write. Shipped in server instructions and, in
 // gateway mode, on every continuation-eligible write surface so the model reads it first.
 def _mrtrClientErrorHint() {
-    return "If a write returns a client-side error with no result body, the hub may still be running it or may already have finished it. Read the target before repeating the call: a repeat is only safe when the target shows the change did not land, because repeating a finished write performs it again. See hub_get_tool_guide(section='slow_ops')."
+    return "If a write returns a client-side error with no result body, the hub is still running it or has already finished it. Wait about 15 seconds, then call hub_get_info and check recentWrites for that tool (running, paused_resuming, finished, finished_with_error). Read the target before repeating the call: a repeat is only safe when the write shows as failed or absent and the target shows the change did not land, because repeating a finished write performs it again. See hub_get_tool_guide(section='slow_ops')."
 }
 
 def serverInstructions() {
@@ -2273,6 +2273,19 @@ private def _mrtrLeafArguments(String outerTool, String leafTool, Map outerArgs)
     return null
 }
 
+// The arguments a clone/import continuation keeps: the original call minus this round's
+// budget clock and minus the import payload, at both the gateway and the leaf level.
+private Map _mrtrCheckpointArguments(Map executionArgs) {
+    Map next = _mrtrCopyMap(executionArgs ?: [:])
+    ["__reqT0", "jsonContent"].each { next.remove(it) }
+    if (next.args instanceof Map) {
+        Map leaf = _mrtrCopyMap(next.args as Map)
+        ["__reqT0", "jsonContent"].each { leaf.remove(it) }
+        next.args = leaf
+    }
+    return next
+}
+
 private Map _mrtrWithLeafArguments(Map rec, Map outerArgs, Map nextLeafArgs) {
     if (rec.outerTool?.toString() == rec.leafTool?.toString()) return nextLeafArgs
     def next = _mrtrCopyMap(outerArgs)
@@ -2909,11 +2922,11 @@ private Map _mrtrContinuation(String leafTool, Map executionArgs, result, Map re
     if (result.__mrtrContinue instanceof Map) {
         return [kind: result.__mrtrContinue.kind,
                 checkpoint: result.__mrtrContinue.checkpoint,
-                // Clone/import checkpoints contain everything needed for their next
-                // bounded phase. Do not duplicate the original (potentially very
-                // large) import JSON into atomicState; the client already resends the
-                // exact original arguments with requestState on every MRTR request.
-                nextArguments: null]
+                // Every phase after the first reads only the checkpoint, so the stored
+                // arguments exist to let the server run the next phase itself when no
+                // client request does. The (potentially very large) import JSON is
+                // dropped: it is consumed by the first phase and never read again.
+                nextArguments: _mrtrCheckpointArguments(executionArgs)]
     }
     def leafArgs = _mrtrLeafArguments(rec.outerTool?.toString(), rec.leafTool?.toString(), executionArgs)
     if (!(leafArgs instanceof Map)) return null
@@ -3423,13 +3436,50 @@ private void _mrtrNoteIfUnstorable(Map result, boolean stored) {
 
 def _mrtrAutoContinueDelaySeconds() { 5 }
 
+// What a client that could not render a continuation most needs to know: whether its
+// write is still running, waiting for the server's own continuation, finished, or failed.
+// Records outlive completion by ten minutes, so this covers the recent past, newest first.
+def _mrtrRecentOperations(int limit = 10) {
+    Map stored
+    synchronized (WRITE_RESERVATION_LOCK) { stored = [:] + _writeStateMapLocked("mrtrRequests") }
+    Set writes = _mrtrWriteTools()
+    List rows = []
+    stored.each { k, v ->
+        if (!(v instanceof Map)) return
+        Map rec = v as Map
+        String leaf = rec.leafTool?.toString()
+        if (!writes.contains(leaf)) return
+        String status = rec.status?.toString()
+        String phase
+        if (status == "terminal") {
+            phase = rec.terminalIsError == true ? "finished_with_error" : "finished"
+        } else if (status == "active") {
+            phase = (rec.claimId != null) ? "running" : "paused_resuming"
+        } else {
+            phase = status ?: "unknown"
+        }
+        Map row = [tool: leaf, status: phase, startedAt: rec.startedAt,
+                   updatedAt: rec.updatedAt ?: rec.startedAt, slices: (rec.rounds ?: 0)]
+        if (status == "terminal" && rec.terminalResult instanceof Map) {
+            Map result = rec.terminalResult as Map
+            ["success", "appId", "ruleId", "newAppId", "deviceId", "driverId", "error"].each {
+                if (result.containsKey(it)) row[it] = result[it]
+            }
+            if (result.device instanceof Map && result.device.id != null) row.deviceId = result.device.id
+        }
+        rows << row
+    }
+    rows.sort { a, b -> ((b.updatedAt ?: 0L) as Long) <=> ((a.updatedAt ?: 0L) as Long) }
+    return rows.take(limit)
+}
+
 // A checkpointed slice waits for the client's next state-bearing request. The spec lets a
 // client never send one, which would leave the remainder unrun until the record expires,
 // so the server resumes the work itself once a continuing client has had time to. A
 // client request that arrives first claims the generation and this job finds nothing.
 private void _mrtrScheduleAutoContinue(String stateId, Map rec) {
-    // Clone and import checkpoints derive their remaining work from the original
-    // arguments the client resends, which are not stored; they stay client-driven.
+    // Every checkpoint stores its next arguments; a record without them is malformed and
+    // a job for it would only log that it found nothing to run.
     if (!(rec?.nextArguments instanceof Map)) return
     // runMrtrAutoContinue is a no-op unless the record is still unclaimed at this exact
     // generation, so a duplicate schedule is harmless -- which makes one bounded retry the
@@ -10360,7 +10410,7 @@ The state is bound to the original leaf tool and exact original arguments. A mis
 
 ### Worker checkpoints and limits
 
-Native bulk trigger/action edits, resumable patch batches and walk-driver steps pause between completed items after the worker target. Driver bulk installs/updates pause between drivers. Each saved checkpoint retains the untouched remainder, renews the active window, and advances the owner generation; the next original-argument request with the same state starts a fresh worker slice. If no client request resumes a checkpoint within about five seconds, the server resumes it itself and keeps going to completion or the eight-slice cap, so a client that never continues still gets the whole write; a client request that arrives later observes or replays as usual. Clone and import checkpoints are the exception: their remaining work is derived from the original arguments the client resends, so they stay client-driven. Every state-only reply, every background completion and every paused write that expires unresumed is logged in the MCP log (`hub_get_logs` with `mode="mcp"`, component `mrtr`) at info or warn, so a client-side error can be traced without enabling debug logging. Inner destructive wizard operations never receive this worker clock.
+Native bulk trigger/action edits, resumable patch batches and walk-driver steps pause between completed items after the worker target. Driver bulk installs/updates pause between drivers. Each saved checkpoint retains the untouched remainder, renews the active window, and advances the owner generation; the next original-argument request with the same state starts a fresh worker slice. If no client request resumes a checkpoint within about five seconds, the server resumes it itself and keeps going to completion or the eight-slice cap, so a client that never continues still gets the whole write; a client request that arrives later observes or replays as usual. Clone and import checkpoints resume the same way (their later phases read only the checkpoint, so the import JSON is not retained). `hub_get_info` returns `recentWrites`: the last ten continuation-eligible writes with their status (`running`, `paused_resuming`, `finished`, `finished_with_error`) and identifiers, so a client that saw only a generic error can learn what happened with one read. Every state-only reply, every background completion and every paused write that expires unresumed is logged in the MCP log (`hub_get_logs` with `mode="mcp"`, component `mrtr`) at info or warn, so a client-side error can be traced without enabling debug logging. Inner destructive wizard operations never receive this worker clock.
 
 Native creation, action replacement, individual driver operations, and patch batches containing `replaceRequiredExpression` remain uninterrupted. Splitting those operations would require additional phase or rollback state. The target is not a hard execution deadline or a guarantee of recovery from a platform kill.
 

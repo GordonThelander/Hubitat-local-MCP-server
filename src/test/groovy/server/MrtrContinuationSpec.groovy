@@ -1536,7 +1536,7 @@ class MrtrContinuationSpec extends ToolSpecBase {
         then:
         initialized.result.resultType == 'input_required'
         requestState instanceof String
-        autoContinueJobs().isEmpty()
+        autoContinueJobs().size() == 1
         atomicStateMap.mrtrRequests[requestState].checkpoint.phase == 'clone_clicks'
         atomicStateMap.mrtrRequests[requestState].checkpoint.clonerAppId == 4242
         posts.isEmpty()
@@ -1625,7 +1625,8 @@ class MrtrContinuationSpec extends ToolSpecBase {
         then:
         uploaded.result.resultType == 'input_required'
         requestState instanceof String
-        autoContinueJobs().isEmpty()
+        autoContinueJobs().size() == 1
+        !(atomicStateMap.mrtrRequests[requestState].nextArguments.toString().contains('appData'))
         atomicStateMap.mrtrRequests[requestState].checkpoint.phase == 'import_commit'
         atomicStateMap.mrtrRequests[requestState].checkpoint.clonerAppId == 4242
         uploads.size() == 1
@@ -3647,5 +3648,89 @@ class MrtrContinuationSpec extends ToolSpecBase {
         expiredLine.level == 'warn'
         expiredLine.message.toString().startsWith('hub_call_rule:')
         expiredLine.message.toString().contains('1 slice(s) had committed')
+    }
+
+    def "a clone that no client ever resumes is finished by the server's own continuation"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Source Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Source Rule'],
+                                          [id: 250, label: 'Source Rule clone']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [sourceAppId: 100, confirm: true]
+
+        when: 'the first request checkpoints; each server-side job runs the next phase'
+        def initialized = modernCall('hub_clone_native_app', args)
+        String requestState = initialized.result.requestState
+        int fired = 0
+        while (fired < 6 && autoContinueJobs().size() > fired) {
+            script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[fired][2].data as Map))
+            fired++
+        }
+        def cloneClicks = posts.findAll { it.path == '/installedapp/btn' && it.body.name == 'cloneRuleButton' }
+        def replay = modernCall('hub_clone_native_app', args, requestState)
+        def inner = mcpDriver.parseInner(replay)
+
+        then: 'the clone landed without a single state-bearing client request'
+        initialized.result.resultType == 'input_required'
+        fired >= 2
+        cloneClicks.size() == 2
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'importNow' }
+        atomicStateMap.mrtrRequests[requestState].status == 'terminal'
+        replay.result.resultType == 'complete'
+        inner.success == true
+        inner.newAppId == 250
+    }
+
+    def "hub_get_info recentWrites reports a paused, then finished, continuation write"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [97, 98], action: 'stop']
+
+        when: 'the first slice pauses'
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        List paused = script._mrtrRecentOperations() as List
+
+        then:
+        paused.size() == 1
+        paused[0].tool == 'hub_call_rule'
+        paused[0].status == 'paused_resuming'
+        paused[0].slices == 1
+
+        when: 'the server finishes it'
+        script.metaClass.toolRunRmRule = { Map a -> [success: true, ruleIds: a.ruleId, results: a.ruleId.collect { [success: true, ruleId: it] }] }
+        script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[0][2].data as Map))
+        List done = script._mrtrRecentOperations() as List
+
+        then:
+        done.size() == 1
+        done[0].status == 'finished'
+        done[0].success == true
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'terminal'
     }
 }
