@@ -3295,6 +3295,16 @@ NATIVE_WRAPPER_SELF_TEST_CASES = [
 # classify the enclosing method's name, and an app @Field Map is in scope for every library.
 MAP_SUBSCRIPT_SELF_TEST_CASES = [
     (
+        "definite Map-to-List reassignment -- must-not-catch",
+        {"libraries/x.groovy": "def read(int index) {\n def rows = [:]\n rows = []\n return rows[index]\n}\n"},
+        [],
+    ),
+    (
+        "branch Map reassignment invalidates outer List proof -- must-catch",
+        {"libraries/x.groovy": "def read(String key, boolean flag) {\n def rows = []\n if (flag) { rows = [:] }\n return rows[key]\n}\n"},
+        [("libraries/x.groovy", 4)],
+    ),
+    (
         "dynamic read on a def-declared Map -- must-catch",
         {"libraries/x.groovy": "def read(String key) {\n def m = [:]\n return m[key]\n}\n"},
         [("libraries/x.groovy", 3)],
@@ -4856,7 +4866,7 @@ def check_sandbox_map_subscripts(
         re.MULTILINE,
     )
     map_decl = re.compile(rf"\b{map_type}\s+({ident})\b")
-    assignment_re = re.compile(rf"\b({ident}(?:\.{ident})*)\s*=(?!=)\s*")
+    assignment_re = re.compile(rf"(?<![.\w?])({ident}(?:\??\.{ident})*)\s*=(?!=|~)\s*")
     checked_map = re.compile(rf"\b({ident})\s+(?:instanceof|as)\s+Map\b")
     conditional_map = re.compile(
         rf"\b({ident})\s*=\s*[^\n;]*\binstanceof\s+Map\b[^\n;]*:\s*\[:\]"
@@ -4972,6 +4982,27 @@ def check_sandbox_map_subscripts(
             opening = (constructor or call).end() - 1
             return close_delimiter(expression, opening, "(", ")") == len(expression) - 1
         return is_map_literal(expression)
+
+    def is_list_expression(expression: str) -> bool:
+        while expression.startswith("(") and close_delimiter(expression, 0, "(", ")") == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        if expression.startswith("[") and close_delimiter(expression, 0, "[", "]") == len(expression) - 1:
+            return not is_map_literal(expression)
+        constructor = re.match(
+            r"new\s+(?:java\.util\.(?:concurrent\.)?)?"
+            r"(?:ArrayList|LinkedList|CopyOnWriteArrayList)(?:\s*<[^{};=]+?>)?\s*\(", expression
+        )
+        if constructor:
+            return close_delimiter(expression, constructor.end() - 1, "(", ")") == len(expression) - 1
+        cast = re.search(r"\s+as\s+(?:java\.util\.)?List(?:\s*<[^{};=]+?>)?$", expression)
+        if cast:
+            operand = expression[:cast.start()].strip()
+            # A trailing cast in a conditional applies only to that arm. Limit
+            # proof to a simple receiver or a fully parenthesized operand.
+            return bool(re.fullmatch(rf"{ident}(?:\??\.{ident})*", operand)) or (
+                operand.startswith("(") and close_delimiter(operand, 0, "(", ")") == len(operand) - 1
+            )
+        return False
 
     def method_return_expressions(body: str) -> list[str]:
         # A return inside a closure returns from that closure, not its method.
@@ -5169,6 +5200,29 @@ def check_sandbox_map_subscripts(
             for loop in re.finditer(r"\bfor\s*\(", body):
                 header_end = close_delimiter(body, loop.end() - 1, "(", ")")
                 blocks.append((loop.start(), statement_end(body, header_end + 1)))
+            # Assignment proof must stay within the executed arm, including
+            # controls without braces. This is separate from declaration scope.
+            proof_blocks = list(blocks)
+            control_bodies = []
+            control_headers = []
+            repeat_blocks = []
+            for control in re.finditer(r"\b(?:if|for|while|switch|synchronized|catch)\s*\(", body):
+                header_end = close_delimiter(body, control.end() - 1, "(", ")")
+                control_headers.append((control.start(), header_end))
+                control_bodies.append(header_end + 1)
+                block = (control.start(), statement_end(body, header_end + 1))
+                proof_blocks.append(block)
+                if re.match(r"(?:for|while)\b", control[0]):
+                    repeat_blocks.append(block)
+            for control in re.finditer(r"\b(?:else|do|try|finally)\b", body):
+                control_bodies.append(control.end())
+                block = (control.start(), statement_end(body, control.end()))
+                proof_blocks.append(block)
+                if control[0] == "do":
+                    repeat_blocks.append(block)
+            control_braces = {site + len(body[site:]) - len(body[site:].lstrip()) for site in control_bodies}
+            closure_blocks = [block for block in brace_blocks(body) if block[0] not in control_braces]
+            repeat_blocks.extend(closure_blocks)
             declared_re = re.compile(rf"\b(?:def|{ident}(?:<[^{{}};=]+>)?)\s+$")
 
             def declared(site: int, *, body=body, declared_re=declared_re) -> bool:
@@ -5224,17 +5278,56 @@ def check_sandbox_map_subscripts(
                 binding = binding_at(receiver, pos)
                 return binding[3] if binding is not None else receiver in field_maps
 
+            assignments = list(assignment_records(body))
+            list_proofs = []
+            for dest, expression, start in assignments:
+                enclosing = [block for block in proof_blocks if block[0] < start < block[1]]
+                stop = max(enclosing)[1] if enclosing else len(body)
+                boundary = max([body.rfind(token, 0, start) + 1 for token in "\n;{"]
+                               + [site for site in control_bodies if site <= start])
+                prefix = body[boundary:start].strip()
+                standalone = (not prefix or bool(re.fullmatch(local_type + r"\s*(?:<[^{};=]+?>)?", prefix)))
+                # Newlines inside an expression do not turn a skipped operand
+                # into an unconditional statement. Headers are never proof.
+                prior = body[:boundary].rstrip()
+                standalone = standalone and not (prior and prior[-1] in "&|?:=,+-*/%(")
+                standalone = standalone and not any(left < start < right for left, right in control_headers)
+                list_proofs.append((dest.replace("?", ""), start, stop,
+                                    standalone and is_list_expression(expression)))
+
+            def list_at(receiver: str, pos: int, *, list_proofs=list_proofs,
+                        closure_blocks=closure_blocks, repeat_blocks=repeat_blocks) -> bool:
+                binding = binding_at(receiver, pos)
+                # Select the latest assignment before checking its scope: a
+                # branch-local Map assignment invalidates an earlier outer List
+                # proof, while a shadowing local writes a different binding.
+                latest = next((record for record in reversed(list_proofs)
+                               if record[0] == receiver and record[1] < pos
+                               and binding_at(receiver, record[1]) == binding), None)
+                if latest is None or pos >= latest[2] or not latest[3]:
+                    return False
+                for name, site, _, _ in list_proofs:
+                    if name != receiver or binding_at(receiver, site) != binding:
+                        continue
+                    # A captured write can run later than its source position;
+                    # an outer List proof also cannot cover a loop's next pass.
+                    if any(left < site < right and not left < pos < right for left, right in closure_blocks):
+                        return False
+                    if any(latest[1] < left < pos < right and left < site < right for left, right in repeat_blocks):
+                        return False
+                return True
+
             def map_at(receiver: str, pos: int, *, inferred_sites=inferred_sites) -> bool:
-                return explicit_at(receiver, pos) or any(
+                return explicit_at(receiver, pos) or (not list_at(receiver, pos) and any(
                     name == receiver and start < pos < stop
                     and binding_at(receiver, start) == binding_at(receiver, pos)
                     for name, start, stop in inferred_sites
-                )
+                ))
 
-            for dest, expression, start in assignment_records(body):
+            for dest, expression, start in assignments:
                 visible_maps = {name for name in maps if map_at(name, start)}
                 if is_map_expression(expression, visible_maps, returns):
-                    inferred_sites.append((dest, *visible_range(start, declared(start))))
+                    inferred_sites.append((dest.replace("?", ""), *visible_range(start, declared(start))))
 
             bounded = []
             # A literal list is a finite key set, but only if its actual values

@@ -289,6 +289,178 @@ private def ordinaryLists(List rows, int index) {
     assert sandbox_map_findings(source) == []
 
 
+@pytest.mark.parametrize("map_first", [True, False])
+def test_map_guard_resolves_receiver_type_from_latest_preceding_assignment(map_first):
+    map_phase = " rows = [:]\n rows[key] = 1\n"
+    list_phase = " rows = []\n def first = rows[key]\n"
+    source = ("def read(String key) {\n def rows\n"
+              + (map_phase + list_phase if map_first else list_phase + map_phase)
+              + " return rows\n}")
+    findings = sandbox_map_findings(source)
+    assert [f["line"] for f in findings] == [4 if map_first else 6]
+    assert "rows[key]" in findings[0]["message"]
+
+
+@pytest.mark.parametrize("list_expression", [
+    "[]", "[1, 2]", "[[id: 1]]", "[flag ? left : right]", "[entry?.label ?: fallback]",
+    "([])", "new ArrayList()", "new LinkedList<String>()", "source as List",
+    "[\n  1,\n  2\n]",
+])
+def test_map_guard_skips_a_receiver_last_assigned_a_provable_list(list_expression):
+    source = f"""def read(String key, boolean flag) {{
+ def rows = [:]
+ rows = {list_expression}
+ return rows[key]
+}}"""
+    assert sandbox_map_findings(source) == []
+
+
+@pytest.mark.parametrize("reassignment", [
+    "if (flag) { rows = [] }",
+    "rows = rows.findAll { true }",
+    "rows = flag ? [] : [:]",
+    "rows = [a: 1]",
+    "rows = ['a': 1]",
+    "rows = [(key): 1]",
+    "rows == []",
+    "other = []",
+    "result.rows = []",
+    "result?.rows = []",
+])
+def test_map_guard_keeps_map_classification_unless_a_list_is_proven(reassignment):
+    source = f"""def read(String key, boolean flag) {{
+ def rows = [:]
+ {reassignment}
+ return rows[key]
+}}"""
+    findings = sandbox_map_findings(source)
+    assert [f["line"] for f in findings] == [4]
+
+
+def test_map_guard_sibling_branch_list_does_not_cover_the_else_branch():
+    source = """def read(String key, boolean flag) {
+ def rows = [:]
+ if (flag) {
+  rows = []
+ } else {
+  rows[key] = 1
+ }
+ return rows
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [6]
+
+
+def test_map_guard_list_assigned_in_an_enclosing_block_covers_nested_subscripts():
+    source = """def read(String key, boolean flag) {
+ def rows = [:]
+ if (flag) {
+  rows = []
+  if (key) { rows[key] = 1 }
+ }
+ return rows
+}"""
+    assert sandbox_map_findings(source) == []
+
+
+def test_map_guard_list_phase_skips_literal_collision_keys():
+    source = """def read() {
+ def rows = [:]
+ rows = []
+ return rows['class']
+}"""
+    assert sandbox_map_findings(source) == []
+
+
+@pytest.mark.parametrize("reassignment", [
+    "if (flag) { rows = [:] }", "if (flag) rows = [:]",
+    "if (flag)\n  rows = [:]", "items.each { rows = [:] }",
+])
+def test_branch_assignment_invalidates_an_earlier_list_proof(reassignment):
+    source = f"""def read(boolean flag) {{
+ def rows = []
+ {reassignment}
+ return rows['class']
+}}"""
+    assert len(sandbox_map_findings(source)) == 1
+
+
+@pytest.mark.parametrize("reassignment", [
+    "if (flag) rows = []", "if (flag)\n  rows = []",
+    "if (flag) other()\n else rows = []",
+    "while (flag) rows = []", "for (item in items) rows = []",
+    "rows = new ArrayList().asMap()", "rows = [].asMap()",
+    "rows = flag ? [:] : source as List", "rows = source ?: other as List",
+    "rows =~ []",
+    "flag && (rows = [])", "flag || (rows = [])",
+    "flag &&\n  (rows = [])",
+    "if (flag || (rows = [])) { return rows[key] }",
+    "def chosen = flag ? other : (rows = [])",
+])
+def test_conditional_or_partial_list_expression_cannot_clear_map_detection(reassignment):
+    source = f"""def read(String key, boolean flag) {{
+ def rows = [:]
+ {reassignment}
+ return rows[key]
+}}"""
+    findings = sandbox_map_findings(source)
+    assert len(findings) == (2 if "return rows[key]" in reassignment else 1)
+
+
+def test_shadowed_assignment_does_not_invalidate_outer_list_proof():
+    source = """def read(int index) {
+ def rows = [:]
+ rows = []
+ items.each { def rows = [:]; rows.put('a', 1) }
+ return rows[index]
+}"""
+    assert sandbox_map_findings(source) == []
+
+
+def test_list_phase_does_not_infer_a_map_alias():
+    source = """def read(int index) {
+ def rows = [:]
+ rows = []
+ def alias = rows
+ return alias[index]
+}"""
+    assert sandbox_map_findings(source) == []
+
+
+def test_explicit_map_type_retains_its_contract_after_assignment():
+    source = """def update(String key) {
+ Map rows = [:]
+ rows = []
+ rows[key] = 1
+}"""
+    assert len(sandbox_map_findings(source)) == 1
+
+
+def test_captured_binding_cannot_assume_closure_assignment_execution_order():
+    source = """def read(String key) {
+ def rows = [:]
+ def update = { rows = [:] }
+ rows = []
+ update()
+ return rows[key]
+}"""
+    assert len(sandbox_map_findings(source)) == 1
+
+
+@pytest.mark.parametrize("reset", ["", "rows = [];"])
+@pytest.mark.parametrize("repeated", ["for (int i = 0; i < 2; i++)", "items.each"])
+def test_outer_list_proof_does_not_cover_a_loop_that_reassigns_the_binding(reset, repeated):
+    source = f"""def read() {{
+ def rows = [:]
+ rows = []
+ {repeated} {{
+  {reset}
+  println rows['class']
+  rows = [:]
+ }}
+}}"""
+    assert len(sandbox_map_findings(source)) == (0 if reset else 1)
+
+
 def test_sandbox_map_guard_catches_nested_device_catalog_copy():
     source = """
 private def copyDeviceCatalog(Map catalog) {

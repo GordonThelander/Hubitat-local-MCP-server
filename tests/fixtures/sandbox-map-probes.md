@@ -172,6 +172,15 @@ measured collision names before receiving a bounded-key exception; entire
 methods are not exempted by name. Explicitly typed Map reads follow the measured
 exception above; dynamic typed writes retain the `metaClass` hazard.
 
+For an inferred receiver, a definite standalone List reassignment ends the
+earlier Map classification at subsequent accesses in the same executed scope.
+The latest assignment is selected for that binding before checking its scope;
+a conditional reassignment cannot preserve an older List proof. List literals,
+complete List constructors, and unambiguous List casts qualify. Short-circuited
+assignments, unknown expressions, captured writes, and writes across repeated
+iterations remain conservative where execution order cannot establish a List.
+Explicit Map declarations retain their measured contract after assignment.
+
 This source scanner is not an exhaustive Groovy type checker and cannot prove
 arbitrary external helper return types or every interprocedural key constraint.
 List indexing, numeric indices, comments, strings, and bounded-key controls must
