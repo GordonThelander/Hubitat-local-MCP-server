@@ -3557,4 +3557,62 @@ class MrtrContinuationSpec extends ToolSpecBase {
         outcome.result.status == 'slow_read_timeout'
         outcome.result.note.contains('could not be retained for replay')
     }
+
+    def "a clone whose record vanishes at its first checkpoint returns a clean error, never the checkpoint"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Source Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Source Rule'],
+                                          [id: 250, label: 'Source Rule clone']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            // The cloner is being initialized, i.e. the first slice is mid-flight: sweep the
+            // durable record so the checkpoint has nowhere to go.
+            atomicStateMap.mrtrRequests = [:]
+            script._writeStateCacheInvalidate()
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [sourceAppId: 100, confirm: true]
+
+        when:
+        def response = modernCall('hub_clone_native_app', args)
+        String wire = groovy.json.JsonOutput.toJson(response)
+        def inner = mcpDriver.parseInner(response)
+
+        then: 'an unfinished operation, reported as such'
+        response.error == null
+        response.result.resultType == 'complete'
+        response.result.isError == true
+        inner.success == false
+        inner.tool == 'hub_clone_native_app'
+        inner.error.contains('clone_native_app checkpoint')
+        inner.note.contains('continuation record was lost')
+
+        and: 'no control sentinel or checkpoint internals reach the client'
+        !inner.containsKey('__mrtrContinue')
+        !wire.contains('__mrtrContinue')
+        !wire.contains('clonerAppId')
+        !wire.contains('preIds')
+    }
 }

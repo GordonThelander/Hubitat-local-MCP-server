@@ -1735,6 +1735,18 @@ def handleToolsCall(msg) {
                 orphaned.success = false
                 orphaned.isError = true
                 if (sliceResult.remainingRuleIds instanceof List) orphaned.remainingRuleIds = sliceResult.remainingRuleIds
+                // A clone/import slice hands back only its control sentinel, whose checkpoint
+                // is internal (temporary cloner app id, phase). Never serialize that; the temp
+                // app it names has no record left to finish it, so remove the app as well.
+                if (sliceResult.__mrtrContinue instanceof Map) {
+                    Map lostCheckpoint = (sliceResult.__mrtrContinue.checkpoint instanceof Map)
+                        ? sliceResult.__mrtrContinue.checkpoint as Map : null
+                    orphaned.remove("__mrtrContinue")
+                    orphaned.tool = reactiveToolName
+                    orphaned.error = "Tool error: ${reactiveToolName} paused at its ${sliceResult.__mrtrContinue.kind} " +
+                        "checkpoint and the continuation record was lost, so the operation cannot finish.".toString()
+                    if (lostCheckpoint != null) _mrtrCleanupRecord([checkpoint: lostCheckpoint])
+                }
                 lostNote += " The work after this slice did not run and will not run from this requestState; " +
                     "results record what did. Start a fresh call for only the unfinished items. " +
                     "Do not repeat the whole operation."
