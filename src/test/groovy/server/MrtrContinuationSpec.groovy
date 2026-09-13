@@ -3388,11 +3388,16 @@ class MrtrContinuationSpec extends ToolSpecBase {
         then: 'the slice outcome comes back with the loss stated, instead of a generic failure'
         response.error == null
         response.result.resultType == 'complete'
-        response.result.isError != true
         inner.results*.ruleId == [61]
         inner.note.contains('continuation record was lost')
         !inner.containsKey('rejoined')
         !(inner.error?.toString()?.startsWith('Tool error'))
+
+        and: 'the paused remainder never ran, so the operation is reported unfinished, not done'
+        response.result.isError == true
+        inner.success == false
+        inner.remainingRuleIds == [62]
+        inner.note.contains('Do not repeat the whole operation')
     }
 
     def "a validation refusal on a later slice hands back the committed ledger"() {

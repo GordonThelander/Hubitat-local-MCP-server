@@ -1584,6 +1584,7 @@ def handleToolsCall(msg) {
     String stateId = requestState?.toString()
     boolean rejoined = false
     def sliceResult = null
+    Map executionArgs = null
     long reqT0 = now()
     try {
         def binding = _mrtrBinding(toolName, reactiveToolName, args)
@@ -1669,7 +1670,7 @@ def handleToolsCall(msg) {
             return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined))
         }
 
-        Map executionArgs = (rec.nextArguments instanceof Map)
+        executionArgs = (rec.nextArguments instanceof Map)
             ? _mrtrCopyMap(rec.nextArguments as Map)
             : _mrtrCopyMap(args as Map)
         boolean detached = _mrtrDetachedWorkerTools().contains(reactiveToolName?.toString())
@@ -1725,6 +1726,19 @@ def handleToolsCall(msg) {
             def orphaned = [:] + (_mrtrAggregateTerminal(rec, sliceResult) as Map)
             String lostNote = "The operation ran, but its continuation record was lost before the result " +
                 "could be stored, so this requestState cannot replay it. Inspect the target before any follow-up."
+            // A slice that paused with work left behind is now an unfinished operation: the
+            // aggregate drops the remainder it expected the next slice to consume, so put it
+            // back and say plainly that nothing will run it.
+            Map remainder = (executionArgs instanceof Map)
+                ? _mrtrContinuation(reactiveToolName?.toString(), executionArgs, sliceResult, rec) : null
+            if (remainder != null) {
+                orphaned.success = false
+                orphaned.isError = true
+                if (sliceResult.remainingRuleIds instanceof List) orphaned.remainingRuleIds = sliceResult.remainingRuleIds
+                lostNote += " The work after this slice did not run and will not run from this requestState; " +
+                    "results record what did. Start a fresh call for only the unfinished items. " +
+                    "Do not repeat the whole operation."
+            }
             orphaned.note = ((orphaned.note ? orphaned.note + " " : "") + lostNote).toString()
             return _renderToolResult(msg.id, toolName, reactiveToolName, args,
                 _mrtrMarkRejoined(orphaned, rejoined), orphaned.isError == true)
