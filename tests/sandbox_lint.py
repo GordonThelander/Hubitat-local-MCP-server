@@ -5160,8 +5160,11 @@ def check_sandbox_map_subscripts(
             typed_params = set(map_decl.findall(params))
             bindings.extend((m[1], -1, len(body), m[1] in typed_params)
                             for m in parameter_re.finditer(params))
+            # Bare command expressions such as `println CACHE` do not declare
+            # a local. Require a type-shaped token before masking a field.
+            local_type = rf"(?:def|boolean|byte|char|double|float|int|long|short|(?:{ident}\.)*[A-Z][A-Za-z0-9_]*)"
             local_re = re.compile(
-                rf"\b(?P<type>(?!(?:return|throw|new|case|else)\b){ident}(?:<[^{{}};=]+?>)?(?:\[\])?)"
+                rf"\b(?P<type>{local_type}(?:<[^{{}};=]+?>)?(?:\[\])?)"
                 rf"\s+(?P<name>{ident})\s*(?==|;|\n|\}})"
             )
             for declaration in local_re.finditer(body):

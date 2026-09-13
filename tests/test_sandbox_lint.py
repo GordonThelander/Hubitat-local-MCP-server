@@ -765,6 +765,15 @@ def update(String key, List items) {
     assert [f["line"] for f in sandbox_map_findings(source)] == [8]
 
 
+def test_command_expression_does_not_declare_a_shadowing_local():
+    source = """@groovy.transform.Field Map CACHE = [:]
+def update(String key) {
+ println CACHE
+ CACHE[key] = 1
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [4]
+
+
 def test_map_property_is_not_an_alias_of_the_containing_map():
     source = """def update(int index) {
  def envelope = [ids: [1, 2]]
