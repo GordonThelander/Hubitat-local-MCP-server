@@ -9995,21 +9995,25 @@ def _createNativeAppShell(args) {
         // populate from a fully-loaded rule (avoids N redundant inits).
         def triggerSpecs = args?.triggers instanceof List ? (args.triggers as List) : []
         def triggerResults = []
+        // Fork patch C: the first failed or partial item stops every later mutation and finalisation.
+        String createStopAfter = null
         if (triggerSpecs) {
             triggerSpecs.eachWithIndex { spec, i ->
+                if (createStopAfter) { triggerResults << _rmBulkNotAttempted(createStopAfter); return }
                 if (!(spec instanceof Map)) {
                     triggerResults << [success: false, error: "triggers[${i}] is not a Map", spec: spec]
-                    return
+                } else {
+                    try {
+                        triggerResults << _rmAddTrigger(newId, spec as Map)
+                    } catch (Exception te) {
+                        triggerResults << [success: false, error: te.message, specCapability: spec.capability]
+                        mcpLog("warn", "rm-native", "hub_set_rule: trigger ${i} (capability=${spec.capability}) failed -- ${te.message}")
+                    }
                 }
-                try {
-                    triggerResults << _rmAddTrigger(newId, spec as Map)
-                } catch (Exception te) {
-                    triggerResults << [success: false, error: te.message, specCapability: spec.capability]
-                    mcpLog("warn", "rm-native", "hub_set_rule: trigger ${i} (capability=${spec.capability}) failed -- ${te.message}")
-                }
+                if (_rmBulkItemBlocks(triggerResults.last())) createStopAfter = "triggers[${i}]".toString()
             }
             // Re-init once after all triggers are committed.
-            _rmClickAppButton(newId, "updateRule")
+            if (!createStopAfter) _rmClickAppButton(newId, "updateRule")
         }
 
         // Optional Required Expression creation. Runs BEFORE actions: the RE
@@ -10026,7 +10030,9 @@ def _createNativeAppShell(args) {
         // re-init click is rejected rather than silently swallowing it.
         def reSpec = args?.requiredExpression instanceof Map ? (args.requiredExpression as Map) : null
         def reResult = null
-        if (reSpec != null) {
+        if (reSpec != null && createStopAfter) {
+            reResult = _rmBulkNotAttempted(createStopAfter)
+        } else if (reSpec != null) {
             try {
                 reResult = _rmAddRequiredExpression(newId, reSpec)
             } catch (Exception ree) {
@@ -10039,7 +10045,8 @@ def _createNativeAppShell(args) {
             // harmless (triggers->updateRule->actions->updateRule already fires
             // multiple per session). On failure, degrade reResult honestly so a
             // dormant RE is not reported as live.
-            if (reResult instanceof Map && reResult.success != false) {
+            if (_rmBulkItemBlocks(reResult)) createStopAfter = "requiredExpression"
+            if (reResult instanceof Map && !createStopAfter) {
                 try {
                     _rmClickAppButton(newId, "updateRule")
                 } catch (Exception reUpdExc) {
@@ -10049,6 +10056,7 @@ def _createNativeAppShell(args) {
                     reResult.partial = true
                     mcpLog("warn", "rm-native", "hub_set_rule: requiredExpression trailing updateRule click failed for app ${newId} -- expression may not be live: ${reUpdExc.message}")
                 }
+                if (_rmBulkItemBlocks(reResult)) createStopAfter = "requiredExpression"
             }
         }
 
@@ -10064,16 +10072,18 @@ def _createNativeAppShell(args) {
             // rule-targeting action is present) and thread it to each item.
             def actionsValidRuleIds = _rmSpecListTargetsRule(actionSpecs) ? _rmValidRuleIds() : null
             actionSpecs.eachWithIndex { spec, i ->
+                if (createStopAfter) { actionResults << _rmBulkNotAttempted(createStopAfter); return }
                 if (!(spec instanceof Map)) {
                     actionResults << [success: false, error: "actions[${i}] is not a Map", spec: spec]
-                    return
+                } else {
+                    try {
+                        actionResults << _rmAddAction(newId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, actionsValidRuleIds)
+                    } catch (Exception ae) {
+                        actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                        mcpLog("warn", "rm-native", "hub_set_rule: action ${i} (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                    }
                 }
-                try {
-                    actionResults << _rmAddAction(newId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, actionsValidRuleIds)
-                } catch (Exception ae) {
-                    actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                    mcpLog("warn", "rm-native", "hub_set_rule: action ${i} (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                }
+                if (_rmBulkItemBlocks(actionResults.last())) createStopAfter = "actions[${i}]".toString()
             }
             // After bulk-add, navigate selectActions → mainPage via
             // _action_previous=Done — mirrors the live UI's "Done with
@@ -10083,19 +10093,21 @@ def _createNativeAppShell(args) {
             // commit ends with a Done navigation up to mainPage before
             // updateRule fires. Without this, state.editAct can linger
             // and updateRule may fire from the wrong page state.
-            try {
-                _rmSubmitSubPageDone(newId, "selectActions", "mainPage", "name", null)
-            } catch (Exception subPageDoneExc) {
-                mcpLog("warn", "rm-native", "hub_set_rule: trailing _rmSubmitSubPageDone(selectActions->mainPage) failed for app ${newId} (${subPageDoneExc.message}) -- relying on updateRule below; lingering state.editAct markers may corrupt subsequent edits")
+            if (!createStopAfter) {
+                try {
+                    _rmSubmitSubPageDone(newId, "selectActions", "mainPage", "name", null)
+                } catch (Exception subPageDoneExc) {
+                    mcpLog("warn", "rm-native", "hub_set_rule: trailing _rmSubmitSubPageDone(selectActions->mainPage) failed for app ${newId} (${subPageDoneExc.message}) -- relying on updateRule below; lingering state.editAct markers may corrupt subsequent edits")
+                }
+                _rmClickAppButton(newId, "updateRule")
             }
-            _rmClickAppButton(newId, "updateRule")
         }
 
         // Final commit: click the Done button on mainPage. The live UI
         // ALWAYS fires this as the last step of every create/modify session
         // (verified). Without it, the rule's session-end state
         // can be incomplete and subsequent reads/edits may behave oddly.
-        def createDone = _rmSubmitMainPageDone(newId)
+        def createDone = createStopAfter ? null : _rmSubmitMainPageDone(newId)
 
         def status = _rmFetchStatusJson(newId)
         def health = _rmCheckRuleHealth(newId)
@@ -10181,6 +10193,14 @@ def _createNativeAppShell(args) {
                 result.success = false
             }
             result.repairHints = (result.repairHints ?: []) + ["The session-end mainPage Done click did not commit (${createDone.reason}). Settings are already written, but the app's update lifecycle did not run -- verify via hub_get_app_config(appId=${newId}) and re-commit via hub_set_native_app(appId=${newId}, button='updateRule') for RM-family apps.".toString()]
+        }
+        if (createStopAfter) {
+            result.success = false
+            result.partial = true
+            result.bulkStoppedAfter = createStopAfter
+            result.finalisationNotAttempted = true
+            result.note = "Created ${appType} app (id=${newId}) but stopped after ${createStopAfter} failed or was partial: later triggers, Required Expression and actions were not attempted, and the trailing updateRule and mainPage Done were not fired.".toString()
+            result.repairHints = (result.repairHints ?: []) + ["Creation stopped fail-closed after ${createStopAfter}. Inspect with hub_get_app_config(appId=${newId}); delete the incomplete rule and re-create it, or repair the failed item and add the notAttempted items, then fire hub_set_rule(button='updateRule') and re-run hub_get_rule_health.".toString()]
         }
         if (triggerSpecs) result.triggers = triggerResults
         if (actionSpecs) result.actions = actionResults
@@ -13355,6 +13375,31 @@ private _stripInternalClock(rem) {
 // not-yet-live at a pause and gating success on health would falsely fail every pause. The
 // unprocessed items are handed back (minus the internal __reqT0 clock) for the caller to
 // re-issue.
+// Fail-closed bulk contract: a failed or partial item stops every later mutation and finalisation.
+private boolean _rmBulkItemBlocks(r) {
+    return r instanceof Map && (r.success == false || r.partial == true)
+}
+
+private Map _rmBulkNotAttempted(String stoppedAfter) {
+    return [success: false, notAttempted: true, error: "not attempted: bulk stopped after ${stoppedAfter} failed or was partial".toString()]
+}
+
+private Map _rmBulkStoppedResult(Integer appId, Map backup, String stoppedAfter, Map extra) {
+    def out = [
+        success: false,
+        partial: true,
+        appId: appId,
+        backup: backup,
+        bulkStoppedAfter: stoppedAfter,
+        finalisationNotAttempted: true,
+        health: _rmCheckRuleHealth(appId),
+        repairHints: ["Stopped fail-closed after ${stoppedAfter}: later items were not attempted and the trailing updateRule was not fired. Inspect with hub_get_app_config(appId=${appId}); repair the failed item and add the notAttempted items, or roll back via hub_restore_backup(backupKey='${backup?.backupKey}'). Fire hub_set_rule(button='updateRule') only once the rule is complete.".toString()],
+        note: "Stopped after ${stoppedAfter} failed or was partial; finalisation not attempted.".toString()
+    ]
+    out.putAll(extra ?: [:])
+    return out
+}
+
 private Map _bulkPauseResult(Integer appId, Map backup, List triggerResults, List actionResults,
                                   List addTriggersRemaining, List addActionsRemaining) {
     def trigOk = triggerResults.count { it?.success != false }
@@ -13820,6 +13865,7 @@ def _applyNativeAppEdit(args) {
         // statement below.
         def removed = []
         def addedResults = []
+        String replaceStopAfter = null
         // moveAction rich return ({beforePosition, afterPosition, indicesAfter}).
         // Hoisted for the same block-scope reason as the others above.
         def moveResult = null
@@ -13938,15 +13984,18 @@ def _applyNativeAppEdit(args) {
             }
             if (replaceActionsList != null) {
                 replaceActionsList.eachWithIndex { spec, i ->
+                    // Fork patch C: the first failed or partial item stops every later add and finalisation.
+                    if (replaceStopAfter) { addedResults << _rmBulkNotAttempted(replaceStopAfter); return }
                     if (!(spec instanceof Map)) {
                         addedResults << [success: false, error: "replaceActions[${i}] is not a Map", spec: spec]
-                        return
+                    } else {
+                        try { addedResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, replaceValidRuleIds) }
+                        catch (Exception ae) {
+                            addedResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                            mcpLog("warn", "rm-native", "hub_set_rule: replaceActions[${i}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                        }
                     }
-                    try { addedResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, replaceValidRuleIds) }
-                    catch (Exception ae) {
-                        addedResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                        mcpLog("warn", "rm-native", "hub_set_rule: replaceActions[${i}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                    }
+                    if (_rmBulkItemBlocks(addedResults.last())) replaceStopAfter = "replaceActions[${i}]".toString()
                 }
             }
         } catch (Exception e) {
@@ -14040,6 +14089,9 @@ def _applyNativeAppEdit(args) {
                 result.verifyHint = "Call hub_get_app_config(appId=${appId}) and inspect the actions list -- if the operation actually committed despite the false-fail, do NOT call hub_restore_backup."
             }
             return result
+        }
+        if (replaceStopAfter) {
+            return _rmBulkStoppedResult(appId, backup, replaceStopAfter, [removedIndices: removed ?: null, addedActions: addedResults])
         }
         // Trailing updateRule fires AFTER mutation block completes. Hoisted
         // out of the per-item try so a rejection here doesn't get routed
@@ -14955,6 +15007,7 @@ def _applyNativeAppEdit(args) {
         def updateRuleError = null
         def trigList = (addTriggersList ?: [])
         def actList = (addActionsList ?: [])
+        String bulkStopAfter = null
         try {
             // Indexed for-loops (not eachWithIndex) so the time-budget checkpoint can
             // break/return cleanly between items -- a Groovy closure can't break out of a loop.
@@ -14971,9 +15024,14 @@ def _applyNativeAppEdit(args) {
             // (regardless of a failed op, surfacing it in the pause envelope); only the
             // walkStep-drive step loop gates on all-clean, because its pause is defined as a clean
             // partial.
+            // Fork patch C: fail closed. After the first failed or partial item nothing further is written
+            // and finalisation is skipped, so a failed IF opener can never leave its body committed as
+            // unconditional actions. The stop is decided before the budget checkpoint, so a pause never
+            // hands back a skipped tail.
             int ti = -1
             for (def spec : trigList) {
                 ti++
+                if (bulkStopAfter) { triggerResults << _rmBulkNotAttempted(bulkStopAfter); continue }
                 if ((triggerResults.size() + actionResults.size()) > 0 &&
                         _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                     return _bulkPauseResult(appId, backup, triggerResults, actionResults,
@@ -14981,13 +15039,14 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(spec instanceof Map)) {
                     triggerResults << [success: false, error: "addTriggers[${ti}] is not a Map", spec: spec]
-                    continue
+                } else {
+                    try { triggerResults << _rmAddTrigger(appId, spec as Map) }
+                    catch (Exception te) {
+                        triggerResults << [success: false, error: te.message, specCapability: spec.capability]
+                        mcpLog("warn", "rm-native", "hub_set_rule: addTriggers[${ti}] (${spec.capability}) failed -- ${te.message}")
+                    }
                 }
-                try { triggerResults << _rmAddTrigger(appId, spec as Map) }
-                catch (Exception te) {
-                    triggerResults << [success: false, error: te.message, specCapability: spec.capability]
-                    mcpLog("warn", "rm-native", "hub_set_rule: addTriggers[${ti}] (${spec.capability}) failed -- ${te.message}")
-                }
+                if (_rmBulkItemBlocks(triggerResults.last())) bulkStopAfter = "addTriggers[${ti}]".toString()
             }
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
@@ -14995,6 +15054,7 @@ def _applyNativeAppEdit(args) {
             int ai = -1
             for (def spec : actList) {
                 ai++
+                if (bulkStopAfter) { actionResults << _rmBulkNotAttempted(bulkStopAfter); continue }
                 if ((triggerResults.size() + actionResults.size()) > 0 &&
                         _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                     // Every trigger already processed; only the unprocessed actions remain.
@@ -15003,13 +15063,14 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(spec instanceof Map)) {
                     actionResults << [success: false, error: "addActions[${ai}] is not a Map", spec: spec]
-                    continue
+                } else {
+                    try { actionResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, addActionsValidRuleIds) }
+                    catch (Exception ae) {
+                        actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                        mcpLog("warn", "rm-native", "hub_set_rule: addActions[${ai}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                    }
                 }
-                try { actionResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, addActionsValidRuleIds) }
-                catch (Exception ae) {
-                    actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                    mcpLog("warn", "rm-native", "hub_set_rule: addActions[${ai}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                }
+                if (_rmBulkItemBlocks(actionResults.last())) bulkStopAfter = "addActions[${ai}]".toString()
             }
         } catch (Exception e) {
             mcpLogError("rm-native", "addTriggers/addActions bulk failed for app ${appId}", e)
@@ -15017,6 +15078,9 @@ def _applyNativeAppEdit(args) {
             bulkResult.triggerResults = triggerResults
             bulkResult.actionResults = actionResults
             return bulkResult
+        }
+        if (bulkStopAfter) {
+            return _rmBulkStoppedResult(appId, backup, bulkStopAfter, [triggers: triggerResults, actions: actionResults])
         }
         // Trailing updateRule fires AFTER per-item adds complete. Hoisted out
         // of the per-item try so a rejection here doesn't get routed through

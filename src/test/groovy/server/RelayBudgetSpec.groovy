@@ -434,7 +434,10 @@ class RelayBudgetSpec extends ToolSpecBase {
     // _rmAddTrigger call needed) and the budget then pauses before trigger[1], driving the real
     // checkpoint + trigList.subList(ti, ...) + actList carry-forward. The clean-partial return
     // shape is pinned separately on _bulkPauseResult below.
-    def "the trigger-loop checkpoint hands back the unrun triggers AND all actions on a pause"() {
+    // Fail-closed bulk semantics: once trigger[0] fails nothing further runs, so this failed-item route
+    // can no longer drive the running trigger-loop pause. The pause return shape stays pinned on
+    // _bulkPauseResult below; here the contract is that a skipped tail is never offered for resumption.
+    def "the trigger-loop checkpoint never offers a fail-closed tail for resumption"() {
         given:
         def triggerCalls = []
         def actionCalls = []
@@ -453,30 +456,30 @@ class RelayBudgetSpec extends ToolSpecBase {
                 [capability: 'switch', action: 'off', deviceIds: [12]],
             ]])
 
-        then: 'the loop paused after item 0 (never before the first item); the action loop never started'
+        then: 'no action ran and no in_progress envelope hands back the skipped items'
         actionCalls.size() == 0
-        result.status == 'in_progress'
+        result.status != 'in_progress'
+        !result.containsKey('addTriggersRemaining')
+        !result.containsKey('addActionsRemaining')
 
-        and: 'the trigger-loop pause hands back the two unrun triggers AND every action'
-        result.addTriggersRemaining instanceof List
-        result.addTriggersRemaining.size() == 2
-        result.addTriggersRemaining[0].state == 'off'
-        result.addActionsRemaining instanceof List
-        result.addActionsRemaining.size() == 2
+        and: 'every later trigger and every action is reported notAttempted'
+        result.triggers.size() == 3
+        result.triggers[1].notAttempted == true
+        result.triggers[2].notAttempted == true
+        result.actions.size() == 2
+        result.actions.every { it.notAttempted == true }
 
-        and: 'item 0 failed, so the pause surfaces success:false + partial rather than masking it'
+        and: 'item 0 failed, so the result surfaces success:false + partial rather than masking it'
         result.success == false
         result.partial == true
 
-        and: 'the deferred trailing updateRule did NOT fire on the pause'
-        !clicks.contains('updateRule')
+        and: 'no internal budget marker is echoed back'
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    // A pause fired AFTER a committed item failed: the batch still stops on the budget (to
-    // protect the response from a relay drop) but the failure is surfaced in the outer
-    // success/partial, not masked as a clean in_progress success.
-    def "a bulk pause after a failed item surfaces success:false + partial, not a clean success"() {
+    // A failed item stops the batch (fail-closed) before the budget checkpoint can pause, so no further
+    // hub work runs and no resumable tail is offered; the failure is surfaced, not masked.
+    def "a failed item ends the batch before any budget pause and surfaces success:false + partial"() {
         given:
         def actionCalls = []
         def clicks = []
@@ -498,18 +501,17 @@ class RelayBudgetSpec extends ToolSpecBase {
             [capability: 'switch', action: 'off', deviceIds: [9]],
         ]])
 
-        then: 'the batch STILL paused (protecting the relay) even though item 0 failed'
+        then: 'the batch stopped at item 0: no pause, no resumable remainder'
         actionCalls.size() == 1
-        result.status == 'in_progress'
-        result.addActionsRemaining.size() == 1
+        result.status != 'in_progress'
+        !result.containsKey('addActionsRemaining')
+        result.actions[1].notAttempted == true
 
         and: 'the failure is bubbled up, NOT masked as a clean success'
         result.success == false
         result.partial == true
         result.repairHints instanceof List && !result.repairHints.isEmpty()
 
-        and: 'the deferred updateRule did not fire'
-        !clicks.contains('updateRule')
     }
 
     // Pin the trigger-pause return shape directly on _bulkPauseResult too -- a
