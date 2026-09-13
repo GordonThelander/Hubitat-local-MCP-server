@@ -8481,6 +8481,11 @@ Map _rmWalkStep(Integer appId, Map spec) {
     if (!page.matches(/[A-Za-z0-9_]+/)) throw new IllegalArgumentException("walkStep.page must be alphanumeric/underscore")
     def operation = spec?.operation?.toString()?.trim() ?: "introspect"
     def validateEnum = spec?.validateEnum == true
+    // Fork patch A2: within a drive, carry the page RM rendered in response to the previous write.
+    // Transient wizard state (e.g. the condition opened by cond=a) exists only in that response; a
+    // fresh GET re-renders the pre-write page. Any non-write operation invalidates the carry.
+    def walkCache = spec?.__pageCache instanceof Map ? (Map) spec.__pageCache : null
+    if (walkCache != null && operation != "write") walkCache.clear()
 
     // walkStep is a RAW action-authoring path that bypasses _rmAddAction. If a preceding
     // addRequiredExpression deferred its predCapabs clear (Step 4b), run it now -- before any
@@ -8533,7 +8538,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
         if (navResp?.navRetried == true) navRetriedBefore = true
         beforeCfg = navResp ? [configPage: navResp.configPage] : _rmFetchConfigJson(appId, page)
     } else {
-        beforeCfg = _rmFetchConfigJson(appId, page)
+        beforeCfg = _rmFetchConfigJson(appId, page, walkCache)
     }
     def beforeStatus = _rmFetchStatusJson(appId)
     def beforeSettings = (beforeStatus?.appSettings ?: []).collectEntries { [(it?.name?.toString()): it?.value] }
@@ -8567,24 +8572,34 @@ Map _rmWalkStep(Integer appId, Map spec) {
         // in a numeric index with the same stem/delimiter, and there must be exactly
         // one live candidate.  With zero or multiple candidates we retain the legacy
         // warning + exact-key attempt rather than risk mutating the wrong action.
-        def schemaInput = beforeSchema.inputs.find { it.name == writtenKey }
-        if (!schemaInput && page == "doActPage") {
-            def requestedMatcher = (writtenKey =~ /^(.+[._-])(\d+)$/)
-            if (requestedMatcher.matches()) {
-                def requestedStem = requestedMatcher.group(1)
-                def liveCandidates = beforeSchema.inputs.findAll { input ->
-                    def candidateName = input?.name?.toString() ?: ""
-                    def candidateMatcher = (candidateName =~ /^(.+[._-])(\d+)$/)
-                    candidateMatcher.matches() && candidateMatcher.group(1) == requestedStem
-                }
-                if (liveCandidates.size() == 1) {
-                    def requestedKey = writtenKey
-                    schemaInput = liveCandidates[0]
-                    writtenKey = schemaInput.name.toString()
-                    opResult.rebound = [requestedKey: requestedKey, resolvedKey: writtenKey]
-                }
+        def requestedWriteKey = writtenKey
+        def resolveWriteKey = { Map schema ->
+            def exact = schema.inputs.find { it.name == requestedWriteKey }
+            if (exact || page != "doActPage") return [input: exact, key: requestedWriteKey]
+            def requestedMatcher = (requestedWriteKey =~ /^(.+[._-])(\d+)$/)
+            if (!requestedMatcher.matches()) return [input: null, key: requestedWriteKey]
+            def requestedStem = requestedMatcher.group(1)
+            def liveCandidates = schema.inputs.findAll { input ->
+                def candidateName = input?.name?.toString() ?: ""
+                def candidateMatcher = (candidateName =~ /^(.+[._-])(\d+)$/)
+                candidateMatcher.matches() && candidateMatcher.group(1) == requestedStem
             }
+            return liveCandidates.size() == 1 ? [input: liveCandidates[0], key: liveCandidates[0].name.toString(), rebound: true] : [input: null, key: requestedWriteKey]
         }
+        def resolved = resolveWriteKey(beforeSchema)
+        if (resolved.input == null && walkCache != null && !walkCache.isEmpty()) {
+            // Fork patch A2 miss recovery: a carried POST echo can lag one render and omit the field the
+            // previous write revealed. Drop the carry and resolve once against a live page before
+            // concluding the key is absent. The previous write is never re-posted.
+            walkCache.clear()
+            beforeCfg = _rmFetchConfigJson(appId, page, walkCache)
+            beforeSchema = _rmCollectWalkSchema(beforeCfg?.configPage, beforeSettings)
+            resolved = resolveWriteKey(beforeSchema)
+            opResult.carryRefetched = true
+        }
+        def schemaInput = resolved.input
+        writtenKey = resolved.key
+        if (resolved.rebound) opResult.rebound = [requestedKey: requestedWriteKey, resolvedKey: writtenKey]
         // Validate against schema if asked.
         if (!schemaInput) {
             opResult.warning = "Field '${writtenKey}' not in current schema for page '${page}'. Available: ${beforeSchema.inputs.collect { it.name }}. The write will be attempted but the hub may silently drop it."
@@ -8619,6 +8634,22 @@ Map _rmWalkStep(Integer appId, Map spec) {
                 mcpLog("warn", "rm-native", "walkStep: href-context version fetch for app ${appId} on page '${hrefContext.fromPage ?: page}' failed (${verExc.message}) -- POSTing write without version field; hub may reject on concurrent-edit conflict")
             }
             _rmPostSettings(appId, body)
+        } else if (page && page != "mainPage" && schemaInput != null) {
+            // Fork patch A: sub-page writes need formAction/currentPage/pageBreadcrumbs, or RM
+            // silently no-ops wizard pickers such as doActPage cond (see _rmWriteSettingOnPage).
+            def pageApplied = []
+            def pageSkipped = []
+            _rmWriteSettingOnPage(appId, page, writtenKey, writtenValue, pageApplied, null, pageSkipped, walkCache)
+            if (pageSkipped) opResult.skipped = pageSkipped
+        } else if (page && page != "mainPage") {
+            // Unresolved key: keep walkStep's contract of attempting the exact requested key (with the
+            // schema warning above), but with page context so a wizard picker is not silently dropped.
+            def body = _rmBuildSettingsBody(appId, [(writtenKey): writtenValue], fullSchemaMap)
+            body.formAction = "update"
+            body.currentPage = page
+            body.pageBreadcrumbs = '["mainPage"]'
+            if (beforeCfg?.app?.version != null) body.version = beforeCfg.app.version.toString()
+            _rmPostSettings(appId, body, walkCache)
         } else {
             _rmUpdateAppSettings(appId, [(writtenKey): writtenValue], fullSchemaMap)
         }
@@ -8722,7 +8753,8 @@ Map _rmWalkStep(Integer appId, Map spec) {
         if (navResp?.navRetried == true) opResult.navRetried = true
         afterCfg = navResp ? [configPage: navResp.configPage] : _rmFetchConfigJson(appId, page)
     } else {
-        afterCfg = _rmFetchConfigJson(appId, page)
+        if (walkCache != null && operation != "write") walkCache.clear()
+        afterCfg = _rmFetchConfigJson(appId, page, walkCache)
     }
     def afterStatus = _rmFetchStatusJson(appId)
     def afterSettings = (afterStatus?.appSettings ?: []).collectEntries { [(it?.name?.toString()): it?.value] }
@@ -8796,7 +8828,12 @@ Map _rmWalkStep(Integer appId, Map spec) {
     // replays a needlessly failed envelope). And an UNREADABLE probe (a transient
     // fetch failure -- no evidence of breakage either way) must never fail the
     // committed work; only positive evidence may.
-    def health = _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
+    // Fork patch A3: inside a drive, defer the probe for every mutating step to the drive's final health
+    // check. The probe renders other rule pages, which resets RM's in-flight wizard (doActPage and STPage
+    // condition builders alike); gating on the step's operation, not its page, also covers `done`.
+    def health = (walkCache != null && operation in ["write", "click", "navigate", "done"]) ?
+        _rmEmptyHealthVerdict(ok: true, skipped: true, source: "deferred", note: "health probe deferred to the end of the drive (wizard in progress)") :
+        _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
     def silentRejection = (operation == "write") &&
         appeared.isEmpty() && disappeared.isEmpty() &&
         valueEcho?.match == false
@@ -8887,6 +8924,7 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     def currentPage = spec?.page?.toString()?.trim()
     def allOk = true
     def lastStepOperation = null
+    def driveWalkCache = [:]   // fork patch A2: per-drive page carry, see _rmWalkStep
     // Time-budget self-pause: set when the budget is reached BETWEEN steps so the
     // post-loop path returns an in_progress envelope with the unrun steps instead of
     // the normal fail-loud rollup. Null whenever no pause fires (within budget, or
@@ -8926,6 +8964,7 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         // above then fires before the next step. stepsRemaining is built from the
         // raw list via _stripInternalClock, so the clock never leaks into an echo.
         if (spec?.__reqT0 != null) step.__reqT0 = spec.__reqT0
+        step.__pageCache = driveWalkCache
         def stepOp = step.operation?.toString()?.trim() ?: "introspect"
         // Inherit the page the previous step ended on when this step omits one.
         if (!step.page && currentPage) step.page = currentPage
@@ -9015,6 +9054,8 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         steps: stepResults,
         health: finalHealth
     ]
+    // A terminal drive that leaves any structural issue (an unclosed block included) is incomplete.
+    if (!finalHealthGate && (finalHealth?.structuralIssues as List)) result.structuralIssues = finalHealth.structuralIssues
     // Fail-loud rollup: a success:false drive must ALWAYS carry a top-level reason. A step
     // error caught per-step otherwise lives only in steps[].error -- a weak signal for an
     // LLM caller that sees success:false with no top-level `error`. Surface the first failed
@@ -11374,9 +11415,15 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             cancelInFlightCond()
             throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'variable' (the hub variable name) and 'comparator'. Got: ${cond}")
         }
+        // Fork patch B: a Boolean variable exposes state_<N> (true/false) directly and has no comparator
+        // field, so an omitted comparator is allowed only with a true/false literal; otherwise fail loud.
         if (!cond.comparator) {
-            cancelInFlightCond()
-            throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
+            def rhs = cond.state != null ? cond.state : cond.value
+            boolean booleanLiteral = rhs instanceof Boolean || rhs?.toString()?.toLowerCase() in ["true", "false"]
+            if (!booleanLiteral) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'), or value true/false for a Boolean variable. Got: ${cond}")
+            }
         }
         // compareToVariable (variable-vs-variable RHS) and value/state (constant RHS)
         // are mutually exclusive -- RM renders one OR the other, never both. Reject the
@@ -11423,11 +11470,55 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             throw new IllegalArgumentException("conditions[${condIdx}]: Variable: hub variable '${varName}' not in the revealed picker for '${varPickerField}'. Available: ${varOpts.sort().join(', ')}")
         }
 
-        // Reveal 2: write variable name as the trigger -> RelrDev_<N> comparator appears
-        def normalizedComparator = _rmNormalizeComparator(cond.comparator.toString())
-        def relrReveal = revealStep(appId, page, /RelrDev_\d+/, {
+        // Reveal 2: write variable name as the trigger -> RelrDev_<N> comparator appears,
+        // or state_<N> directly for a Boolean variable (fork patch B).
+        def normalizedComparator = cond.comparator ? _rmNormalizeComparator(cond.comparator.toString()) : null
+        def relrReveal = revealStep(appId, page, "RelrDev_${cIdx}|state_${cIdx}".toString(), {
             writeST(hrefParams, varPickerField, varName)
         })
+        if (relrReveal.input && relrReveal.input.name.toString() == "state_${cIdx}".toString()) {
+            if (relrReveal.fallbackToExisting) {
+                // state_<cIdx> was already on the page before the variable write (static schema or a
+                // leftover slot). Accept it only if the variable picker echoes the variable just chosen.
+                def varEcho = (relrReveal.postInputs ?: []).find { it?.name?.toString() == varPickerField }
+                def echoed = varEcho?.value != null ? varEcho.value : varEcho?.currentValue
+                if (echoed?.toString() != varName) {
+                    cancelInFlightCond()
+                    throw new IllegalStateException("conditions[${condIdx}]: Variable: ambiguous schema -- state_${cIdx} was present before '${varName}' was selected and the picker '${varPickerField}' does not echo it (got '${echoed}'). Refusing to guess between a Boolean value field and a leftover slot.")
+                }
+            }
+            // Boolean variable: implicit equality against true/false; RM persists RelrDev_<N>='=' itself
+            // (observed on rule 3243 built through the native UI).
+            if (cond.compareToVariable != null) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; RM compares it only to true/false, not to another variable.")
+            }
+            if (normalizedComparator != null && normalizedComparator != _rmNormalizeComparator("=")) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; only '=' is supported (use not:true to negate). Got comparator '${cond.comparator}'.")
+            }
+            def boolRaw = cond.state != null ? cond.state : cond.value
+            def boolStr = (boolRaw instanceof Boolean) ? boolRaw.toString() : boolRaw?.toString()?.toLowerCase()
+            def boolField = relrReveal.input.name.toString()
+            def boolOpts = _rmReadPickerOptionStrings(relrReveal.input)
+            if (!(boolStr in ["true", "false"]) || (boolOpts && !(boolStr in boolOpts))) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; value must be true or false. Got '${boolRaw}'. Options: ${boolOpts}")
+            }
+            writeST(hrefParams, boolField, boolStr)
+            if (cond.not == true) {
+                writeST(hrefParams, "not${cIdx}".toString(), true)
+            }
+            if (cond.rawSettings instanceof Map) {
+                (cond.rawSettings as Map).each { rk, rv -> writeST(hrefParams, rk.toString(), rv) }
+            }
+            _rmClickAppButton(appId, "hasAll", null, page, cache)
+            return
+        }
+        if (relrReveal.input && !cond.comparator) {
+            cancelInFlightCond()
+            throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
+        }
         if (!relrReveal.input) {
             cancelInFlightCond()
             def visible = relrReveal.visibleNames?.join(', ') ?: "(none)"
@@ -15109,7 +15200,14 @@ def _applyNativeAppEdit(args) {
                     unknownSettings << k.toString()
                 }
             }
-            if (knownSettings) {
+            def isSubPageWrite = (pageName && pageName != "mainPage")
+            def subPageApplied = []
+            def subPageSkipped = []
+            if (knownSettings && isSubPageWrite) {
+                // Fork patch A: write sub-page keys one at a time with page context and verify each
+                // landed; settingsApplied lists only confirmed keys.
+                knownSettings.each { k, v -> _rmWriteSettingOnPage(appId, pageName, k.toString(), v, subPageApplied, null, subPageSkipped) }
+            } else if (knownSettings) {
                 _rmUpdateAppSettings(appId, knownSettings, schema)
             }
             // Auto-fire updateRule only for main-page writes. On sub-pages
@@ -15134,7 +15232,11 @@ def _applyNativeAppEdit(args) {
                 _rmClickAppButton(appId, editCommitButton)
                 implicitCommitButton = editCommitButton
             }
-            result.settingsApplied = knownSettings.keySet().toList()
+            result.settingsApplied = isSubPageWrite ? subPageApplied : knownSettings.keySet().toList()
+            if (isSubPageWrite && subPageSkipped) {
+                result.settingsNotLanded = subPageSkipped
+                result.partial = true
+            }
             if (unknownSettings) {
                 result.settingsSkipped = unknownSettings
                 def settingWord = (unknownSettings.size() == 1) ? "Setting" : "Settings"
