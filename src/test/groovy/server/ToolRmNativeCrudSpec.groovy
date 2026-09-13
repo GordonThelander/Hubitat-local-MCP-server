@@ -39213,16 +39213,10 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
     @spock.lang.Unroll
     def "hub_set_rule bulk #shape per-item failure blocks the trailing updateRule and flips partial:true (W7/W11)"() {
-        // W7: pins the partial OR-branch (`itemsPartial || updateRuleFailed`) on the
-        // SUCCESS path of the trailing updateRule. Sibling-coverage gap: the failure
-        // @Unroll above always flips partial:true via updateRuleFailed; the success
-        // @Unroll above never has per-item partial. This spec exercises the cross
-        // case: a per-item add returns success=false (one bogus deviceId) while the
-        // trailing updateRule fires successfully. The OR-branch must still flip
-        // result.partial=true so callers see the per-item failure was not papered
-        // over by the otherwise-clean trailing click. A regression that flips the
-        // OR to AND (`itemsPartial && updateRuleFailed`) would silently report
-        // partial=false here.
+        // W7: a per-item add returns success=false (one bogus deviceId). Fail-closed
+        // processing stops the batch there, so the trailing updateRule is never
+        // attempted: result.partial must be true, finalisationNotAttempted set, and
+        // updateRuleFailed stays falsy because no click was made.
         //
         // W11: the original W7 spec covered addTriggers ONLY. Convert to @Unroll
         // matching the failure-pin's 3 shapes (triggers-only, actions-only, both)
@@ -41700,7 +41694,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         hints.any { it?.toString()?.contains("Stopped fail-closed after replaceActions[0]") }
 
         and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        // The trailing updateRule click succeeded so the rejection hint MUST
+        // No trailing updateRule click was attempted, so the rejection hint MUST
         // stay absent. Without this assertion a regression that always-appends
         // the rejection hint (the pre-R4 C1 shape) would silently lint-green.
         !hints.any { it?.toString()?.contains("updateRule click was rejected") }
@@ -42606,7 +42600,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         hints.any { it?.toString()?.contains("Stopped fail-closed after addActions[0]") }
 
         and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        // The trailing updateRule click succeeded so the rejection hint MUST stay
+        // No trailing updateRule click was attempted, so the rejection hint MUST stay
         // absent. Without this assertion a regression that always-appends the
         // rejection hint (pre-R4 C1 shape) would silently lint-green.
         !hints.any { it?.toString()?.contains("updateRule click was rejected") }
