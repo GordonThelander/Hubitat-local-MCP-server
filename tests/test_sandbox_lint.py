@@ -694,6 +694,64 @@ def read(int index) {
     assert sandbox_map_findings(source) == []
 
 
+def test_later_local_declaration_does_not_hide_an_earlier_field_write():
+    source = """@groovy.transform.Field Map CACHE = [:]
+def update(String key) {
+ CACHE[key] = 1
+ List CACHE = []
+ CACHE[key] = 2
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [3]
+
+
+@pytest.mark.parametrize("declaration", ["List CACHE = []", "def CACHE = []"])
+def test_nested_local_shadows_field_only_inside_its_block(declaration):
+    source = f"""@groovy.transform.Field Map CACHE = [:]
+def update(String key, List items) {{
+ CACHE[key] = 1
+ items.each {{
+  {declaration}
+  CACHE[key] = 2
+ }}
+ CACHE[key] = 3
+}}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [3, 8]
+
+
+@pytest.mark.parametrize("parameter", ["List CACHE", "def CACHE", "CACHE"])
+def test_closure_parameter_shadows_field_only_inside_its_closure(parameter):
+    source = f"""@groovy.transform.Field Map CACHE = [:]
+def update(String key, List items) {{
+ CACHE[key] = 1
+ items.each {{ {parameter} ->
+  CACHE[key] = 2
+ }}
+ CACHE[key] = 3
+}}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [3, 7]
+
+
+def test_shadowing_inferred_map_does_not_inherit_field_typed_read_exemption():
+    source = """@groovy.transform.Field Map CACHE = [:]
+def read(String key, List items) {
+ items.each {
+  def CACHE = [:]
+  println CACHE[key]
+ }
+ return CACHE[key]
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [5]
+
+
+def test_nested_non_map_parameter_shadows_a_typed_map_local():
+    source = """def update(String key, List items) {
+ Map values = [:]
+ items.each { List values -> values[key] = 1 }
+ values[key] = 2
+}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [4]
+
+
 def test_map_property_is_not_an_alias_of_the_containing_map():
     source = """def update(int index) {
  def envelope = [ids: [1, 2]]

@@ -209,6 +209,58 @@ class LogMrtrContinuationSpec extends ToolSpecBase {
         snapshots.size() == 8
     }
 
+    def "TTL cleanup retains an observed snapshot until its reader returns pending=#pending"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        long ttl = pending ? 90000L : 30000L
+        String key = '402:app:42'
+        snapshots.put(key, [at: timestamp - ttl + 1L, pending: pending,
+            fetchId: 'original', text: '[]', readers: 0])
+        Map observed = null
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            NOW_OVERRIDE.set({ -> timestamp + 1L })
+            script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+            observed = snapshots.get(key)
+            if (observed != null) {
+                observed.pending = false
+                observed.text = 'original result'
+            }
+        })
+        // A pending entry reaches TTL inside its wait; a ready entry is observed
+        // by an already active caller while another request sweeps the pool.
+        if (!pending) snapshots.get(key).readers = 1
+
+        when:
+        Map result
+        if (pending) {
+            result = script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+        } else {
+            NOW_OVERRIDE.set({ -> timestamp + 1L })
+            script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+            result = script._observeHubReadSnapshot(key, 'original', null, [:])
+            snapshots.get(key).readers = 0
+        }
+
+        then:
+        result.state == 'ready'
+        result.text == (pending ? 'original result' : '[]')
+        snapshots.get(key).fetchId == 'original'
+        snapshots.get(key).readers == 0
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][2].data.query.id == '99'
+
+        when:
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+
+        then:
+        !snapshots.containsKey(key)
+        runInMillisCalls.size() == 1
+
+        where:
+        pending << [true, false]
+    }
+
     def "a lost or replaced foreground snapshot fails without claiming replacement readers replacement=#replacement"() {
         given:
         Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
