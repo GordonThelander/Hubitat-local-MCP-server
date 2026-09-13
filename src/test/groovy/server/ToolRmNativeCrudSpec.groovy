@@ -15062,7 +15062,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         // backup-and-catch envelope in toolSetRule and surfaced as a
         // structured success=false map (consistent with the sibling
         // compareToDevice missing-comparator guard on this same addTrigger
-        // path), NOT a propagated -32602. The validation still fires before the
+        // path), NOT a propagated isError validation result. The validation still fires before the
         // trigger editor opens, so no wizard write POST is sent.
         given:
         enableWrite()
@@ -24814,7 +24814,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // coverage rather than full one-for-one parity. The coverage
     // matrix: one happy path per native_app tool (create / update /
     // delete / clone / export / import / hub_get_rule_health), plus
-    // representative IAE (-32602) and runtime-exception (isError)
+    // representative IAE (isError validation result) and runtime-exception (isError)
     // envelope shapes. The full per-tool internals are covered by
     // the direct-call features above; this block guards the
     // production envelope (handleMcpRequest -> handleToolsCall ->
@@ -24824,7 +24824,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns -32602 envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -24833,15 +24833,15 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_set_rule', [name: "BAT-RM-demo"])
 
         then:
-        response.error.code == -32602
-        response.error.message.contains("SAFETY CHECK FAILED")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains("SAFETY CHECK FAILED")
 
         where:
         useGateways << [true, false]
     }
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns -32602 envelope when name is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule via dispatch returns isError validation result envelope when name is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -24850,8 +24850,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_set_rule', [confirm: true])
 
         then:
-        response.error.code == -32602
-        response.error.message.contains("name is required")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains("name is required")
 
         where:
         useGateways << [true, false]
@@ -24895,7 +24895,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns -32602 envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -24904,8 +24904,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_set_rule', [appId: 100, settings: [a: 1]])
 
         then:
-        response.error.code == -32602
-        response.error.message.contains("SAFETY CHECK FAILED")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains("SAFETY CHECK FAILED")
 
         where:
         useGateways << [true, false]
@@ -25008,7 +25008,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_clone_native_app dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_clone_native_app via dispatch returns -32602 envelope when sourceAppId is missing (useGateways=#useGateways)"() {
+    def "hub_clone_native_app via dispatch returns isError validation result envelope when sourceAppId is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -25017,8 +25017,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_clone_native_app', [confirm: true])
 
         then:
-        response.error.code == -32602
-        response.error.message.toLowerCase().contains("sourceappid")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains("sourceappid")
 
         where:
         useGateways << [true, false]
@@ -25111,7 +25111,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_import_native_app dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_import_native_app via dispatch returns -32602 envelope on non-JSON content (useGateways=#useGateways)"() {
+    def "hub_import_native_app via dispatch returns isError validation result envelope on non-JSON content (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -25120,16 +25120,16 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_import_native_app', [jsonContent: 'not-json', parentHintAppId: 100, confirm: true])
 
         then:
-        response.error.code == -32602
-        response.error.message.toLowerCase().contains("not valid json") ||
-            response.error.message.toLowerCase().contains("appreplacements")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains("not valid json") ||
+            mcpDriver.parseInner(response).error.toLowerCase().contains("appreplacements")
 
         where:
         useGateways << [true, false]
     }
 
     @spock.lang.Unroll
-    def "hub_import_native_app via dispatch returns -32602 envelope on JSON without appReplacements (useGateways=#useGateways)"() {
+    def "hub_import_native_app via dispatch returns isError validation result envelope on JSON without appReplacements (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -25138,8 +25138,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def response = mcpDriver.callTool('hub_import_native_app', [jsonContent: '{"foo":"bar"}', parentHintAppId: 100, confirm: true])
 
         then:
-        response.error.code == -32602
-        response.error.message.toLowerCase().contains("appreplacements")
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains("appreplacements")
 
         where:
         useGateways << [true, false]
@@ -30363,7 +30363,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "rejected as an invalid name (the IAE maps to a -32602-style error envelope)"
+        then: "rejected as an invalid name (the IAE maps to a isError validation result-style error envelope)"
         result.success == false
         result.error?.toString()?.contains("not valid")
 
@@ -37888,7 +37888,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- runtime-exception envelope (isError) coverage ----------
 
     @spock.lang.Unroll
-    def "hub_clone_native_app via dispatch returns -32602 when source config fetch returns empty (useGateways=#useGateways)"() {
+    def "hub_clone_native_app via dispatch returns isError validation result when source config fetch returns empty (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -37897,10 +37897,10 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         when:
         def response = mcpDriver.callTool('hub_clone_native_app', [sourceAppId: 999, confirm: true])
 
-        then: "empty config fetch surfaces as -32602 IAE (matches the direct-call test's IllegalArgumentException)"
-        response.error.code == -32602
-        response.error.message.contains("999")
-        response.error.message.toLowerCase().contains("not found")
+        then: "empty config fetch surfaces as isError validation result IAE (matches the direct-call test's IllegalArgumentException)"
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains("999")
+        mcpDriver.parseInner(response).error.toLowerCase().contains("not found")
 
         where:
         useGateways << [true, false]
