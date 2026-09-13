@@ -3615,4 +3615,37 @@ class MrtrContinuationSpec extends ToolSpecBase {
         !wire.contains('clonerAppId')
         !wire.contains('preIds')
     }
+
+    def "a state-only reply and an unresumed expiry are visible in the MCP log without debug logging"() {
+        given: 'the default operator level, not debug'
+        settingsMap.enableWrite = true
+        settingsMap.mcpLogLevel = 'info'
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [95, 96], action: 'stop']
+
+        when: 'the first slice pauses'
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        def pendingLine = script.getDebugLogEntries().find {
+            it.message?.toString()?.contains("returned requestState ${stateId}") }
+
+        then: 'an info line names the tool, the state and what a client should do'
+        pendingLine != null
+        pendingLine.level == 'info'
+        pendingLine.message.toString().startsWith('hub_call_rule:')
+        pendingLine.message.toString().contains('this slice finished with work remaining')
+        pendingLine.message.toString().contains('read the target before repeating')
+
+        when: 'nobody resumes it and the record expires'
+        atomicStateMap.mrtrRequests[stateId].expiresAt = 1L
+        script._writeStateCacheInvalidate()
+        script.runMrtrCleanup()
+        def expiredLine = script.getDebugLogEntries().find {
+            it.message?.toString()?.contains("requestState ${stateId} expired without being resumed") }
+
+        then: 'a warn line says the remainder never ran'
+        expiredLine != null
+        expiredLine.level == 'warn'
+        expiredLine.message.toString().startsWith('hub_call_rule:')
+        expiredLine.message.toString().contains('1 slice(s) had committed')
+    }
 }

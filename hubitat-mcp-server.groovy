@@ -1636,7 +1636,8 @@ def handleToolsCall(msg) {
             rejoined = reservation.rejoined == true
             if (readLeaf) {
                 // The read is already running in the background; hand back its state.
-                return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined))
+                return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined, reactiveToolName,
+                    "the read is still fetching in the background"))
             }
         }
         // A write claims its record in the same request that reserved it and runs the
@@ -1667,7 +1668,8 @@ def handleToolsCall(msg) {
             // Runtime contention is still the same logical request, not a
             // malformed JSON-RPC call. Keep an automatic modern client in
             // its continuation loop without advancing or restarting work.
-            return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined))
+            return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined, reactiveToolName,
+                "another request currently owns the running slice"))
         }
 
         executionArgs = (rec.nextArguments instanceof Map)
@@ -1694,7 +1696,8 @@ def handleToolsCall(msg) {
                     return _renderToolResult(msg.id, toolName, reactiveToolName, executionArgs,
                         _mrtrMarkRejoined(terminalRec.terminalResult, rejoined), terminalRec.terminalIsError == true)
                 }
-                return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined))
+                return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined, reactiveToolName,
+                    "the background worker was still running when this request's wait budget ran out"))
             }
             return _renderToolResult(msg.id, toolName, reactiveToolName, executionArgs,
                 _mrtrMarkRejoined(scheduled.failure, rejoined), true)
@@ -1702,7 +1705,8 @@ def handleToolsCall(msg) {
         sliceResult = _mrtrExecuteSlice(stateId, rec, executionArgs)
         Map completion = _mrtrCommitSlice(stateId, rec, claim, executionArgs, sliceResult)
         if (completion.outcome == "continued") {
-            return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined))
+            return jsonRpcResult(msg.id, _mrtrPendingResult(stateId, rejoined, reactiveToolName,
+                "this slice finished with work remaining"))
         }
         return _renderToolResult(msg.id, toolName, reactiveToolName, executionArgs,
             _mrtrMarkRejoined(completion.result, rejoined), completion.isError == true)
@@ -1765,9 +1769,20 @@ def handleToolsCall(msg) {
     }
 }
 
-private Map _mrtrPendingResult(String stateId, boolean rejoined = false) {
+// A state-only continuation is invisible to anyone reading the hub log unless it is said
+// out loud: a client that cannot render input_required shows a generic error, and the
+// operator's only evidence is here. Info, not debug, so it is on by default.
+private Map _mrtrPendingResult(String stateId, boolean rejoined = false, leafTool = null, String reason = null) {
     Map pending = [resultType: "input_required", requestState: stateId]
     if (rejoined) pending.rejoined = true
+    if (leafTool != null) {
+        String leaf = leafTool.toString()
+        boolean write = _mrtrWriteTools().contains(leaf)
+        mcpLog("info", "mrtr", "${leaf}: returned requestState ${stateId}${rejoined ? ' to a rejoined duplicate call' : ''}" +
+            " (${reason ?: 'work still running'}). The hub keeps working; a continuing client repeats the identical call " +
+            "with that state" + (write ? ", and the server resumes a paused write itself after ~${_mrtrAutoContinueDelaySeconds()}s if none does" : "") +
+            ". A client that shows an error instead should read the target before repeating the call.")
+    }
     return pending
 }
 
@@ -2512,7 +2527,16 @@ def runMrtrCleanup() {
         }
         _mrtrPublishCleanupCheckLocked(hint)
     }
-    cleanup.each { _mrtrCleanupRecord(it as Map) }
+    cleanup.each { Map expired ->
+        // Only an active record reaches here, and only when nothing was executing it: the
+        // client never continued and the server's own continuation did not run it either.
+        if (expired.nextArguments instanceof Map || expired.checkpoint instanceof Map) {
+            int committed = ((expired.rounds ?: 0) as Integer)
+            mcpLog("warn", "mrtr", "${expired.leafTool}: requestState ${expired.stateId ?: '?'} expired without being resumed; " +
+                "${committed} slice(s) had committed and the remaining work did not run. Inspect the target before repeating.")
+        }
+        _mrtrCleanupRecord(expired)
+    }
 }
 
 // Eviction must be durable before publishing the cache or releasing helper ownership.
@@ -2625,7 +2649,7 @@ private List _mrtrSweepLocked() {
                 (v.expiresAt != null && (v.expiresAt as Long) > at))) {
             kept.put(k, v)
         } else if (v instanceof Map && v.status == "active") {
-            cleanup << ([:] + (v as Map))
+            cleanup << (([:] + (v as Map)) + [stateId: k?.toString()])
         }
     }
     // Reads and writes are capped as separate pools here too, so read traffic can never
@@ -3325,8 +3349,8 @@ private Map _mrtrScheduleSlice(String stateId, Map rec, Map claim, Map execution
 def runMrtrSlice(Map job = [:]) {
     String stateId = job?.stateId?.toString()
     String claimId = job?.claimId?.toString()
-    Integer generation = null
-    try { generation = job?.generation as Integer } catch (Exception ignored) { }
+    def generationRaw = job?.generation
+    Integer generation = (generationRaw instanceof Number) ? generationRaw.intValue() : null
     Map work = null
     Map rec = null
     Map claim = [outcome: "claimed", claimId: claimId, generation: generation]
@@ -3356,7 +3380,7 @@ def runMrtrSlice(Map job = [:]) {
     try {
         Map executionArgs = _mrtrCopyMap(work.arguments as Map)
         def result = _mrtrExecuteSlice(stateId, rec, executionArgs)
-        _mrtrCommitSlice(stateId, rec, claim, executionArgs, result)
+        _mrtrLogBackgroundCommit(stateId, rec, _mrtrCommitSlice(stateId, rec, claim, executionArgs, result))
     } catch (Exception workerErr) {
         if (workerErr instanceof IllegalArgumentException &&
                 rec.leafTool in ["hub_manage_virtual_device", "hub_update_device"]) {
@@ -3486,7 +3510,7 @@ def runMrtrAutoContinue(Map job = [:]) {
             return
         }
         def result = _mrtrExecuteSlice(stateId, rec, executionArgs)
-        _mrtrCommitSlice(stateId, rec, claim, executionArgs, result)
+        _mrtrLogBackgroundCommit(stateId, rec, _mrtrCommitSlice(stateId, rec, claim, executionArgs, result))
     } catch (IllegalArgumentException e) {
         // No caller receives this refusal, so the stored terminal is its only channel: an
         // abandoned record would tell the next client request "expired" and lose the ledger.
@@ -3500,6 +3524,20 @@ def runMrtrAutoContinue(Map job = [:]) {
         def failure = _mrtrFailureWithLedger(rec, leaf, "Tool error: ${e.message}".toString())
         _mrtrCleanupRecord(rec)
         _mrtrStoreTerminalOrLog(stateId, rec, claim, failure, leaf)
+    }
+}
+
+// A slice that ran with no request waiting on it finished or paused unseen. One info line
+// says which, so an operator whose client showed an error can see the write did land.
+private void _mrtrLogBackgroundCommit(String stateId, Map rec, Map completion) {
+    String leaf = rec?.leafTool?.toString()
+    if (completion?.outcome == "continued") {
+        mcpLog("info", "mrtr", "${leaf}: background slice paused with work remaining (requestState ${stateId}); " +
+            "a continuing client or the server's own continuation runs the next slice")
+    } else if (completion?.outcome == "terminal") {
+        mcpLog(completion.isError == true ? "warn" : "info", "mrtr",
+            "${leaf}: finished in the background (${completion.isError == true ? 'with an error' : 'ok'}); " +
+            "the result is retained for requestState ${stateId} and any waiting or later identical call receives it")
     }
 }
 
@@ -10322,7 +10360,7 @@ The state is bound to the original leaf tool and exact original arguments. A mis
 
 ### Worker checkpoints and limits
 
-Native bulk trigger/action edits, resumable patch batches and walk-driver steps pause between completed items after the worker target. Driver bulk installs/updates pause between drivers. Each saved checkpoint retains the untouched remainder, renews the active window, and advances the owner generation; the next original-argument request with the same state starts a fresh worker slice. If no client request resumes a checkpoint within about five seconds, the server resumes it itself and keeps going to completion or the eight-slice cap, so a client that never continues still gets the whole write; a client request that arrives later observes or replays as usual. Clone and import checkpoints are the exception: their remaining work is derived from the original arguments the client resends, so they stay client-driven. Inner destructive wizard operations never receive this worker clock.
+Native bulk trigger/action edits, resumable patch batches and walk-driver steps pause between completed items after the worker target. Driver bulk installs/updates pause between drivers. Each saved checkpoint retains the untouched remainder, renews the active window, and advances the owner generation; the next original-argument request with the same state starts a fresh worker slice. If no client request resumes a checkpoint within about five seconds, the server resumes it itself and keeps going to completion or the eight-slice cap, so a client that never continues still gets the whole write; a client request that arrives later observes or replays as usual. Clone and import checkpoints are the exception: their remaining work is derived from the original arguments the client resends, so they stay client-driven. Every state-only reply, every background completion and every paused write that expires unresumed is logged in the MCP log (`hub_get_logs` with `mode="mcp"`, component `mrtr`) at info or warn, so a client-side error can be traced without enabling debug logging. Inner destructive wizard operations never receive this worker clock.
 
 Native creation, action replacement, individual driver operations, and patch batches containing `replaceRequiredExpression` remain uninterrupted. Splitting those operations would require additional phase or rollback state. The target is not a hard execution deadline or a guarantee of recovery from a platform kill.
 
