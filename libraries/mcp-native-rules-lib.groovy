@@ -10070,7 +10070,7 @@ def _createNativeAppShell(args) {
         if (actionSpecs) {
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
-            def actionsValidRuleIds = _rmSpecListTargetsRule(actionSpecs) ? _rmValidRuleIds() : null
+            def actionsValidRuleIds = (!createStopAfter && _rmSpecListTargetsRule(actionSpecs)) ? _rmValidRuleIds() : null
             actionSpecs.eachWithIndex { spec, i ->
                 if (createStopAfter) { actionResults << _rmBulkNotAttempted(createStopAfter); return }
                 if (!(spec instanceof Map)) {
@@ -15012,18 +15012,14 @@ def _applyNativeAppEdit(args) {
             // Indexed for-loops (not eachWithIndex) so the time-budget checkpoint can
             // break/return cleanly between items -- a Groovy closure can't break out of a loop.
             // The checkpoint fires BETWEEN items only (never before the first committed item) and
-            // stops the batch as soon as the time budget is exceeded, WHETHER OR NOT an earlier
-            // item failed -- continuing un-budgeted after a failure risks the relay dropping the
-            // whole response (a transport timeout the caller can only recover from by re-issuing,
-            // which double-commits the already-applied items). _bulkPauseResult computes the
-            // outer success/partial from the committed items so a failed/degraded item is bubbled,
-            // not masked. On a pause, hand back the unprocessed items and return BEFORE the trailing
-            // updateRule below so it does NOT fire -- the items so far are committed at the settings
-            // level but not yet baked; the resume call's own trailing updateRule bakes them once the
-            // remaining items complete. Sibling pattern: the patches op loop stops the same way
-            // (regardless of a failed op, surfacing it in the pause envelope); only the
-            // walkStep-drive step loop gates on all-clean, because its pause is defined as a clean
-            // partial.
+            // stops the batch as soon as the time budget is exceeded -- continuing un-budgeted risks
+            // the relay dropping the whole response (a transport timeout the caller can only recover
+            // from by re-issuing, which double-commits the already-applied items). A pause is only
+            // reachable while every processed item is clean: a failed or partial item stops the batch
+            // first (see below). On a pause, hand back the unprocessed items and return BEFORE the
+            // trailing updateRule below so it does NOT fire -- the items so far are committed at the
+            // settings level but not yet baked; the resume call's own trailing updateRule bakes them
+            // once the remaining items complete.
             // Fork patch C: fail closed. After the first failed or partial item nothing further is written
             // and finalisation is skipped, so a failed IF opener can never leave its body committed as
             // unconditional actions. The stop is decided before the budget checkpoint, so a pause never
@@ -15050,7 +15046,7 @@ def _applyNativeAppEdit(args) {
             }
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
-            def addActionsValidRuleIds = _rmSpecListTargetsRule(actList) ? _rmValidRuleIds() : null
+            def addActionsValidRuleIds = (!bulkStopAfter && _rmSpecListTargetsRule(actList)) ? _rmValidRuleIds() : null
             int ai = -1
             for (def spec : actList) {
                 ai++

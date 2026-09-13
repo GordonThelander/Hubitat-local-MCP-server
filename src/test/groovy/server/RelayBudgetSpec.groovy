@@ -18,10 +18,10 @@ import support.ToolSpecBase
  *     on a pause; it fires when the remaining patches complete)
  *   - _applyNativeAppEdit -- between plain bulk addTriggers[]/addActions[] items (same
  *     deferred-updateRule contract; the trigger-loop pause hands back the unrun triggers
- *     AND every action). The bulk and patches pauses stop as soon as the budget is spent
- *     REGARDLESS of whether an earlier item failed -- continuing un-budgeted risks the
- *     relay dropping the whole response -- and surface any failed/degraded item in the
- *     pause envelope's success/partial rather than masking it as a clean success.
+ *     AND every action). Plain bulk items fail closed: a failed or partial item stops the
+ *     batch before the checkpoint, so a resumable tail exists only while every processed
+ *     item is clean. The patches pause still stops as soon as the budget is spent and
+ *     surfaces any failed/degraded op in the pause envelope's success/partial.
  *
  * The generic machinery (_isCloudRequest / _relayBudgetMs / _lanBudgetMs /
  * _timeBudgetExceeded) lives in the main file. The loop tests stub
@@ -425,18 +425,9 @@ class RelayBudgetSpec extends ToolSpecBase {
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    // A RUNNING trigger-loop pause: the trigger-loop checkpoint hands back a DISTINCT shape
-    // from the action-loop pause -- the unrun triggers PLUS every action (the action loop has
-    // not started). A SUCCEEDING-trigger running pause cannot be stubbed here: _rmAddTrigger is
-    // a PRIVATE method, so the intra-script call resolves invokespecial and a per-instance
-    // metaClass stub does not intercept it (unlike the non-private _rmAddAction). So exercise
-    // the real running loop via a non-Map trigger[0]: the loop records that failure INLINE (no
-    // _rmAddTrigger call needed) and the budget then pauses before trigger[1], driving the real
-    // checkpoint + trigList.subList(ti, ...) + actList carry-forward. The clean-partial return
-    // shape is pinned separately on _bulkPauseResult below.
-    // Fail-closed bulk semantics: once trigger[0] fails nothing further runs, so this failed-item route
-    // can no longer drive the running trigger-loop pause. The pause return shape stays pinned on
-    // _bulkPauseResult below; here the contract is that a skipped tail is never offered for resumption.
+    // Fail-closed bulk semantics: a non-Map trigger[0] is recorded inline as a failure and stops the
+    // batch before the budget checkpoint, so no trigger-loop pause occurs and the skipped tail is never
+    // offered for resumption. The clean-pause return shape is pinned separately on _bulkPauseResult below.
     def "the trigger-loop checkpoint never offers a fail-closed tail for resumption"() {
         given:
         def triggerCalls = []
@@ -444,7 +435,7 @@ class RelayBudgetSpec extends ToolSpecBase {
         def clicks = []
         installBulkStubs(triggerCalls, actionCalls, clicks, true)
 
-        when: 'trigger[0] is a non-Map (recorded inline, no _rmAddTrigger call); the budget then pauses before trigger[1]'
+        when: 'trigger[0] is a non-Map (recorded inline, no _rmAddTrigger call) while the budget reports exhausted'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L,
             addTriggers: [
                 'not-a-map',
@@ -495,7 +486,7 @@ class RelayBudgetSpec extends ToolSpecBase {
                                                String pageName = null, Map cache = null -> clicks << name }
         script.metaClass._timeBudgetExceeded = { Long t0 -> true }
 
-        when: 'the first action fails, then the budget pauses before the second'
+        when: 'the first action fails while the budget reports exhausted'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L, addActions: [
             [capability: 'switch', action: 'on', deviceIds: [8]],
             [capability: 'switch', action: 'off', deviceIds: [9]],
