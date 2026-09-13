@@ -774,6 +774,59 @@ def update(String key) {
     assert [f["line"] for f in sandbox_map_findings(source)] == [4]
 
 
+@pytest.mark.parametrize("declaration", [
+    "Map row", "Map <String, Object> row", "java.util.Map row",
+])
+@pytest.mark.parametrize("separator", ["in", ":"])
+def test_typed_loop_map_is_classified_only_inside_the_loop(declaration, separator):
+    source = f"""def update(List rows, String key) {{
+ List row = []
+ for ({declaration} {separator} rows) {{
+  row[key] = 1
+ }}
+ row[key] = 2
+}}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [4]
+
+
+@pytest.mark.parametrize("declaration", ["java.util.Map", "Map <String, Object>"])
+def test_map_type_spelling_preserves_typed_reads_and_dynamic_writes(declaration):
+    source = f"""def update(String key) {{
+ {declaration} row = obtainUnknown()
+ row[key] = 1
+ return row[key]
+}}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [3]
+
+
+@pytest.mark.parametrize("declaration", ["List row", "def row"])
+def test_loop_binding_shadows_a_field_only_through_its_single_statement(declaration):
+    source = f"""@groovy.transform.Field Map row = [:]
+def update(List rows, String key) {{
+ row[key] = 1
+ for ({declaration} in rows) row[key] = 2
+ row[key] = 3
+}}"""
+    assert [f["line"] for f in sandbox_map_findings(source)] == [3, 5]
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ("if (allowed)\n   row[key] = 1", 1),
+    ("if (allowed) { row[key] = 1 }\n  else { row[key] = 2 }", 2),
+    ("if (allowed)\n   row[key] = 1\n  else\n   row[key] = 2", 2),
+    ("while (allowed)\n   row[key] = 1", 1),
+    ("try { row[key] = 1 }\n  finally { row[key] = 2 }", 2),
+    ("try { row[key] = 1 }\n  catch (Exception e) { row[key] = 2 }", 2),
+    ("do { row[key] = 1 }\n  while (allowed)", 1),
+])
+def test_loop_map_binding_covers_the_complete_controlled_statement(statement, expected):
+    source = f"""def update(List rows, String key, boolean allowed) {{
+ for (Map row in rows)
+  {statement}
+}}"""
+    assert len(sandbox_map_findings(source)) == expected
+
+
 def test_map_property_is_not_an_alias_of_the_containing_map():
     source = """def update(int index) {
  def envelope = [ids: [1, 2]]

@@ -5118,6 +5118,34 @@ def check_sandbox_map_subscripts(
                 blocks.append((stack.pop(), pos))
         return blocks
 
+    def statement_end(code: str, start: int) -> int:
+        start += len(code[start:]) - len(code[start:].lstrip())
+        if start >= len(code):
+            return len(code)
+        if code[start] == "{":
+            return min(len(code), close_brace(code, start) + 1)
+        control = re.match(r"(if|for|while|switch|synchronized|catch)\s*\(", code[start:])
+        if control:
+            header_end = close_delimiter(code, start + control.end() - 1, "(", ")")
+            stop = statement_end(code, header_end + 1)
+            alternate = re.match(r"\s*else\b", code[stop:]) if control[1] == "if" else None
+            return statement_end(code, stop + alternate.end()) if alternate else stop
+        if re.match(r"try\b", code[start:]):
+            stop = statement_end(code, start + 3)
+            while continuation := re.match(r"\s*(catch|finally)\b", code[stop:]):
+                if continuation[1] == "catch":
+                    stop = statement_end(code, stop + continuation.start(1))
+                else:
+                    stop = statement_end(code, stop + continuation.end())
+            return stop
+        if re.match(r"do\b", code[start:]):
+            stop = statement_end(code, start + 2)
+            condition = re.match(r"\s*while\s*\(", code[stop:])
+            return (min(len(code), close_delimiter(code, stop + condition.end() - 1, "(", ")") + 1)
+                    if condition else stop)
+        return next((start + pos + (token != "}")
+                     for pos, token in outer_expression_tokens(code[start:]) if token in ";\n}"), len(code))
+
     findings = []
     for path, source in sources.items():
         code = masked[path]
@@ -5138,6 +5166,9 @@ def check_sandbox_map_subscripts(
             # in scope (a closure assigning an outer local), so it counts from
             # its position onward regardless of block.
             blocks = brace_blocks(body)
+            for loop in re.finditer(r"\bfor\s*\(", body):
+                header_end = close_delimiter(body, loop.end() - 1, "(", ")")
+                blocks.append((loop.start(), statement_end(body, header_end + 1)))
             declared_re = re.compile(rf"\b(?:def|{ident}(?:<[^{{}};=]+>)?)\s+$")
 
             def declared(site: int, *, body=body, declared_re=declared_re) -> bool:
@@ -5164,13 +5195,14 @@ def check_sandbox_map_subscripts(
             # a local. Require a type-shaped token before masking a field.
             local_type = rf"(?:def|boolean|byte|char|double|float|int|long|short|(?:{ident}\.)*[A-Z][A-Za-z0-9_]*)"
             local_re = re.compile(
-                rf"\b(?P<type>{local_type}(?:<[^{{}};=]+?>)?(?:\[\])?)"
-                rf"\s+(?P<name>{ident})\s*(?==|;|\n|\}})"
+                rf"\b(?P<type>{local_type}(?:\s*<[^{{}};=]+?>)?(?:\[\])?)"
+                rf"\s+(?P<name>{ident})\s*(?==|;|\n|\}}|:|\bin\b)"
             )
+            typed_local_sites = {m.start(1) for m in map_decl.finditer(body)}
             for declaration in local_re.finditer(body):
                 site = declaration.start("name")
                 bindings.append((declaration["name"], *visible_range(site, True),
-                                 bool(re.fullmatch(map_type, declaration["type"]))))
+                                 site in typed_local_sites))
             for closure in re.finditer(r"\{\s*([^{}]*?)->", body):
                 closure_params = closure[1]
                 typed = set(map_decl.findall(closure_params))
