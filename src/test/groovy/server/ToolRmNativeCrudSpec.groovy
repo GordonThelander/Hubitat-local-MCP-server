@@ -34360,10 +34360,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         inside.preExistingStructuralIssues == [openIssue]
         !inside.containsKey("structuralIssues")
 
-        and: "anything the drive introduced still fails"
+        and: "anything the drive introduced still fails, and the pre-existing subset is still named"
         added.success == false
+        added.structuralIssues.size() == 2
+        added.preExistingStructuralIssues == [openIssue]
         orphan.success == false
-        !added.containsKey("preExistingStructuralIssues")
+        orphan.preExistingStructuralIssues == [openIssue]
 
         and: "one structural baseline per drive, taken without the page-rendering health probe"
         baselineCalls == 3

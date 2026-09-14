@@ -8921,8 +8921,14 @@ private List _rmPreExistingStructuralOnly(List baseline, Map finalHealth) {
             (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null) return null
     def after = ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }
     if (!after) return null
+    return _rmPreExistingStructuralSubset(baseline, finalHealth).size() == after.size() ? after : null
+}
+
+// Final structural issues that were already present in the baseline, matched one by one; empty without a baseline.
+private List _rmPreExistingStructuralSubset(List baseline, Map finalHealth) {
+    if (baseline == null || !(finalHealth instanceof Map)) return []
     def before = baseline.collect { it?.toString() } as Set
-    return after.every { before.contains(it) } ? after : null
+    return ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }.findAll { before.contains(it) }
 }
 
 // Auto-driver for walkStep (operation='drive'): run an ordered list of
@@ -9085,7 +9091,8 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     // A terminal drive that leaves any structural issue it introduced (an unclosed block included) is incomplete;
     // issues already present before the drive (e.g. building inside an open IF across calls) are reported, not failed.
     if (!finalHealthGate && (finalHealth?.structuralIssues as List)) result.structuralIssues = finalHealth.structuralIssues
-    if (preExistingStructural) result.preExistingStructuralIssues = preExistingStructural
+    def preExistingSubset = _rmPreExistingStructuralSubset(baselineStructural, finalHealth)
+    if (preExistingSubset) result.preExistingStructuralIssues = preExistingSubset
     // Fail-loud rollup: a success:false drive must ALWAYS carry a top-level reason. A step
     // error caught per-step otherwise lives only in steps[].error -- a weak signal for an
     // LLM caller that sees success:false with no top-level `error`. Surface the first failed
