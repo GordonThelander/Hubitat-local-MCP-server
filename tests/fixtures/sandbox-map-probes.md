@@ -207,3 +207,13 @@ closing PR's Testing section. Test-hub deployment, fixture restoration, and
 lease release are recorded there with the E2E run; they are distinct from the
 manual source-copy evidence above. The merge order remains this prerequisite
 first, then main into #411 with the blocking guard retained.
+
+### Unicode escape limitation
+
+Groovy decodes Unicode escapes before lexical analysis. This lint scans raw source
+and does not emulate that preprocessing: an escaped collision such as
+`m["cl\u0061ss"]` can be missed, and an escaped fixed fragment in an interpolated
+or concatenated key can incorrectly appear bounded. Review escaped key literals
+against their decoded value, including `fields`, `class`, and `metaClass`; prefer
+explicit `Map.get` / `Map.put` for unbounded data keys. This documents a scanner
+limitation, not general Groovy lexer emulation.

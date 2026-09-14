@@ -1242,7 +1242,7 @@ class ToolAppsDriversSpec extends ToolSpecBase {
     }
 
     @spock.lang.Unroll
-    def "restore reports missing undo after pre-restore capture fails at #failure"() {
+    def "restore aborts without writing after pre-restore capture fails at #failure"() {
         given:
         settingsMap.enableWrite = true
         stateMap.lastBackupTimestamp = 1234567890000L
@@ -1278,10 +1278,10 @@ class ToolAppsDriversSpec extends ToolSpecBase {
         def result = script.toolRestoreItemBackup([backupKey: 'app_228', confirm: true])
 
         then:
-        result.success == true
-        saved == ['BACKUPSRC']
+        result.success == false
+        saved.isEmpty()
         result.undoAvailable == false
-        result.warning
+        result.error.contains('Nothing was restored')
         !result.containsKey('preRestoreBackup')
         !result.containsKey('preRestoreFile')
         !result.containsKey('undoHint')
@@ -1296,12 +1296,14 @@ class ToolAppsDriversSpec extends ToolSpecBase {
         settingsMap.enableWrite = true
         stateMap.lastBackupTimestamp = 1234567890000L
         atomicStateMap.itemBackupManifest = [
-            app_228: [type: 'app', id: '228', fileName: 'backup.groovy', version: 5, timestamp: 1L]
+            app_228: [type: 'app', id: '228', fileName: 'backup.groovy', version: 5, timestamp: 1L],
+            prerestore_app_228: [type: 'app', id: '228', fileName: 'mcp-prerestore-app-228.groovy', version: 2, timestamp: 1L]
         ]
         def files = ['backup.groovy': 'BACKUPSRC'.getBytes('UTF-8')]
         def liveSource = 'CURRENT SOURCE'
         def uploads = []
-        script.metaClass.downloadHubFile = { String name -> files.get(name) }
+        def downloads = []
+        script.metaClass.downloadHubFile = { String name -> downloads << name; files.get(name) }
         script.metaClass.uploadHubFile = { String name, byte[] bytes -> uploads << name; files.put(name, bytes) }
         script.metaClass.hubInternalGet = { String path, Map params = null ->
             groovy.json.JsonOutput.toJson([source: liveSource, version: 7])
@@ -1324,7 +1326,7 @@ class ToolAppsDriversSpec extends ToolSpecBase {
         if (undoState == 'file missing') files.remove(undoFile)
         if (undoState == 'file changed') files.put(undoFile, 'OTHER UNDO'.getBytes('UTF-8'))
         if (undoState == 'different backup key') {
-            atomicStateMap.itemBackupManifest.put('app_alias', atomicStateMap.itemBackupManifest.app_228)
+            script._publishItemBackup('app_alias', script._itemBackupManifest().get('app_228'))
         }
         if (undoState == 'different backup contents') {
             files.put('backup.groovy', 'DIFFERENT SNAPSHOT'.getBytes('UTF-8'))
@@ -1335,7 +1337,9 @@ class ToolAppsDriversSpec extends ToolSpecBase {
 
         then:
         result.success == true
-        uploads == ['mcp-prerestore-app-228.groovy']
+        uploads == [first.preRestoreFile]
+        first.preRestoreFile ==~ /mcp-prerestore-app-228-[a-f0-9-]+\.groovy/
+        downloads.count(first.preRestoreFile) == (undoState in ['different backup key', 'different backup contents'] ? 1 : 2)
         result.undoAvailable == expectedUndo
         if (expectedUndo) {
             assert result.preRestoreBackup == first.preRestoreBackup

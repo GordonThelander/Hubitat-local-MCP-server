@@ -1159,6 +1159,55 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         uploads.size() == 2
     }
 
+    def "pending native baseline is not reused even when its file remains readable"() {
+        given:
+        hubGet.register('/installedapp/configure/json/503') { params -> ruleConfigJson(503, "pending") }
+        hubGet.register('/installedapp/statusJson/503') { params -> statusJson(503) }
+        Map files = [:]
+        script.metaClass.uploadHubFile = { String name, byte[] bytes -> files[name] = bytes }
+        script.metaClass.downloadHubFile = { String name -> files[name] }
+        script.metaClass.deleteHubFile = { String name -> files.remove(name) }
+        def first = script._rmBackupBeforeEdit(503, "pre-addAction")
+        script._publishItemBackup(first.backupKey.toString(),
+            script._itemBackupManifest()[first.backupKey.toString()] + [deletePending: true])
+
+        when:
+        def next = script._rmBackupBeforeEdit(503, "pre-addAction")
+
+        then:
+        next.baselineReused == false
+        next.backupKey != first.backupKey
+        files[next.fileName] != null
+    }
+
+    def "native baseline reuse repairs an oversized manifest without evicting the baseline"() {
+        given:
+        hubGet.register('/installedapp/configure/json/503') { params -> ruleConfigJson(503, "cap") }
+        hubGet.register('/installedapp/statusJson/503') { params -> statusJson(503) }
+        Map files = [:]
+        script.metaClass.uploadHubFile = { String name, byte[] bytes -> files[name] = bytes }
+        script.metaClass.downloadHubFile = { String name -> files[name] }
+        List deleted = []
+        script.metaClass.deleteHubFile = { String name -> deleted << name; files.remove(name) }
+        def first = script._rmBackupBeforeEdit(503, "pre-addAction")
+        Map oversized = script._itemBackupManifest()
+        (1..22).each {
+            oversized["app_${it}".toString()] = [type: 'app', id: it.toString(), fileName: "mcp-backup-app-${it}.groovy".toString(),
+                                                 timestamp: (long) it, version: 1, sourceLength: 3]
+        }
+        script._commitItemBackupManifest(oversized)
+
+        when:
+        def next = script._rmBackupBeforeEdit(503, "pre-walkStep")
+
+        then:
+        next.baselineReused == true
+        next.backupKey == first.backupKey
+        atomicStateMap.itemBackupManifest.size() == 20
+        atomicStateMap.itemBackupManifest.containsKey(first.backupKey.toString())
+        deleted == (1..3).collect { "mcp-backup-app-${it}.groovy".toString() }
+    }
+
     def "baseline reuse survives a worker execution reading a stale manifest snapshot"() {
         given:
         def clock = [1234567890000L]
@@ -1175,7 +1224,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         clock[0] += 30 * 1000L
         def second = script._rmBackupBeforeEdit(503, "pre-addActions-bulk")
 
-        then: 'the JVM mirror carries the handle across the visibility gap'
+        then: 'the committed backup view carries the handle across the visibility gap'
         second.baselineReused == true
         second.backupKey == first.backupKey
     }
@@ -1421,6 +1470,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                               appLabel: "restored", timestamp: 1000, sourceLength: snapshotBytes.length]
         ]
         script.metaClass.downloadHubFile = { String fn ->
+            assert Thread.holdsLock(scriptStaticField('ITEM_BACKUP_MANIFESTS'))
             fn == "mcp-rm-backup-300-x.json" ? snapshotBytes : null
         }
         hubGet.register('/installedapp/configure/json/300') { params ->
@@ -1431,6 +1481,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
         def posts = []
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            assert !Thread.holdsLock(scriptStaticField('ITEM_BACKUP_MANIFESTS'))
             posts << [path: path, body: body]
             [status: 200, location: null, data: '{"status":"success"}']
         }
@@ -2288,7 +2339,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                      it.body?.any { k, v -> k?.toString()?.startsWith("settings[actSubType.") && v == "getIfThen" } }
 
         and: "(deferral) the rule is flagged predClearPending so the next addAction runs the clear just-in-time"
-        atomicStateMap.predClearPending?.get("100") == true
+        atomicStateMap.predClearPending?.get("100") instanceof String
+        !atomicStateMap.predClearPending.get("100").isEmpty()
 
         and: "no actionCancel / actionDone here -- the ghost slot is never opened during the RE build"
         !posts.any { it.path == "/installedapp/btn" && it.body?.name in ["actionCancel", "actionDone"] }
@@ -2719,12 +2771,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         atomicStateMap.predClearPending?.get("100") == true
     }
 
-    def "replaceRequiredExpression restore drops the deferred predCapabs-clear flag (null-backup early return)"() {
-        // D. _rmRestoreCommittedREFromBackup rolls back a failed new-RE build, so it drops any
-        // predClearPending the failed build flagged (lib ~10641, at the top before the fileName check):
-        // the restored rule's predCapabs comes from a clean backup, and a leftover flag would fire a
-        // wasted ghost clear on the rule's next addAction. The null-backup early-return path
-        // (fileName == null) reaches the drop and needs no hub stubs.
+    def "replaceRequiredExpression restore preserves the deferred predCapabs-clear flag when no backup exists"() {
+        // A rollback that cannot restore anything must keep its recovery intent.
         given:
         enableWrite()
         atomicStateMap.predClearPending = ["100": true]
@@ -2735,8 +2783,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "the restore reports the RE was NOT restored (no backup to restore from)"
         result.requiredExpressionRestored == false
 
-        and: "the deferred predCapabs-clear flag is dropped -- the rolled-back build's flag is cleared"
-        !atomicStateMap.predClearPending?.get("100")
+        and: "the deferred clear remains available for a later recovery attempt"
+        atomicStateMap.predClearPending?.get("100") == true
     }
 
     def "toolDeleteNativeApp force-delete drops the deferred predCapabs-clear flag"() {
@@ -24824,7 +24872,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule create via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -24895,7 +24943,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule update via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()

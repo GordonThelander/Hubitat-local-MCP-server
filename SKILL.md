@@ -297,9 +297,9 @@ Exception: `toolCreateHubBackup` checks `confirm` directly without requiring a p
 **`backupItemSource(type, id)`** — Automatic item-level backup for modify/delete operations:
 - Called by `hub_update_app`, `hub_update_driver`, `hub_delete_item` (type=app|driver) before making changes
 - Fetches current source code and saves as a `.groovy` file in the hub's local File Manager via `uploadHubFile()`
-- Metadata (type, id, version, timestamp, fileName, sourceLength) stored in `state.itemBackupManifest` keyed by `"app_<id>"` or `"driver_<id>"`
-- 1-hour window: if a backup of the same item exists within the last hour, it is kept (preserves the pre-edit original across a series of edits)
-- Prunes to max 20 entries; oldest file deleted via `deleteHubFile()` when limit exceeded
+- Metadata (type, id, version, timestamp, fileName, sourceLength) stored in `atomicState.itemBackupManifest` keyed by `"app_<id>"` or `"driver_<id>"`
+- 1-hour window: if a backup of the same item exists within the last hour and is not pending deletion, it is kept (preserves the pre-edit original across a series of edits)
+- Retains max 20 entries across all backup types: the trimmed manifest is committed first, then files no entry references are deleted via `deleteHubFile()` (a failed delete leaves an orphan file, never a dangling entry)
 - No size limit — full source always stored (File Manager has ~1GB capacity)
 - Not needed for install tools (nothing to lose when creating new)
 - Files persist even if MCP app is uninstalled; accessible at `http://<HUB_IP>/local/<filename>`
@@ -308,7 +308,7 @@ Exception: `toolCreateHubBackup` checks `confirm` directly without requiring a p
 **Item Backup Tools** (3 tools — reads available under the Read master, restore under the Write master):
 - `hub_list_backups` — lists all backups with metadata (type, id, version, age, size) and direct download URLs
 - `hub_get_backup` — retrieves full source code from a backup via `downloadHubFile()` by key (e.g., `app_123`); returns source inline for files ≤60KB, otherwise provides download URL
-- `hub_restore_backup` — reads backup via `downloadHubFile()` and pushes source back to the hub via `hub_update_app`/`hub_update_driver` (requires the Write master); removes manifest entry first so the current code gets backed up during restore; on failure, puts the manifest entry back
+- `hub_restore_backup` — reads backup via `downloadHubFile()` and writes the source through the hub's save endpoint directly (requires the Write master); for app/driver restores, first captures the current source under a distinct pre-restore key (returned as `preRestoreBackup` / `undoHint`). A failed required capture aborts before saving. Only an already-matching retry may succeed without verified undo, with `undoAvailable=false` and a warning. Rule snapshots use their own replay path; library restores use `hub_update_library` with the saved source
 - Every tool response includes `howToRestore` and `manualRestore` instructions for user recovery without MCP
 - All operations are fully local — no cloud involvement
 
@@ -394,14 +394,20 @@ Native requests use the fixed `http://127.0.0.1:8080` loopback endpoint on the h
 ### State Management
 
 **Parent app `state.*`:**
+
 | Key | Type | Purpose |
 |-----|------|---------|
 | `accessToken` | String | OAuth token for MCP endpoint |
 | `ruleVariables` | Map | Global variables shared across rules |
 | `debugLogs` | Map | Small `{config: {logLevel, maxEntries}}` only; entries use a bounded class cache backed by native Past Logs |
 | `lastBackupTimestamp` | Long | Newest known hub backup epoch ms (24-hour write safety gate; stamped by hub_create_backup or refreshed from the hub's local backup list on a gate fallback) |
-| `itemBackupManifest` | Map | Metadata for source code backups stored in File Manager, keyed by `"app_<id>"` / `"driver_<id>"` / `"library_<id>"`, max 20 entries |
 | `updateCheck` | Map | `{latestVersion, checkedAt, updateAvailable}` |
+
+**Parent app `atomicState.*`:**
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `itemBackupManifest` | Map | Shared File Manager backup index for app/driver/library source, rule snapshots, and pre-restore undo; max 20 entries |
 
 Legacy device captures live in per-app class-static memory, not `state` or `atomicState`. Existing `capturedDeviceStates` keys are imported and removed on capture-store access; captures are intentionally lost on app code reload or hub restart. See `docs/capture-storage.md`.
 

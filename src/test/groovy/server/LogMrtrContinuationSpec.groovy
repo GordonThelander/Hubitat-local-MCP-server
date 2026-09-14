@@ -261,6 +261,116 @@ class LogMrtrContinuationSpec extends ToolSpecBase {
         pending << [true, false]
     }
 
+    def "leaked reader retention is bounded for #phase snapshots"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        snapshots.put('stale', [at: timestamp, pending: phase != 'ready', readers: 1,
+            replayProtected: true, work: [tool: phase == 'health' ? 'hub_get_device_health' : 'hub_get_logs']])
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + ttl })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        snapshots.get('stale').readers == 1
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + 599999L })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        snapshots.get('stale').readers == 1
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + 600000L })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        !snapshots.containsKey('stale')
+
+        where:
+        phase    | ttl
+        'logs'   | 90000L
+        'health' | 240000L
+        'ready'  | 30000L
+    }
+
+    def "hard expiry recovers all eight leaked slots and fences an old queued worker"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        (0..<8).each { index ->
+            snapshots.put("402:app:${index}".toString(), [at: timestamp - 600000L,
+                pending: true, readers: 1, fetchId: 'old'])
+        }
+        Map oldJob = [key: '402:app:0', owner: '402', fetchId: 'old', query: [type: 'app', id: '0']]
+        hubGet.register('/logs/past/json') { params -> 'new result' }
+
+        when:
+        def result = script._nativeLogSnapshot([type: 'app', id: '0'], [__reqT0: timestamp - 10000L])
+        script.runNativeLogFetch(oldJob)
+
+        then:
+        result.state == 'pending'
+        snapshots.size() == 1
+        snapshots.get('402:app:0').fetchId != 'old'
+        runInMillisCalls.size() == 1
+        hubGet.calls.empty
+
+        when:
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+
+        then:
+        snapshots.get('402:app:0').text == 'new result'
+        hubGet.calls.size() == 1
+    }
+
+    def "an in-flight worker cannot publish across hard expiry"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp - 10000L])
+        Map oldJob = runInMillisCalls[0][2].data as Map
+        snapshots.get(oldJob.key).readers = 1
+        hubGet.register('/logs/past/json') { params ->
+            NOW_OVERRIDE.set({ -> timestamp + 600000L })
+            script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+            'old result'
+        }
+
+        when:
+        script.runNativeLogFetch(oldJob)
+
+        then:
+        runInMillisCalls.size() == 2
+        snapshots.get(oldJob.key).fetchId == runInMillisCalls[1][2].data.fetchId
+        snapshots.get(oldJob.key).pending == true
+        !snapshots.get(oldJob.key).containsKey('text')
+        hubGet.calls.size() == 1
+    }
+
+    def "hard expiry during observation leaves replacement reader accounting intact"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            NOW_OVERRIDE.set({ -> timestamp + 600000L })
+            script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+            snapshots.get('402:app:42').readers = 2
+        })
+
+        when:
+        script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+
+        then:
+        def failure = thrown(IllegalStateException)
+        failure.message.contains('snapshot expired or was lost')
+        runInMillisCalls.size() == 2
+        snapshots.get('402:app:42').readers == 2
+        hubGet.calls.empty
+    }
+
     def "a lost or replaced foreground snapshot fails without claiming replacement readers replacement=#replacement"() {
         given:
         Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map

@@ -487,16 +487,40 @@ _RETIRED_KEY_PATTERN = "|".join(map(re.escape, RETIRED_PERSISTED_DERIVED_KEYS))
 # Include compound writes while leaving equality and regex comparisons readable.
 _RETIRED_ASSIGNMENT = r"\s*(?:\*\*|>>>|>>|<<|[+\-*/%&|^])?=(?![=~])"
 _RETIRED_DOT_WRITE = re.compile(
-    rf"\b(?:atomicState|state)\s*\.\s*(?P<key>{_RETIRED_KEY_PATTERN})\b"
+    rf"\b(?P<store>atomicState|state)\s*\??\.\s*(?P<key>{_RETIRED_KEY_PATTERN})\b"
     r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
 )
+# The bracket regexes run on masked source, where a string literal is blanked to
+# spaces (quotes included); the key is recovered from the original line at the span.
 _RETIRED_BRACKET_WRITE = re.compile(
-    r"\b(?:atomicState|state)\s*\[(?P<literal>[ \t]*)\]"
+    r"\b(?P<store>atomicState|state)\s*\[(?P<literal>[ \t]*)\]"
     r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
 )
 _RETIRED_BRACKET_LITERAL = re.compile(
     rf"\s*(?P<quote>['\"])(?P<key>{_RETIRED_KEY_PATTERN})(?P=quote)\s*"
 )
+_STATE_QUOTED_PROPERTY_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\??\.(?P<literal>[ \t]+)"
+    r"(?:\s*(?:\[[^]]*\]|\??\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+
+
+def _literal_state_writes(line: str, original: str, dot_re, bracket_re, literal_re) -> list[tuple[str, str]]:
+    """(store, key) pairs assigned on one masked line; bracket keys are recovered from the original."""
+    # Interpolation remains executable in the mask: state."${name}" must not
+    # masquerade as a literal state.name assignment.
+    writes = []
+    for match in dot_re.finditer(line):
+        prefix = re.sub(r"/\*.*?\*/", "", original[match.end("store"):match.start("key")])
+        if not any(quote in prefix for quote in ("'", '"')):
+            writes.append((match.group("store"), match.group("key")))
+    for pattern in (bracket_re, _STATE_QUOTED_PROPERTY_WRITE):
+        for match in pattern.finditer(line):
+            start, end = match.span("literal")
+            literal = literal_re.fullmatch(original[start:end])
+            if literal:
+                writes.append((match.group("store"), literal.group("key")))
+    return writes
 
 
 def _scan_retired_persisted_key_writes(display_path: str, source: str) -> list[dict]:
@@ -506,13 +530,9 @@ def _scan_retired_persisted_key_writes(display_path: str, source: str) -> list[d
     for line_num, (line, original) in enumerate(
         zip(strip_comments_and_strings(source), source_lines, strict=True), start=1
     ):
-        keys = [m.group("key") for m in _RETIRED_DOT_WRITE.finditer(line)]
-        for match in _RETIRED_BRACKET_WRITE.finditer(line):
-            start, end = match.span("literal")
-            literal = _RETIRED_BRACKET_LITERAL.fullmatch(original[start:end])
-            if literal:
-                keys.append(literal.group("key"))
-        for key in keys:
+        for _store, key in _literal_state_writes(
+            line, original, _RETIRED_DOT_WRITE, _RETIRED_BRACKET_WRITE, _RETIRED_BRACKET_LITERAL
+        ):
             findings.append({
                 "file": display_path,
                 "line": line_num,
@@ -521,6 +541,63 @@ def _scan_retired_persisted_key_writes(display_path: str, source: str) -> list[d
                     f"Do not persist retired code-derived cache `{key}` in state/atomicState; "
                     "keep derived metadata in class memory. Reads and remove-based migration "
                     "cleanup remain allowed."
+                ),
+                "severity": "error",
+                "source": original.strip(),
+            })
+    return findings
+
+
+# New durable structures require an explicit storage-contract review, even when
+# their name differs from a retired cache. Keep it in sync with the table in
+# docs/state-storage-audit.md.
+PERSISTED_STATE_INVENTORY = {
+    "state": {
+        "accessToken", "ruleToDelete", "customEngineMigrated", "ruleVariables",
+        "headersReadable", "originLocalIpReadable", "updateCheck",
+        "lastBackupTimestamp", "debugLogs",
+    },
+    "atomicState": {
+        "mrtrRequests", "packageDeployInFlight", "lastSelfDeploy",
+        "hubSecurityCookie", "hubSecurityCookieExpiry", "itemBackupManifest",
+        "debugLogGeneration", "parentAppIds", "inUseHubVars", "variableHistory",
+        "hubVarsAppId", "predClearPending",
+    },
+}
+# `(?<![.\w])` keeps a member chain such as node.state.x from reading as app state.
+_INVENTORY_DOT_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\??\.\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+_INVENTORY_BRACKET_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\[(?P<literal>[ \t]*)\]"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+_INVENTORY_BRACKET_LITERAL = re.compile(r"\s*(?P<quote>['\"])(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)\s*")
+
+
+def _scan_persisted_state_inventory(display_path: str, source: str) -> list[dict]:
+    """Flag new literal state assignments outside the reviewed inventory in the server and included libraries."""
+    path = display_path.replace("\\", "/")
+    if path != "hubitat-mcp-server.groovy" and not path.startswith("libraries/"):
+        return []
+    findings = []
+    for line_num, (line, original) in enumerate(
+        zip(strip_comments_and_strings(source), source.split("\n"), strict=True), start=1
+    ):
+        for store, key in _literal_state_writes(
+            line, original, _INVENTORY_DOT_WRITE, _INVENTORY_BRACKET_WRITE, _INVENTORY_BRACKET_LITERAL
+        ):
+            if key in PERSISTED_STATE_INVENTORY[store] or key in RETIRED_PERSISTED_DERIVED_KEYS:
+                continue
+            findings.append({
+                "file": display_path,
+                "line": line_num,
+                "rule": "PERSISTED_STATE_INVENTORY",
+                "message": (
+                    f"Review new durable `{store}.{key}`: document growth, write frequency and "
+                    "durability in docs/state-storage-audit.md before adding it to the lint inventory. "
+                    "Keep bulk per-call caches in class memory."
                 ),
                 "severity": "error",
                 "source": original.strip(),
@@ -601,6 +678,7 @@ def scan_source(source: str, display_path: str) -> list[dict]:
                 )
 
     findings.extend(_scan_retired_persisted_key_writes(display_path, source))
+    findings.extend(_scan_persisted_state_inventory(display_path, source))
     return findings
 
 
@@ -3324,6 +3402,11 @@ MAP_SUBSCRIPT_SELF_TEST_CASES = [
         {"libraries/x.groovy": "def copy(Map src) {\n def m = [:]\n ['a', 'b'].each { k -> m[k] = src.get(k) }\n return m\n}\n"},
         [],
     ),
+    ('unquoted composed Map key -- must-catch', {"libraries/x.groovy": 'def f(k, suffix) {\n def m = [:]\n m[k + suffix] = 1\n}\n'}, [("libraries/x.groovy", 3)]),
+    ('unquoted composed List key -- must-not-catch', {"libraries/x.groovy": 'def f(k, suffix) {\n def m = []\n m[k + suffix] = 1\n}\n'}, []),
+    ('qualified Map field -- must-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final java.util.Map CACHE = [:]\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, [("libraries/x.groovy", 2)]),
+    ('inferred Map field -- must-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final def CACHE = [:]\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, [("libraries/x.groovy", 2)]),
+    ('inferred List field -- must-not-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final def CACHE = []\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, []),
     (
         "app @Field Map written with a dynamic key from a library -- must-catch",
         {"hubitat-mcp-server.groovy": "@groovy.transform.Field static final Map CACHE = new java.util.HashMap()\n",
@@ -4875,7 +4958,11 @@ def check_sandbox_map_subscripts(
     cast_map = re.compile(rf"\b({ident})\s*=\s*[^\n;]*\bas\s+Map\b")
     field_map = re.compile(
         rf"@(?:groovy\.transform\.)?Field\s+(?:(?:static|final|private|protected|public)\s+)*"
-        rf"{map_type}\s+({ident})\b"
+        rf"(?:java\.util\.(?:concurrent\.)?)?{map_type}\s+({ident})\b"
+    )
+    field_inferred = re.compile(
+        rf"@(?:groovy\.transform\.)?Field\s+(?:(?:static|final|private|protected|public)\s+)*"
+        rf"(?:def\s+)?({ident})\s*=\s*([^\n;]+)"
     )
     # A safe-navigation receiver (ctx?.data[key]) is the same Map access; the
     # receiver is normalised without its '?' before it is looked up.
@@ -4887,16 +4974,10 @@ def check_sandbox_map_subscripts(
         rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[\s*"
         r"(?P<quote>['\"])(?P<key>fields|class|metaClass)(?P=quote)\s*\]"
     )
-    # Composed keys are dynamic too: an interpolated GString, or a literal
-    # concatenated with an expression on either side. Matched on the RAW body
-    # (masking blanks the literal halves) and correlated back to code below.
-    composed_re = re.compile(
-        rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[\s*(?P<key>"
-        r"\"[^\"\n]*\$(?:\{|[A-Za-z_])[^\"\n]*\""
-        r"|(?:\"[^\"\n]*\"|'[^'\n]*')\s*\+[^\]\n]+"
-        rf"|{ident}(?:\??\.{ident})*(?:\(\))?\s*\+\s*(?:\"[^\"\n]*\"|'[^'\n]*')[^\]\n]*"
-        r")\s*\]"
-    )
+    # Balance the outer subscript so nested call arguments and List indices
+    # remain part of a composed key, rather than ending a regex match early.
+    subscript_open_re = re.compile(rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[")
+    interpolated_key_re = re.compile(r'"[^"\n]*\$(?:\{|[A-Za-z_])[^"\n]*"')
     # The raw literal is correlated against executable code below; a quoted
     # example in a comment cannot establish a safe branch.
     bounded_if_re = re.compile(
@@ -4976,7 +5057,7 @@ def check_sandbox_map_subscripts(
             if token == "+":
                 return (is_map_expression(expression[:pos], maps, returns)
                         and is_map_expression(expression[pos + 1:], maps, returns))
-        constructor = re.match(rf"new\s+{map_type}\s*\(", expression)
+        constructor = re.match(rf"new\s+(?:java\.util\.(?:concurrent\.)?)?{map_type}\s*\(", expression)
         call = re.match(rf"({ident})\s*\(", expression)
         if constructor or (call and call[1] in returns):
             opening = (constructor or call).end() - 1
@@ -5136,8 +5217,13 @@ def check_sandbox_map_subscripts(
     # library at runtime (they are one class), so field inference follows the
     # same parent/child scope as return inference, not the file boundary.
     field_maps_by_scope: dict[str, set[str]] = {}
+    inferred_fields_by_scope: dict[str, set[str]] = {}
     for path, code in masked.items():
         field_maps_by_scope.setdefault(return_scope(path), set()).update(field_map.findall(code))
+        inferred_fields_by_scope.setdefault(return_scope(path), set()).update(
+            name for name, expression in field_inferred.findall(code)
+            if is_map_expression(expression, set(), set())
+        )
 
     def brace_blocks(body: str) -> list[tuple[int, int]]:
         blocks = []
@@ -5182,13 +5268,14 @@ def check_sandbox_map_subscripts(
         code = masked[path]
         raw_lines = source.split("\n")
         field_maps = field_maps_by_scope.get(return_scope(path), set())
+        inferred_fields = inferred_fields_by_scope.get(return_scope(path), set())
         for method, params, opening, end, body in methods_by_path[path]:
             raw_body = source[opening + 1:end]
             explicit_maps = set(map_decl.findall(params))
             explicit_maps.update(map_decl.findall(body))
             explicit_maps.update(field_maps)
             returns = map_returns[return_scope(path)]
-            maps = explicit_maps | inferred_maps(params, body, returns)
+            maps = explicit_maps | inferred_fields | inferred_maps(params, body, returns)
             # Groovy scope, not method-wide membership: a declaration (typed
             # local, closure parameter, `def x = [:]`) binds a name only inside
             # its innermost brace block and only after its position, so a
@@ -5317,12 +5404,14 @@ def check_sandbox_map_subscripts(
                         return False
                 return True
 
-            def map_at(receiver: str, pos: int, *, inferred_sites=inferred_sites) -> bool:
-                return explicit_at(receiver, pos) or (not list_at(receiver, pos) and any(
+            def map_at(receiver: str, pos: int, *, inferred_sites=inferred_sites,
+                       inferred_fields=inferred_fields) -> bool:
+                field_inferred_here = receiver in inferred_fields and binding_at(receiver, pos) is None
+                return explicit_at(receiver, pos) or (not list_at(receiver, pos) and (field_inferred_here or any(
                     name == receiver and start < pos < stop
                     and binding_at(receiver, start) == binding_at(receiver, pos)
                     for name, start, stop in inferred_sites
-                ))
+                )))
 
             for dest, expression, start in assignments:
                 visible_maps = {name for name in maps if map_at(name, start)}
@@ -5381,12 +5470,12 @@ def check_sandbox_map_subscripts(
                     f"Measured {'write' if writing else 'read'} collision for '{key}' "
                     f"on {receiver}; preserve the key with Map.{'put' if writing else 'get'}.")
 
-            def composed_key_can_collide(raw_key: str) -> bool:
+            def composed_key_can_collide(raw_key: str, masked_key: str) -> bool:
                 # A composed key is bounded by its fixed parts: "switch${id}.@N"
                 # can never spell fields/class/metaClass, "${k}" or k + "s" can.
                 # Literal fragments stay literal, everything else is a wildcard.
                 parts = []
-                for pos, token in outer_expression_tokens(raw_key):
+                for pos, token in outer_expression_tokens(masked_key):
                     if token == "+":
                         parts.append(pos)
                 pieces = [raw_key[i + 1:j].strip() for i, j in
@@ -5398,6 +5487,10 @@ def check_sandbox_map_subscripts(
                         if piece[0] == '"':
                             inner = re.sub(rf"\$\{{[^}}]*\}}|\${ident}(?:\.{ident})*", "\0", inner)
                         skeleton += "".join(".*" if ch == "\0" else re.escape(ch) for ch in inner)
+                    elif re.fullmatch(r"[+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?[lLfFdDgG]?", piece):
+                        # Numeric addition stays numeric; string concatenation
+                        # retains a digit, excluding every measured collision.
+                        skeleton += re.escape(piece)
                     else:
                         skeleton += ".*"
                 return any(re.fullmatch(skeleton, name) for name in collisions)
@@ -5409,10 +5502,25 @@ def check_sandbox_map_subscripts(
                 # the composed scan below reports it with its real key.
                 if subscript_re.fullmatch(raw_body[access.start():access.end()]):
                     accesses.append((access.start(), access.end(), *access.group("receiver", "key")))
-            for access in composed_re.finditer(raw_body):
-                if (body[access.start():].startswith(access.group("receiver"))
-                        and composed_key_can_collide(access.group("key"))):
-                    accesses.append((access.start(), access.end(), *access.group("receiver", "key")))
+            for access in subscript_open_re.finditer(body):
+                stop = close_delimiter(body, access.end() - 1, "[", "]")
+                if stop == len(body):
+                    continue
+                raw_key = raw_body[access.end():stop]
+                masked_key = body[access.end():stop]
+                # Strip parentheses together to retain raw/masked offset parity.
+                while True:
+                    leading = len(raw_key) - len(raw_key.lstrip())
+                    raw_key = raw_key.strip()
+                    masked_key = masked_key[leading:leading + len(raw_key)]
+                    if not (masked_key.startswith("(") and
+                            close_delimiter(masked_key, 0, "(", ")") == len(masked_key) - 1):
+                        break
+                    raw_key, masked_key = raw_key[1:-1], masked_key[1:-1]
+                composed = (interpolated_key_re.fullmatch(raw_key) or
+                            any(token == "+" for _, token in outer_expression_tokens(masked_key)))
+                if composed and composed_key_can_collide(raw_key, masked_key):
+                    accesses.append((access.start(), stop + 1, access.group("receiver"), raw_key))
             for start, end, receiver, key in sorted(accesses):
                 receiver = receiver.replace("?", "")
                 if not map_at(receiver, start):
