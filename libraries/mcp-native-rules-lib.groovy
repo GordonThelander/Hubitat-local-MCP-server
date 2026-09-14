@@ -8903,6 +8903,28 @@ private boolean _rmHealthGatePass(Map health) {
     return health?.ok == true || health?.unreadable == true
 }
 
+// Structural issues of an RM rule computed the same way the health check does, from the compiled action list and
+// statusJson settings only. Null when the rule is not a readable RM rule.
+List _rmStructuralBaseline(Integer appId) {
+    def cs = _ruleCompiledState(appId)
+    if (cs == null || cs.ruleFormat != "rm") return null
+    def settingsByName = _rmFetchSettingsByName(appId)
+    return _rmStructuralIssuesFromSequence(_rmStructuralSequenceFromSettings(settingsByName, ([] as Set), _rmCoerceActionIndices(cs.actionList)))
+        .collect { it?.toString() }
+}
+
+// Non-empty list when the final verdict fails ONLY on structural issues that were all present in the baseline
+// taken before the drive; null otherwise (no baseline, any new issue, or any other kind of breakage still fails).
+private List _rmPreExistingStructuralOnly(List baseline, Map finalHealth) {
+    if (baseline == null || !(finalHealth instanceof Map) || finalHealth.ok == true || finalHealth.unreadable == true) return null
+    if (finalHealth.broken == true || (finalHealth.brokenMarkers as List) || (finalHealth.orphanedActionRows as List) ||
+            (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null) return null
+    def after = ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }
+    if (!after) return null
+    def before = baseline.collect { it?.toString() } as Set
+    return after.every { before.contains(it) } ? after : null
+}
+
 // Auto-driver for walkStep (operation='drive'): run an ordered list of
 // single-step operations in one call, composing _rmWalkStep per step. Each
 // step is a normal walkStep spec ({operation, page?, write?/click?/navigate?/
@@ -8945,6 +8967,10 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             throw new IllegalArgumentException("walkStep.drive steps cannot nest operation='drive' (step ${i + 1})")
         }
     }
+    // Structural baseline before any step, from the compiled action list and app settings (no page render, so an
+    // in-flight wizard is never reset). The terminal gate then fails only on structural issues this drive introduced.
+    List baselineStructural = null
+    try { baselineStructural = _rmStructuralBaseline(appId) } catch (Exception ignored) { /* no baseline: strict gate */ }
     int idx = 0
     for (def rawStep : steps) {
         idx++
@@ -9044,6 +9070,8 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     // must not fail a drive whose every step committed cleanly; a skipped probe
     // (budget shed) likewise. Positive evidence of breakage still gates.
     boolean finalHealthGate = _rmHealthGatePass(finalHealth)
+    def preExistingStructural = _rmPreExistingStructuralOnly(baselineStructural, finalHealth)
+    if (!finalHealthGate && preExistingStructural) finalHealthGate = true
     def result = [
         success: allOk && finalHealthGate,
         operation: "drive",
@@ -9054,8 +9082,10 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         steps: stepResults,
         health: finalHealth
     ]
-    // A terminal drive that leaves any structural issue (an unclosed block included) is incomplete.
+    // A terminal drive that leaves any structural issue it introduced (an unclosed block included) is incomplete;
+    // issues already present before the drive (e.g. building inside an open IF across calls) are reported, not failed.
     if (!finalHealthGate && (finalHealth?.structuralIssues as List)) result.structuralIssues = finalHealth.structuralIssues
+    if (preExistingStructural) result.preExistingStructuralIssues = preExistingStructural
     // Fail-loud rollup: a success:false drive must ALWAYS carry a top-level reason. A step
     // error caught per-step otherwise lives only in steps[].error -- a weak signal for an
     // LLM caller that sees success:false with no top-level `error`. Surface the first failed

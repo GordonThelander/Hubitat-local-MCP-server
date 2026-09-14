@@ -10530,11 +10530,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             ruleConfigJson(100, "r", [[name: "tCapab1", type: "enum", options: ["Switch"]]])
         }
         hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
-        // 1-step drive => two health checks total: the step's own (read #1, clean) and the
-        // post-loop finalHealth (read #2, broken). Flip broken:true on read #2+.
+        // 1-step drive => three compiled-state reads: the pre-drive structural baseline (#1), the step's
+        // own health check (#2, clean) and the post-loop finalHealth (#3, broken). Flip broken:true on read #3+.
         hubGet.register('/app/ruleBuilderJson/100') { params ->
             rb.n = rb.n + 1
-            JsonOutput.toJson([broken: (rb.n >= 2)])
+            JsonOutput.toJson([broken: (rb.n >= 3)])
         }
         script.metaClass.uploadHubFile = { String fn, byte[] b -> }
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
@@ -34258,10 +34258,14 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         healthCalls == 2
     }
 
-    def "walkStep drive: a terminal open block fails; only a budget pause with declared steps remaining may return in_progress"() {
+    def "walkStep drive: a terminal open block it introduced fails; only a budget pause with declared steps remaining may return in_progress"() {
         given:
         enableWrite()
         def verdict = null
+        def healthy = [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                       multipleFlagPoison: [], configPageError: null, structuralIssues: [], issues: []]
+        // The pre-drive structural baseline is clean, so every final issue is new to the drive.
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
         script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" -> verdict }
         hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
         hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "hasAll", type: "button"]]) }
@@ -34298,6 +34302,72 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         and: "only the pause with a declared step remaining returns in_progress"
         paused.status == "in_progress"
         paused.stepsRemaining?.size() == 1
+    }
+
+    def "_rmStructuralBaseline reports an open IF from the compiled action list and settings without a page render"() {
+        given:
+        def configFetches = 0
+        hubGet.register('/installedapp/configure/json/100') { params -> configFetches++; ruleConfigJson(100, "r", []) }
+        hubGet.register('/app/ruleBuilderJson/100') { params -> JsonOutput.toJson([broken: false, actionList: [2, 3]]) }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, [[name: "actType.2", value: "condActs"], [name: "actSubType.2", value: "getIfThen"],
+                             [name: "actType.3", value: "switchActs"], [name: "actSubType.3", value: "getOnOffSwitch"]])
+        }
+
+        when:
+        def issues = script._rmStructuralBaseline(100)
+
+        then: "the same open-block issue the health check reports, and no config page was rendered"
+        issues?.size() == 1
+        issues[0].contains("action 2 (IF) opened a block that was never closed")
+        configFetches == 0
+    }
+
+    def "walkStep drive inside a block that was already open passes and reports the pre-existing issue; a new issue still fails"() {
+        given:
+        enableWrite()
+        def openIssue = "action 5 (IF) opened a block that was never closed — rule is missing an END-IF"
+        def base = [ok: false, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                    multipleFlagPoison: [], configPageError: null, issues: ["structural imbalance"]]
+        def baseline = null
+        def verdict = null
+        def baselineCalls = 0
+        def renderSources = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> baselineCalls++; baseline }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" -> renderSources << source; verdict }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "actionDone", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+        def drive = [appId: 100, walkStep: [operation: "drive", steps: [[page: "doActPage", operation: "click", click: [name: "actionDone"]]]], confirm: true]
+
+        when: "the IF was open before the drive and the drive leaves exactly that issue"
+        baseline = [openIssue]
+        verdict = base + [structuralIssues: [openIssue]]
+        def inside = script.toolSetRule(drive)
+
+        and: "the drive leaves a second structural issue that was not in the baseline"
+        verdict = base + [structuralIssues: [openIssue, "action 7 (IF) opened a block that was never closed — rule is missing an END-IF"]]
+        def added = script.toolSetRule(drive)
+
+        and: "the baseline issue persists but the drive also leaves an orphaned row"
+        verdict = base + [structuralIssues: [openIssue], orphanedActionRows: ["action 8 leftover"]]
+        def orphan = script.toolSetRule(drive)
+
+        then: "building inside the existing block succeeds and names the pre-existing issue"
+        inside.success == true
+        inside.preExistingStructuralIssues == [openIssue]
+        !inside.containsKey("structuralIssues")
+
+        and: "anything the drive introduced still fails"
+        added.success == false
+        orphan.success == false
+        !added.containsKey("preExistingStructuralIssues")
+
+        and: "one structural baseline per drive, taken without the page-rendering health probe"
+        baselineCalls == 3
+        renderSources.size() == 3
     }
 
     def "addAction ifThen: Between two times reveals start/end chain"() {
