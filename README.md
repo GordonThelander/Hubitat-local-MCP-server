@@ -1660,6 +1660,7 @@ For easier bug reporting:
 
 ## Version History
 
+- **v4.3.2** - fix: complete sandbox Map validation and enforce blocking lint. PRs: [#418](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/418)
 - **v4.3.1** - fix: run MRTR writes in the first request instead of a mutation-free preflight. PRs: [#422](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/422)
 - **v4.3.0** - fix: expire retained request state reliably; fix: use native device operations while honoring the allowlist. PRs: [#417](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/417), [#420](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/420)
 - **v4.2.7** - fix: preserve sandbox Map keys across tool boundaries; feat: expose device preferences and repair device diagnostics. PRs: [#416](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/416), [#411](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/411)
