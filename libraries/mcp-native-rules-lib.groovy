@@ -8918,7 +8918,8 @@ List _rmStructuralBaseline(Integer appId) {
 private List _rmPreExistingStructuralOnly(List baseline, Map finalHealth) {
     if (baseline == null || !(finalHealth instanceof Map) || finalHealth.ok == true || finalHealth.unreadable == true) return null
     if (finalHealth.broken == true || (finalHealth.brokenMarkers as List) || (finalHealth.orphanedActionRows as List) ||
-            (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null) return null
+            (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null ||
+            finalHealth.label?.toString()?.contains("*BROKEN*")) return null
     def after = ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }
     if (!after) return null
     return _rmPreExistingStructuralSubset(baseline, finalHealth).size() == after.size() ? after : null

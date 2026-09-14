@@ -34355,6 +34355,10 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         verdict = base + [structuralIssues: [openIssue], orphanedActionRows: ["action 8 leftover"]]
         def orphan = script.toolSetRule(drive)
 
+        and: "the baseline issue persists but the label carries the *BROKEN* marker"
+        verdict = base + [structuralIssues: [openIssue], label: "r *BROKEN*"]
+        def brokenLabel = script.toolSetRule(drive)
+
         then: "building inside the existing block succeeds and names the pre-existing issue"
         inside.success == true
         inside.preExistingStructuralIssues == [openIssue]
@@ -34366,10 +34370,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         added.preExistingStructuralIssues == [openIssue]
         orphan.success == false
         orphan.preExistingStructuralIssues == [openIssue]
+        brokenLabel.success == false
+        brokenLabel.structuralIssues == [openIssue]
 
         and: "one structural baseline per drive, taken without the page-rendering health probe"
-        baselineCalls == 3
-        renderSources.size() == 3
+        baselineCalls == 4
+        renderSources.size() == 4
     }
 
     def "addAction ifThen: Between two times reveals start/end chain"() {
