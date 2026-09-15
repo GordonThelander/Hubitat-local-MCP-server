@@ -2074,12 +2074,16 @@ class TestRunner:
         return [str(settings.get(f"state_{slot}")).lower() for slot in slots]
 
     def _navigate_new_action(self, app_id: Any) -> str:
-        """Open a new action editor and return its RM-assigned index."""
-        nav = self._set_rule(app_id, {"walkStep": {"page": "selectActions", "operation": "navigate",
-                                                   "navigate": {"targetPage": "doActPage"}}}, strict=True)
-        act_field = next((i.get("name") for i in ((nav.get("after") or {}).get("inputs") or [])
+        """Open a new action editor and return its RM-assigned index.
+
+        The editor is opened the way RM's own New Action button does (N with doActN). Navigating to doActPage by
+        name on a rule with no pending action state renders RM's startsWith-on-null page error."""
+        self._set_rule(app_id, {"walkStep": {"page": "selectActions", "operation": "click",
+                                             "click": {"name": "N", "stateAttribute": "doActN"}}}, strict=True)
+        page = self._set_rule(app_id, {"walkStep": {"page": "doActPage", "operation": "introspect"}}, strict=True)
+        act_field = next((i.get("name") for i in ((page.get("after") or {}).get("inputs") or [])
                           if str(i.get("name")).startswith("actType.")), None)
-        assert act_field, f"doActPage should reveal an actType.<n> picker: {nav}"
+        assert act_field, f"doActPage should reveal an actType.<n> picker: {page}"
         return act_field.split(".", 1)[1]
 
     def _delete_variable_safe(self, name: str) -> None:
