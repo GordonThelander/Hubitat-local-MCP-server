@@ -1655,6 +1655,7 @@ For easier bug reporting:
 
 ## Version History
 
+- **v4.3.4** - fix: stop bulk rule edits at the first failed or partial item. PRs: [#425](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/425)
 - **v4.3.3** - docs: recommend mcp-remote for Claude Desktop on all platforms; fix: coordinate retained backups and recovery state. PRs: [#430](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/430), [#419](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/419)
 - **v4.3.2** - fix: complete sandbox Map validation and enforce blocking lint. PRs: [#418](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/418)
 - **v4.3.1** - fix: run MRTR writes in the first request instead of a mutation-free preflight. PRs: [#422](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/422)
