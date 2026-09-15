@@ -13381,6 +13381,16 @@ private String _rmBulkStopError(String stoppedAfter, stopItem) {
     def item = (stopItem instanceof Map) ? (Map) stopItem : [:]
     String why = item.success == false ? "failed" : "reported partial"
     String itemError = item.error?.toString()?.trim()
+    // A partial item usually has no error of its own; recentWrites keeps only this string, so carry its most specific reason.
+    if (!itemError) itemError = item.updateRuleError?.toString()?.trim()
+    if (!itemError && item.settingsSkipped instanceof List) {
+        def informational = _rmInformationalSkippedReasons()
+        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason && !(it.reason in informational) }
+        if (skip != null) itemError = "field '${skip.key}' was not applied (${skip.reason})".toString()
+    }
+    if (!itemError && item.repairHints instanceof List) {
+        itemError = (item.repairHints as List).find { it != null && it.toString().trim() }?.toString()?.trim()
+    }
     while (itemError?.endsWith(".")) itemError = itemError.substring(0, itemError.length() - 1)
     String detail = itemError ? ": ${itemError}" : ""
     return "Stopped after ${stoppedAfter} ${why}${detail}. Later items were not attempted and finalisation was not fired.".toString()

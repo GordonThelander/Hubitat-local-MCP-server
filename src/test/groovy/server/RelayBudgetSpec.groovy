@@ -526,6 +526,28 @@ class RelayBudgetSpec extends ToolSpecBase {
         !clicks.contains('updateRule')
     }
 
+    def "_rmBulkStopError carries a partial item's most specific reason when the item has no error"() {
+        expect:
+        script._rmBulkStopError('addActions[1]', item) == expected
+
+        where:
+        item << [
+            [success: true, partial: true, error: 'kept first', updateRuleError: 'ignored'],
+            [success: true, partial: true, updateRuleError: 'updateRule rejected'],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop'], [key: 'tstate1', reason: 'silent_rejection']],
+             repairHints: ['later hint']],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']], repairHints: ['', 'Re-add the comparator.']],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']]]
+        ]
+        expected << [
+            'Stopped after addActions[1] reported partial: kept first. Later items were not attempted and finalisation was not fired.',
+            'Stopped after addActions[1] reported partial: updateRule rejected. Later items were not attempted and finalisation was not fired.',
+            "Stopped after addActions[1] reported partial: field 'tstate1' was not applied (silent_rejection). Later items were not attempted and finalisation was not fired.",
+            'Stopped after addActions[1] reported partial: Re-add the comparator. Later items were not attempted and finalisation was not fired.',
+            'Stopped after addActions[1] reported partial. Later items were not attempted and finalisation was not fired.'
+        ]
+    }
+
     // Pin the trigger-pause return shape directly on _bulkPauseResult too -- a
     // deterministic unit on the shape the running loop above relies on.
     def "_bulkPauseResult builds the trigger-loop carry-forward shape (remaining triggers + all actions)"() {
