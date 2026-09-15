@@ -5773,10 +5773,13 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
         and: "the refusal rides on the addAction patch entry as the tailored steer, NOT the generic picker miss"
         // The distinguishing invariant of the patches path vs the dispatcher path: the reject is
-        // reported on the per-op entry and top-level patchErr stays null. Pinning it here catches a
-        // regression that reroutes the reject through the outer catch (which would set result.error,
-        // drop addPatch.error, and still pass success:false + partial:true -- a false green).
-        result.error == null
+        // reported on the per-op entry, and the fail-closed stop names that entry in the top-level
+        // error. A regression that reroutes the reject through the outer catch would drop
+        // addPatch.error and bulkStoppedAfter and still pass success:false + partial:true.
+        result.bulkStoppedAfter == "patches[0]"
+        result.finalisationNotAttempted == true
+        result.error?.startsWith("Stopped after patches[0] failed: 'Lock codes'")
+        !result.error?.contains("..")
         def addPatch = (result.patches as List).find { it instanceof Map && it.op == "addAction" }
         addPatch != null
         addPatch.success == false
@@ -6428,23 +6431,27 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
 
-        when: "patches contains addTriggers with one valid + one bogus-id spec"
+        when: "patches contains addTriggers with one bogus-id spec followed by one valid spec"
         def result = script.toolSetRule([
             appId: 100,
             patches: [[addTriggers: [
-                [capability: "Switch", deviceIds: [8], state: "on"],
-                [capability: "Switch", deviceIds: [99999], state: "on"]
+                [capability: "Switch", deviceIds: [99999], state: "on"],
+                [capability: "Switch", deviceIds: [8], state: "on"]
             ]]],
             confirm: true
         ])
 
-        then: "outer patches[0].success is FALSE because one inner item failed"
+        then: "outer patches[0].success is FALSE because its first inner item failed"
         result.patches.size() == 1
         result.patches[0].op == "addTriggers"
         result.patches[0].success == false
         result.patches[0].results.size() == 2
-        result.patches[0].results[1].success == false
-        result.patches[0].results[1].error?.contains("99999")
+        result.patches[0].results[0].success == false
+        result.patches[0].results[0].error?.contains("99999")
+
+        and: "the inner stop leaves the valid item unattempted and names the inner position"
+        result.patches[0].results[1].notAttempted == true
+        result.bulkStoppedAfter == "patches[0].addTriggers[0]"
 
         and: "the user-visible result.success is also false"
         result.success == false
@@ -6471,36 +6478,44 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
 
-        when: 'batch with addTrigger, addAction, addRequiredExpression, addLocalVariable, bogusOp'
-        def result = script.toolSetRule([
-            appId: 100,
-            patches: [
-                [addTrigger: [capability: "Switch", deviceIds: [8], state: "on"]],
-                [addAction: [action: "delayedAction", actions: [[action: "deviceControl",
-                    capability: "Switch", deviceIds: [8], command: "on"]],
-                    delay: [value: 1, unit: "Seconds"]]],
-                // 'conditions' (not 'exprs') is the required field name in _rmAddRequiredExpression
-                [addRequiredExpression: [conditions: [
-                    [capability: "Switch", deviceIds: [8], state: "on"]
-                ]]],
-                [addLocalVariable: [name: "myVar", type: "Number", value: "42"]],
-                [bogusOp: "should not be recognized"]
-            ],
-            confirm: true
-        ])
+        when: 'each op kind runs as its own single-op batch (a failed op stops a batch, so later ops would not be dispatched)'
+        def specs = [
+            [addTrigger: [capability: "Switch", deviceIds: [8], state: "on"]],
+            [addAction: [action: "delayedAction", actions: [[action: "deviceControl",
+                capability: "Switch", deviceIds: [8], command: "on"]],
+                delay: [value: 1, unit: "Seconds"]]],
+            // 'conditions' (not 'exprs') is the required field name in _rmAddRequiredExpression
+            [addRequiredExpression: [conditions: [
+                [capability: "Switch", deviceIds: [8], state: "on"]
+            ]]],
+            [addLocalVariable: [name: "myVar", type: "Number", value: "42"]],
+            [bogusOp: "should not be recognized"]
+        ]
+        def results = specs.collect { spec -> script.toolSetRule([appId: 100, patches: [spec], confirm: true]) }
 
         then: 'each op is dispatched to its handler (op key present); bogusOp surfaces the unrecognized-key error'
-        result.patches.size() == 5
-        result.patches[0].op == "addTrigger"
-        result.patches[1].op == "addAction"
+        results.every { it.patches.size() == 1 }
+        results[0].patches[0].op == "addTrigger"
+        results[1].patches[0].op == "addAction"
         // addRequiredExpression reached its handler (not rejected as unrecognized).
         // Handler may fail on hub stubs (complex wizard) but must NOT throw the
         // "conditions is required" IAE that the old wrong field name 'exprs' caused.
-        result.patches[2].op == "addRequiredExpression"
-        !result.patches[2].error?.contains("conditions is required")
-        result.patches[3].op == "addLocalVariable"
-        result.patches[4].success == false
-        result.patches[4].error?.contains("no recognized operation key")
+        results[2].patches[0].op == "addRequiredExpression"
+        !results[2].patches[0].error?.contains("conditions is required")
+        results[3].patches[0].op == "addLocalVariable"
+        results[4].patches[0].success == false
+        results[4].patches[0].error?.contains("no recognized operation key")
+
+        when: 'a failed op precedes the others in one batch'
+        def batch = script.toolSetRule([appId: 100, patches: specs, confirm: true])
+
+        then: 'the ops after the stop keep their op keys and are reported notAttempted, never dispatched'
+        batch.patches.size() == 5
+        batch.patches[0].op == "addTrigger"
+        batch.patches[0].success == false
+        batch.bulkStoppedAfter == "patches[0]"
+        (1..4).every { batch.patches[it].notAttempted == true }
+        batch.patches[1..4]*.op == ["addAction", "addRequiredExpression", "addLocalVariable", "bogusOp"]
     }
 
     // ---------- structured-shortcut coverage (addLocalVariable + related) ----------
@@ -13108,6 +13123,113 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "full success -- API wrote at least one setting AND trigger row exists"
         result.success == true
         result.partial == false
+    }
+
+    // The clean trigger-loop continuation: a successful first trigger followed by a spent budget hands back
+    // exactly the unrun triggers and every action, with no stop markers. Hub fixtures stand in for
+    // _rmAddTrigger, which is private and cannot be stubbed.
+    def "bulk addTriggers: a clean first trigger then a spent budget hands back the remaining triggers and all actions"() {
+        given:
+        enableWrite()
+        def fetchSeq = 0
+        def clicks = []
+        def actionCalls = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/btn" && body["settings[updateRule]"] == "clicked") clicks << "updateRule"
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            fetchSeq++
+            selectTriggersSchemaJson(100, fetchSeq)
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> mainPageJson(100, "r", true) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validRuleIds = null ->
+            actionCalls << spec; [success: true]
+        }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+        def triggers = [
+            [capability: "Switch", deviceIds: [8], state: "on"],
+            [capability: "Switch", deviceIds: [8], state: "off"],
+            [capability: "Motion", deviceIds: [8], state: "active"]
+        ]
+        def actions = [
+            [capability: "switch", action: "on", deviceIds: [8]],
+            [capability: "switch", action: "off", deviceIds: [8]]
+        ]
+
+        when:
+        def result = script.toolSetRule([appId: 100, confirm: true, __reqT0: 2000L,
+            addTriggers: triggers, addActions: actions])
+
+        then: "one clean trigger committed and the request paused"
+        result.status == "in_progress"
+        result.success == true
+        result.triggers.size() == 1
+        result.triggers[0].success == true
+        result.triggersCommitted == 1
+        actionCalls.isEmpty()
+
+        and: "the remainder is exactly the unrun triggers and every action"
+        result.addTriggersRemaining == triggers.subList(1, 3)
+        result.addActionsRemaining == actions
+
+        and: "a clean pause carries no stop markers and defers updateRule"
+        !result.containsKey("bulkStoppedAfter")
+        !result.containsKey("finalisationNotAttempted")
+        !clicks.contains("updateRule")
+        !JsonOutput.toJson(result).contains("__reqT0")
+    }
+
+    def "patches addTriggers: a clean first inner trigger then a spent budget rewrites the op into patchesRemaining"() {
+        given:
+        enableWrite()
+        def fetchSeq = 0
+        def clicks = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/btn" && body["settings[updateRule]"] == "clicked") clicks << "updateRule"
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            fetchSeq++
+            selectTriggersSchemaJson(100, fetchSeq)
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> mainPageJson(100, "r", true) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+
+        when:
+        def result = script.toolSetRule([appId: 100, confirm: true, __reqT0: 2000L, patches: [
+            [addTriggers: [
+                [capability: "Switch", deviceIds: [8], state: "on"],
+                [capability: "Switch", deviceIds: [8], state: "off"],
+                [capability: "Motion", deviceIds: [8], state: "active"]
+            ]],
+            [addLocalVariable: [name: "later", type: "Number", value: "1"]]
+        ]])
+
+        then: "the first inner trigger committed and the op paused mid-list"
+        result.status == "in_progress"
+        def op = result.patchResults.find { it.op == "addTriggers" }
+        op.results.size() == 1
+        op.results[0].success == true
+        op.partial == true
+
+        and: "patchesRemaining leads with the same op cut to its unrun triggers, then the later op"
+        result.patchesRemaining.size() == 2
+        result.patchesRemaining[0].addTriggers*.state == ["off", "active"]
+        result.patchesRemaining[1].addLocalVariable.name == "later"
+
+        and: "no stop markers, and updateRule is deferred"
+        !result.containsKey("bulkStoppedAfter")
+        !clicks.contains("updateRule")
+        !JsonOutput.toJson(result).contains("__reqT0")
     }
 
     def "addTrigger returns success=true partial=true when trigger does not bake (triggerNotBaked)"() {
@@ -40506,17 +40628,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.patches[0]?.op == "addRequiredExpression" || result.patches[0]?.success != false
     }
 
-    def "hub_set_rule patches with inner addRequiredExpression returning partial:true -- outer envelope partial:true even when trailing updateRule succeeds (B1 inner-op detection)"() {
-        // B1 inner-op-partial detection pin (C-W3). The B1 fix adds the clause
-        // `patchResults.any { it instanceof Map && (it.partial == true) }` to the
-        // outer patches envelope's partial formula. Existing patches specs cover
-        // OUTER failure modes (trailing-updateRule rejection, op-level error,
-        // op-count mismatch) but not the inner-op-partial case where every op
-        // landed AND trailing updateRule succeeded BUT one inner op self-reported
-        // partial:true (e.g. addRequiredExpression with compareToDevice fallback).
-        // A regression that drops the new clause from the OR would leave
-        // result.partial == false even with the inner partial set, so callers
-        // would silently treat the response as fully baked.
+    def "hub_set_rule patches with inner addRequiredExpression returning partial:true stops fail-closed before the trailing updateRule"() {
+        // An op that self-reports partial:true (here addRequiredExpression with a degraded
+        // compareToDevice offset) stops the batch like a failed one: the trailing updateRule
+        // does not fire, and the outer envelope must still report partial rather than a clean
+        // success.
         //
         // Fixture drives the inner partial via the compareToDevice
         // offset_field_not_revealed path: STPage reveals relDevice_1 after isDev_1
@@ -40609,38 +40725,19 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "trailing updateRule click happened -- precondition (this isn't an outer-failure case)"
-        // Without this, an early throw OR a regression short-circuiting before the
-        // trailing click would make the rest vacuous. Pins that we are testing the
-        // inner-partial-with-trailing-success matrix cell.
-        updateRuleClicked == true
+        then: "the partial op stopped the batch before finalisation"
+        updateRuleClicked == false
+        result.bulkStoppedAfter == "patches[0]"
+        result.finalisationNotAttempted == true
+        result.error?.startsWith("Stopped after patches[0] reported partial")
 
-        and: "overall success not false (every patch op landed)"
-        // Load-bearing discriminator: B1's clause is specifically about partial
-        // (orthogonal to success). The outer success path here is the happy one --
-        // the inner addRE returned `success: true, partial: true` (a dropped offset is
-        // a partial-but-success contract).
-        result.success != false
-
-        and: "outer updateRuleFailed is falsy (this isn't an outer-failure case)"
-        // Negative discriminator paired with the precondition: pins that partial=true
-        // below is coming from the B1 inner-op clause, NOT from the updateRuleFailed
-        // OR-clause.
+        and: "the outer envelope reports the stop, not a baked success"
+        result.success == false
+        result.partial == true
         result.updateRuleFailed != true
         result.patchesNotLive != true
 
-        and: "outer partial is true (B1 inner-op clause: patchResults.any { ... partial == true })"
-        // Load-bearing discriminator (the C-W3 contract pin): with no outer failure
-        // and trailing updateRule success, the only way partial flips true is via the
-        // new B1 clause that surfaces the inner partial. A regression that drops the
-        // `patchResults.any { it instanceof Map && (it.partial == true) }` clause
-        // from the outer OR would leave result.partial == false here.
-        result.partial == true
-
-        and: "inner patches[0] also reports partial:true (sanity-check: inner DID report partial)"
-        // Sanity discriminator: without this, an inner regression that stops emitting
-        // partial=true would make the outer partial-pin above vacuously satisfied via
-        // some other source. Pins the inner is the source of truth.
+        and: "inner patches[0] is the partial source (sanity-check the fixture)"
         result.patches?.size() == 1
         result.patches[0]?.partial == true
     }
@@ -41599,24 +41696,14 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.success == false
     }
 
-    // ---------- TN3 contract: inner-only partial fires a repairHint on the outer envelope ----------
+    // ---------- Partial added item: fail-closed stop and repairHint on the outer envelope ----------
 
     def "action-mutation replaceActions: inner-only partial stops before finalisation and emits the fail-closed repairHint"() {
-        // Pin the inner-only repairHints contract added in this round. Pre-fix:
-        // when itemsPartial flipped true but updateRuleFailed stayed false, the
-        // outer envelope returned partial:true + success:false + repairHints:[]
-        // -- the caller had to drill into addedActions[] to discover why. This
-        // is the same C2 antipattern the rest of this PR has been closing on
-        // the *NotLive flags.
-        //
-        // Contract: `itemsPartial && !updateRuleFailed` MUST append a
-        // discoverable repairHint naming addedActions[] as the next inspection
-        // point. The OR-clause spec above pins partial:true; this spec pins
-        // the repairHint that makes partial:true actionable.
+        // A partial added item stops the replacement before the trailing updateRule, and the
+        // outer envelope must carry actionable repairHints rather than a bare partial:true.
         //
         // Drives partial via the same verification-fetch-failed path the
         // OR-clause spec uses (post-commit mainPage fetch throws).
-        // Both-ways pending (orchestrator).
         given:
         enableWrite()
         def updateRuleClicked = false
@@ -42514,23 +42601,16 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         silentRejectionCount >= 1
     }
 
-    // ---------- Bulk addTriggers/addActions inner-partial detection + inner-only repairHint ----------
+    // ---------- Bulk addTriggers/addActions inner-partial detection + fail-closed repairHint ----------
 
     def "bulk addActions: inner-only partial stops before finalisation and emits the fail-closed repairHint"() {
-        // Sibling of the action-mutation replaceActions inner-only spec. The bulk
-        // addTriggers/addActions dispatcher previously computed itemsPartial as a
-        // count-only comparison (trigOk/actOk vs size) -- an inner item returning
-        // {success:true, partial:true} inflated trigOk/actOk and the size-equality
-        // missed the inner-partial signal. Outer partial dropped to updateRuleFailed
-        // only, hiding the inner partial. Two-part fix:
-        //   1. itemsPartial OR-clauses `any { ... partial == true }` on both result lists
-        //   2. inner-only branch appends a discoverable repairHint (matches the C2
-        //      antipattern this PR has been closing on the *NotLive flags)
+        // An item returning {success:true, partial:true} must count as partial, not as a clean
+        // success (a count-only success comparison would miss it), and it stops the batch
+        // before the trailing updateRule with an actionable repairHint.
         //
         // Drives partial via verificationFetchFailed: throw on the post-commit
         // mainPage fetch (after the inner _rmAddAction's actionDone click) so
-        // _rmAddAction returns {success:true, partial:true}. Trailing updateRule
-        // click then lands clean. Both-ways pending (orchestrator).
+        // _rmAddAction returns {success:true, partial:true}.
         given:
         enableWrite()
         def updateRuleClicked = false
@@ -42613,17 +42693,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.actions[0]?.partial == true
     }
 
-    // ---------- Patches dispatcher inner-only repairHint (sibling of bulk + action-mutation) ----------
+    // ---------- Patches dispatcher: partial op stops the batch (sibling of bulk + action-mutation) ----------
 
-    def "patches[addRequiredExpression]: inner-only partial (updateRule clean) emits inner-partial repairHint"() {
-        // Sibling of the action-mutation and bulk inner-only repairHint specs.
-        // The patches dispatcher already bubbles inner-partial via the
-        // `patchResults.any { ... partial == true }` clause (B1/C-W3 contract);
-        // this spec pins the new inner-only repairHint branch that makes the
-        // outer partial:true actionable. Pre-fix the outer envelope returned
-        // partial:true + repairHints:[] when an inner op self-reported partial
-        // but the trailing updateRule click landed clean -- caller had to drill
-        // into patches[] to discover why.
+    def "patches[addRequiredExpression]: a partial op marks later ops notAttempted and emits the fail-closed repairHint"() {
+        // A partial op followed by another op: the later op is never dispatched, and the
+        // outer repairHints carry the fail-closed recovery guidance rather than the old
+        // inner-only partial hint.
         //
         // Drives partial via the compareToDevice offset_field_not_revealed path:
         // STPage reveals relDevice_1 after isDev_1 (device-relative RHS lands) but never
@@ -42704,38 +42779,35 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         when: "patches bundle with addRequiredExpression in compareToDevice offset-degraded path"
         def result = script.toolSetRule([
             appId: 100,
-            patches: [[addRequiredExpression: [conditions: [[
-                capability: "Temperature",
-                deviceIds: [8],
-                comparator: ">",
-                compareToDevice: [deviceId: 99, attribute: "temperature", offset: -2]
-            ]]]]],
+            patches: [
+                [addRequiredExpression: [conditions: [[
+                    capability: "Temperature",
+                    deviceIds: [8],
+                    comparator: ">",
+                    compareToDevice: [deviceId: 99, attribute: "temperature", offset: -2]
+                ]]]],
+                [addLocalVariable: [name: "neverAdded", type: "Number", value: "1"]]
+            ],
             confirm: true
         ])
 
-        then: "preconditions: trailing updateRule click landed clean AND inner partial fired"
-        updateRuleClicked == true
+        then: "preconditions: the partial op stopped the batch"
+        updateRuleClicked == false
         result.partial == true
         result.updateRuleFailed != true
-        result.patchesNotLive != true
+        result.bulkStoppedAfter == "patches[0]"
 
-        and: "outer repairHints includes the patches inner-only hint (load-bearing discriminator)"
-        // Load-bearing: a regression that drops the inner-only branch from the
-        // patches dispatcher would return repairHints:[] here even though
-        // partial:true and updateRuleFailed:false both hold. The hint substring
-        // is the distinguishing characteristic.
-        def hints = (result.repairHints as List) ?: []
-        hints.any { it?.toString()?.contains("One or more patch ops reported partial") }
-
-        and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        !hints.any { it?.toString()?.contains("updateRule click was rejected") }
-
-        and: "inner patches[0] is the partial source (sanity-check the fixture)"
-        // Sanity discriminator: pins the inner is the source of truth -- a regression
-        // that stops emitting partial=true from the inner addRE would make the outer
-        // partial-pin above vacuously satisfied via some other source.
-        result.patches?.size() == 1
+        and: "the later op keeps its op key and is reported notAttempted"
+        result.patches?.size() == 2
         result.patches[0]?.partial == true
+        result.patches[1]?.op == "addLocalVariable"
+        result.patches[1]?.notAttempted == true
+
+        and: "outer repairHints carry the fail-closed guidance, not the updateRule-rejected hint"
+        def hints = (result.repairHints as List) ?: []
+        hints.any { it?.toString()?.contains("Stopped fail-closed after patches[0]") }
+        !hints.any { it?.toString()?.contains("updateRule click was rejected") }
+        !hints.any { it?.toString()?.contains("One or more patch ops reported partial") }
     }
 
     // ========================================================================

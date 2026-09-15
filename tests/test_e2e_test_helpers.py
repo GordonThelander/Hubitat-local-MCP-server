@@ -1490,8 +1490,13 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
             return {
                 "success": False,
                 "partial": True,
+                "bulkStoppedAfter": "patches[1]",
+                "finalisationNotAttempted": True,
+                "error": "Stopped after patches[1] failed: refused. Later items were not attempted and finalisation was not fired.",
                 "patchResults": [{"op": "addAction", "success": True, "actionIndex": 3}],
-                "patches": [{"op": "addAction", "success": False, "error": "refused"}],
+                "patches": [{"op": "addAction", "success": False, "error": "refused"},
+                            {"op": "addAction", "success": False, "notAttempted": True,
+                             "error": "not attempted: bulk stopped after patches[1] failed or was partial"}],
                 "health": {"ok": True},
             }
 
@@ -1499,6 +1504,7 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
     patches = [
         {"addAction": {"capability": "log", "message": "land"}},
         {"addAction": {"capability": "switch", "state": "on"}},
+        {"addAction": {"capability": "log", "message": "skipped"}},
     ]
 
     entries = runner._patch_rule(42, patches, expected_refusals=1)
@@ -1506,6 +1512,8 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
     assert entries == [
         {"op": "addAction", "success": True, "actionIndex": 3},
         {"op": "addAction", "success": False, "error": "refused"},
+        {"op": "addAction", "success": False, "notAttempted": True,
+         "error": "not attempted: bulk stopped after patches[1] failed or was partial"},
     ]
     assert calls == [("hub_manage_rule_machine", {
         "tool": "hub_set_rule",
@@ -1529,6 +1537,58 @@ def test_patch_rule_rejects_terminal_activation_failure():
 
     with pytest.raises(AssertionError, match="terminal activation"):
         runner._patch_rule(42, [{"addAction": {"capability": "log", "message": "x"}}])
+
+
+def _stop_envelope(**overrides):
+    envelope = {
+        "success": False,
+        "partial": True,
+        "bulkStoppedAfter": "addActions[1]",
+        "finalisationNotAttempted": True,
+        "error": "Stopped after addActions[1] failed: refused. Later items were not attempted and finalisation was not fired.",
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def test_assert_bulk_stop_accepts_the_fail_closed_contract():
+    tail = [{"success": False, "notAttempted": True}]
+    et.TestRunner._assert_bulk_stop(_stop_envelope(), "addActions[1]", tail)
+    et.TestRunner._assert_bulk_stop(
+        _stop_envelope(error="Stopped after addActions[1] reported partial. Later items were not attempted."),
+        "addActions[1]", tail, partial_item=True)
+
+
+@pytest.mark.parametrize("override, tail, message", [
+    ({"bulkStoppedAfter": "addActions[0]"}, [], "bulkStoppedAfter"),
+    ({"finalisationNotAttempted": None}, [], "finalisationNotAttempted"),
+    ({"error": "One or more items failed"}, [], "name the stopping item"),
+    ({}, [{"success": False}], "notAttempted"),
+    ({"addActionsRemaining": [{"capability": "log"}]}, [], "skipped tail"),
+    ({"success": True}, [], "success:false"),
+])
+def test_assert_bulk_stop_rejects_a_broken_stop(override, tail, message):
+    with pytest.raises(AssertionError, match=message):
+        et.TestRunner._assert_bulk_stop(_stop_envelope(**override), "addActions[1]", tail)
+
+
+def test_patch_rule_rejects_a_refusal_without_the_stop_contract():
+    class FakeClient:
+        def call_tool(self, _name, _arguments):
+            return {
+                "success": False,
+                "partial": True,
+                "patches": [{"op": "addAction", "success": False, "error": "refused"},
+                            {"op": "addAction", "success": True}],
+                "health": {"ok": True},
+            }
+
+    runner = _native_rule_runner(FakeClient())
+
+    with pytest.raises(AssertionError, match="bulkStoppedAfter"):
+        runner._patch_rule(42, [{"addAction": {"capability": "switch", "state": "on"}},
+                                {"addAction": {"capability": "log", "message": "x"}}],
+                           expected_refusals=1)
 
 
 def test_create_native_rule_relay_lost_adoption_marks_bundled_fixture_for_readback(

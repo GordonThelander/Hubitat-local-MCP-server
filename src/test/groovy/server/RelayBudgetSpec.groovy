@@ -18,10 +18,9 @@ import support.ToolSpecBase
  *     on a pause; it fires when the remaining patches complete)
  *   - _applyNativeAppEdit -- between plain bulk addTriggers[]/addActions[] items (same
  *     deferred-updateRule contract; the trigger-loop pause hands back the unrun triggers
- *     AND every action). Plain bulk items fail closed: a failed or partial item stops the
- *     batch before the checkpoint, so a resumable tail exists only while every processed
- *     item is clean. The patches pause still stops as soon as the budget is spent and
- *     surfaces any failed/degraded op in the pause envelope's success/partial.
+ *     AND every action). Bulk items and patch ops fail closed: a failed or partial item or
+ *     op stops the batch before the checkpoint, so a resumable tail exists only while
+ *     every processed item is clean.
  *
  * The generic machinery (_isCloudRequest / _relayBudgetMs / _lanBudgetMs /
  * _timeBudgetExceeded) lives in the main file. The loop tests stub
@@ -321,33 +320,44 @@ class RelayBudgetSpec extends ToolSpecBase {
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    def "a patch op with a large inner addTriggers list pauses MID-op, rewriting the op into patchesRemaining"() {
+    // A failed inner trigger stops the batch before the mid-op checkpoint, so no remainder is offered.
+    // The clean mid-op trigger pause is pinned with hub fixtures in ToolRmNativeCrudSpec, because
+    // _rmAddTrigger is private and cannot be stubbed here.
+    def "a failed inner addTriggers item stops the patch batch before any mid-op pause"() {
         given:
         def addActionCalls = []
         def clicks = []
         installPatchStubs(addActionCalls, clicks, true)
 
-        when: 'ONE patch op carrying three inner addTriggers (first is a non-Map, recorded inline -- _rmAddTrigger is private/unstubbable); budget already blown'
+        when: 'ONE patch op whose first inner trigger is a non-Map, then an addAction op; budget already blown'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L, patches: [
             [addTriggers: [
                 'not-a-map',
                 [capability: 'Switch', state: 'off', deviceIds: [9]],
                 [capability: 'Motion', state: 'active', deviceIds: [10]],
             ]],
+            [addAction: [a: 1]],
         ]])
 
-        then: 'the budget paused after the first inner trigger, before the second'
-        result.status == 'in_progress'
+        then: 'no pause and no resumable remainder'
+        result.status != 'in_progress'
+        !result.containsKey('patchesRemaining')
+        addActionCalls.isEmpty()
 
-        and: 'patchesRemaining leads with the SAME op rewritten to its two unprocessed inner triggers'
-        result.patchesRemaining instanceof List
-        result.patchesRemaining.size() == 1
-        result.patchesRemaining[0].addTriggers instanceof List
-        result.patchesRemaining[0].addTriggers.size() == 2
-        result.patchesRemaining[0].addTriggers[0].state == 'off'
+        and: 'the later inner triggers and the later op are notAttempted'
+        def op = result.patches.find { it.op == 'addTriggers' }
+        op.results[0].success == false
+        op.results[1].notAttempted == true
+        op.results[2].notAttempted == true
+        result.patches[1].op == 'addAction'
+        result.patches[1].notAttempted == true
 
-        and: 'the op is recorded partial in patchResults and no updateRule fired'
-        result.patchResults.find { it.op == 'addTriggers' }?.partial == true
+        and: 'the stop is named and finalisation is skipped'
+        result.success == false
+        result.partial == true
+        result.bulkStoppedAfter == 'patches[0].addTriggers[0]'
+        result.finalisationNotAttempted == true
+        result.error?.startsWith('Stopped after patches[0].addTriggers[0] failed')
         !clicks.contains('updateRule')
         !JsonOutput.toJson(result).contains('__reqT0')
     }
@@ -464,6 +474,12 @@ class RelayBudgetSpec extends ToolSpecBase {
         result.success == false
         result.partial == true
 
+        and: 'the stop is named and the trailing updateRule is not fired'
+        result.bulkStoppedAfter == 'addTriggers[0]'
+        result.finalisationNotAttempted == true
+        result.error?.startsWith('Stopped after addTriggers[0] failed: addTriggers[0] is not a Map')
+        !clicks.contains('updateRule')
+
         and: 'no internal budget marker is echoed back'
         !JsonOutput.toJson(result).contains('__reqT0')
     }
@@ -503,6 +519,11 @@ class RelayBudgetSpec extends ToolSpecBase {
         result.partial == true
         result.repairHints instanceof List && !result.repairHints.isEmpty()
 
+        and: 'the stop is named and the trailing updateRule is not fired'
+        result.bulkStoppedAfter == 'addActions[0]'
+        result.finalisationNotAttempted == true
+        result.error == 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.'
+        !clicks.contains('updateRule')
     }
 
     // Pin the trigger-pause return shape directly on _bulkPauseResult too -- a

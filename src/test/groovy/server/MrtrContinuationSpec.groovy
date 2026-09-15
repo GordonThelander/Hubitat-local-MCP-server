@@ -3733,4 +3733,136 @@ class MrtrContinuationSpec extends ToolSpecBase {
         done[0].success == true
         (atomicStateMap.mrtrRequests as Map)[stateId].status == 'terminal'
     }
+
+    def "a bulk trigger stop in a later slice is restated in the original request's trigger indices"() {
+        given: 'two triggers ran in earlier slices; this slice fails its second trigger'
+        String stopText = 'not attempted: bulk stopped after addTriggers[1] failed or was partial'
+        Map rec = [aggregate: [kind: 'bulk_edit', triggers: [[success: true], [success: true]], actions: []]]
+        Map lastSlice = [success: false, partial: true, bulkStoppedAfter: 'addTriggers[1]', finalisationNotAttempted: true,
+                         error: 'Stopped after addTriggers[1] failed: boom. Later items were not attempted and finalisation was not fired.',
+                         repairHints: ['Stopped fail-closed after addTriggers[1]: later items were not attempted.'],
+                         triggers: [[success: true], [success: false, error: 'boom'],
+                                    [success: false, notAttempted: true, error: stopText]],
+                         actions: [[success: false, notAttempted: true, error: stopText]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'every reference names trigger 3 of the original request'
+        out.bulkStoppedAfter == 'addTriggers[3]'
+        out.error == 'Stopped after addTriggers[3] failed: boom. Later items were not attempted and finalisation was not fired.'
+        out.repairHints == ['Stopped fail-closed after addTriggers[3]: later items were not attempted.']
+        out.triggers.size() == 5
+        out.triggers[4].error == 'not attempted: bulk stopped after addTriggers[3] failed or was partial'
+        out.actions[0].error == 'not attempted: bulk stopped after addTriggers[3] failed or was partial'
+        out.success == false
+        out.finalisationNotAttempted == true
+    }
+
+    def "a bulk action stop in a later slice is restated in the original request's action indices"() {
+        given: 'two triggers and three actions ran in earlier slices; this slice fails its first action'
+        Map rec = [aggregate: [kind: 'bulk_edit', triggers: [[success: true], [success: true]],
+                               actions: [[success: true], [success: true], [success: true]]]]
+        Map lastSlice = [success: false, partial: true, bulkStoppedAfter: 'addActions[0]', finalisationNotAttempted: true,
+                         error: 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.',
+                         triggers: [],
+                         actions: [[success: false, error: 'bad cap'],
+                                   [success: false, notAttempted: true, error: 'not attempted: bulk stopped after addActions[0] failed or was partial']]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'the action offset applies, and the trigger offset does not leak into action references'
+        out.bulkStoppedAfter == 'addActions[3]'
+        out.error.startsWith('Stopped after addActions[3] failed: bad cap.')
+        out.actions.size() == 5
+        out.actions[4].error == 'not attempted: bulk stopped after addActions[3] failed or was partial'
+    }
+
+    def "a patches stop after a mid-op pause is restated in the original op and inner indices"() {
+        given: 'slice one ran op 0 and two inner triggers of op 1, then paused mid-op'
+        Map rec = [aggregate: [kind: 'patches', patchResults: [
+            [success: true, op: 'addLocalVariable'],
+            [success: true, op: 'addTriggers', pausedMidOp: true, results: [[success: true], [success: true]]]
+        ]]]
+        Map innerStop = [success: false, partial: true, bulkStoppedAfter: 'patches[0].addTriggers[1]', finalisationNotAttempted: true,
+                         error: 'Stopped after patches[0].addTriggers[1] failed: boom. Later items were not attempted and finalisation was not fired.',
+                         patches: [
+                             [success: false, op: 'addTriggers', results: [[success: true], [success: false, error: 'boom'],
+                                 [success: false, notAttempted: true, error: 'not attempted: bulk stopped after patches[0].addTriggers[1] failed or was partial']]],
+                             [op: 'addAction', success: false, notAttempted: true,
+                              error: 'not attempted: bulk stopped after patches[0].addTriggers[1] failed or was partial']
+                         ]]
+
+        when: 'the continuation slice fails the second trigger it ran'
+        def out = script._mrtrAggregateTerminal(rec, innerStop)
+
+        then: 'the stop names op 1 and its fourth inner trigger'
+        out.bulkStoppedAfter == 'patches[1].addTriggers[3]'
+        out.error.startsWith('Stopped after patches[1].addTriggers[3] failed: boom.')
+        out.patchResults.size() == 4
+        out.patchResults[3].error == 'not attempted: bulk stopped after patches[1].addTriggers[3] failed or was partial'
+        out.patchResults[2].results[2].error == 'not attempted: bulk stopped after patches[1].addTriggers[3] failed or was partial'
+
+        and: 'the internal pause marker never reaches the caller'
+        !out.patchResults.any { it instanceof Map && it.containsKey('pausedMidOp') }
+
+        when: 'the continuation slice instead stops on the op after the resumed one'
+        Map opStop = [success: false, partial: true, bulkStoppedAfter: 'patches[1]', finalisationNotAttempted: true,
+                      error: 'Stopped after patches[1] failed: nope. Later items were not attempted and finalisation was not fired.',
+                      patches: [[success: true, op: 'addTriggers', results: [[success: true]]],
+                                [success: false, op: 'addAction', error: 'nope']]]
+        def opOut = script._mrtrAggregateTerminal(rec, opStop)
+
+        then: 'only the op offset applies'
+        opOut.bulkStoppedAfter == 'patches[2]'
+        opOut.error.startsWith('Stopped after patches[2] failed: nope.')
+    }
+
+    def "a stopped continuation slice ends the request with no further server continuation and recentWrites names the stop"() {
+        given:
+        settingsMap.enableWrite = true
+        List leafArgs = []
+        script.metaClass.toolSetRule = { Map actual ->
+            leafArgs << actual
+            leafArgs.size() == 1
+                ? [success: true, partial: false, status: 'in_progress', appId: actual.appId, triggers: [],
+                   actions: [[success: true]], addTriggersRemaining: [], addActionsRemaining: [[a: 2], [a: 3]]]
+                : [success: false, partial: true, appId: actual.appId, bulkStoppedAfter: 'addActions[0]',
+                   finalisationNotAttempted: true,
+                   error: 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.',
+                   triggers: [],
+                   actions: [[success: false, error: 'bad cap'],
+                             [success: false, notAttempted: true, error: 'not attempted: bulk stopped after addActions[0] failed or was partial']]]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+        def args = [appId: 341, confirm: true, addActions: [[a: 1], [a: 2], [a: 3]]]
+
+        when: 'slice one pauses and no client request follows'
+        def first = modernCall('hub_set_rule', args)
+        String stateId = first.result.requestState
+        script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[0][2].data as Map))
+        Map record = (atomicStateMap.mrtrRequests as Map)[stateId] as Map
+        List recent = script._mrtrRecentOperations() as List
+
+        then: 'the server ran only the remainder, and the stop ended the request'
+        first.result.resultType == 'input_required'
+        leafArgs.size() == 2
+        leafArgs[1].addActions == [[a: 2], [a: 3]]
+        autoContinueJobs().size() == 1
+        record.status == 'terminal'
+
+        and: 'the terminal result names the stop in the original request'
+        record.terminalResult.bulkStoppedAfter == 'addActions[1]'
+        record.terminalResult.finalisationNotAttempted == true
+        record.terminalResult.actions.size() == 3
+
+        and: 'recentWrites carries the failure and its reason'
+        recent.size() == 1
+        recent[0].success == false
+        recent[0].error == 'Stopped after addActions[1] failed: bad cap. Later items were not attempted and finalisation was not fired.'
+    }
 }

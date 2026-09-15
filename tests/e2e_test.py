@@ -5499,7 +5499,11 @@ class TestRunner:
                 ({"addRequiredExpression": {"conditions": [{"capability": "Last Event Device"}]}},
                  ("not usable as a condition", "in actions")),
             ]
-            refusal_entries = self._patch_rule(app_id, [spec for spec, _ in refusal_specs], expected_refusals=len(refusal_specs))
+            # One batch per refusal: the first refused op stops a patches batch, so a combined batch
+            # would only ever validate its first spec.
+            refusal_entries = []
+            for spec, _ in refusal_specs:
+                refusal_entries += self._patch_rule(app_id, [spec], expected_refusals=1)
             assert len(refusal_entries) == len(refusal_specs), \
                 f"batched refusal results were incomplete: {refusal_entries}"
             for entry, (_, needles) in zip(refusal_entries, refusal_specs, strict=True):
@@ -6618,19 +6622,69 @@ class TestRunner:
         assert result.get("updateRuleFailed") is not True \
             and result.get("patchesNotLive") is not True, \
             f"patch terminal activation failed; mutations are not safely live: {result}"
-        refused = [entry for entry in entries if entry.get("success") is False]
-        assert result.get("error") is None, \
-            f"patch batch had an outer application error unrelated to per-op results: {result}"
+        # The first refused op stops the batch, so later ops come back notAttempted rather than refused.
+        refused = [entry for entry in entries
+                   if entry.get("success") is False and entry.get("notAttempted") is not True]
         assert len(refused) == expected_refusals, \
             f"patch refusal count mismatch (expected {expected_refusals}): entries={entries}; outer={result}"
         if expected_refusals:
-            assert result.get("success") is False and result.get("partial") is True \
-                and all(entry.get("error") for entry in refused), \
+            assert expected_refusals == 1, "a patches batch stops at its first refusal; issue one refusal per batch"
+            assert all(entry.get("error") for entry in refused), \
                 f"outer patch failure was not attributable to explicit refused entries: {result}"
+            stop_at = entries.index(refused[0])
+            self._assert_bulk_stop(result, f"patches[{stop_at}]", entries[stop_at + 1:])
         else:
+            assert result.get("error") is None, \
+                f"patch batch had an outer application error unrelated to per-op results: {result}"
             assert result.get("success") is True and not result.get("partial"), \
                 f"patch batch did not fully activate: {result}"
         return entries
+
+    @staticmethod
+    def _assert_bulk_stop(result: Any, stopped_after: str, not_attempted: list,
+                          *, partial_item: bool = False) -> None:
+        """Assert the fail-closed bulk contract on one envelope.
+
+        The stopping item is named in bulkStoppedAfter and the top-level error, finalisation is
+        skipped, every later row is notAttempted, and no skipped tail is handed back for resumption.
+        """
+        assert isinstance(result, dict), f"a stopped batch returned no envelope: {result!r}"
+        assert result.get("success") is False and result.get("partial") is True, \
+            f"a stopped batch must report success:false + partial:true: {result}"
+        assert result.get("bulkStoppedAfter") == stopped_after, \
+            f"expected bulkStoppedAfter={stopped_after!r}, got {result.get('bulkStoppedAfter')!r}: {result}"
+        assert result.get("finalisationNotAttempted") is True, \
+            f"a stopped batch must report finalisationNotAttempted:true: {result}"
+        reason = "reported partial" if partial_item else "failed"
+        assert str(result.get("error", "")).startswith(f"Stopped after {stopped_after} {reason}"), \
+            f"the top-level error must name the stopping item and why it stopped: {result.get('error')!r}"
+        assert all(isinstance(row, dict) and row.get("notAttempted") is True for row in not_attempted), \
+            f"every item after the stop must be reported notAttempted: {not_attempted}"
+        assert result.get("status") != "in_progress" and not any(
+                key in result for key in ("addTriggersRemaining", "addActionsRemaining", "patchesRemaining")), \
+            f"a stopped batch must not hand back its skipped tail: {result}"
+
+    def _rm_stop_call(self, app_id: Any, extra: dict) -> dict:
+        """Issue an edit expected to stop fail-closed; its envelope is the assertion subject."""
+        args = {"appId": app_id, "confirm": True}
+        args.update(extra)
+        try:
+            result = self.client.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": args})
+        except (McpError, McpToolError, requests.HTTPError) as exc:
+            if "504" not in str(exc):
+                raise
+            raise RelayLostResponseError(
+                f"504 relay response loss erased the fail-closed stop envelope for {list(extra)}; "
+                "retry this test with its run-unique fixture"
+            ) from exc
+        # A stopped batch skipped the trailing updateRule, so its health is not a finished rule's.
+        self._last_write_health = None
+        return result
+
+    def _rule_page_text(self, app_id: Any) -> str:
+        """The rule's rendered page, for landed/never-landed markers. The render, not the settings map,
+        because a removed action's settings are not guaranteed to be purged."""
+        return json.dumps(self._get_persisted_rule_config(app_id).get("page") or {})
 
     def _rm_call_soft(self, args: dict, strict: bool = False, recover_504: bool = False) -> Any:
         """Direct hub_set_rule call preserving its full response contract."""
@@ -7323,6 +7377,38 @@ class TestRunner:
                 f"modifyTrigger state-change token should refuse pre-write: {rejected}"
             self._set_rule(app_id, {"removeTrigger": {"index": tidx}}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            # Fail-closed bulk triggers: a clean Switch-off trigger lands, the refused state-change
+            # token stops the batch, and the later trigger and the action are never written.
+            def _switch_trigger_states() -> list[str]:
+                settings = self._get_persisted_rule_config(app_id).get("settings") or {}
+                return [str(settings.get(f"tstate{str(key)[4:]}")).lower()
+                        for key, value in settings.items()
+                        if str(key).startswith("tDev") and self._setting_holds_exact(value, sw)]
+            states_before = _switch_trigger_states()
+            skipped_msg = "E2E trigger stop skipped action"
+            stopped = self._rm_stop_call(app_id, {
+                "addTriggers": [
+                    {"capability": "Switch", "deviceIds": [sw], "state": "off"},
+                    {"capability": "Temperature", "value": "increased"},
+                    {"capability": "Switch", "deviceIds": [sw], "state": "on"},
+                ],
+                "addActions": [{"capability": "log", "message": skipped_msg}],
+            })
+            triggers = stopped.get("triggers") or []
+            actions = stopped.get("actions") or []
+            assert len(triggers) == 3 and len(actions) == 1 \
+                and triggers[0].get("success") is not False and not triggers[0].get("partial") \
+                and triggers[1].get("success") is False, \
+                f"expected a clean trigger, then the refusal, then the skipped tail: {stopped}"
+            self._assert_bulk_stop(stopped, "addTriggers[1]", triggers[2:] + actions)
+            states_after = _switch_trigger_states()
+            assert states_after.count("off") == states_before.count("off") + 1 \
+                and states_after.count("on") == states_before.count("on"), \
+                f"the clean prefix trigger must remain and the skipped trigger must never land: " \
+                f"before={states_before} after={states_after}"
+            assert skipped_msg not in self._rule_page_text(app_id), \
+                "the action after a stopped trigger batch was written"
         finally:
             self._delete_native(app_id)
 
@@ -8335,14 +8421,13 @@ class TestRunner:
                         f"relay-adopted unary create did not persist one absolute action: {unary_settings}"
                     mu_idx = unary_indices[0]
 
-                c_entries = self._patch_rule(app_c, [
-                    {"addAction": {"capability": "setVariable", "variable": str_var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                    {"addAction": {"capability": "setVariable", "variable": bool_var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                    {"addAction": {"capability": "setVariable", "variable": var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                ], expected_refusals=3)
+                # One batch per refusal: the first refused op stops a patches batch.
+                c_entries = []
+                for target in (str_var_name, bool_var_name, var_name):
+                    c_entries += self._patch_rule(app_c, [
+                        {"addAction": {"capability": "setVariable", "variable": target,
+                                       "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
+                    ], expected_refusals=1)
                 assert len(c_entries) == 3, f"rejection patches were incomplete: {c_entries}"
                 str_reject, bool_reject, neg = c_entries
                 assert mu_idx is not None, f"math unary action index was not returned or persisted: {unary_settings}"
@@ -8739,6 +8824,43 @@ class TestRunner:
             self._set_rule(app_id, {"clearActions": True}, strict=True)
             self._set_rule(app_id, {"replaceActions": [{"capability": "log", "message": "final"}]}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            # Fail-closed bulk actions: the clean first action lands, the switch state: steer refuses
+            # the second, and the third is never written. The refusal is decided per item inside the
+            # add, so it stops the batch rather than refusing the call up front.
+            refused_spec = {"capability": "switch", "state": "on", "deviceIds": [int(self.get_test_switch_id())]}
+            bulk_kept, bulk_skipped = "E2E bulk stop kept", "E2E bulk stop skipped"
+            bulk_stop = self._rm_stop_call(app_id, {"addActions": [
+                {"capability": "log", "message": bulk_kept},
+                refused_spec,
+                {"capability": "log", "message": bulk_skipped},
+            ]})
+            bulk_rows = bulk_stop.get("actions") or []
+            assert len(bulk_rows) == 3 and bulk_rows[0].get("success") is not False \
+                and not bulk_rows[0].get("partial") and bulk_rows[1].get("success") is False \
+                and "action:" in str(bulk_rows[1].get("error", "")), \
+                f"expected a clean action, then the state: refusal, then the skipped tail: {bulk_stop}"
+            self._assert_bulk_stop(bulk_stop, "addActions[1]", bulk_rows[2:])
+            page = self._rule_page_text(app_id)
+            assert bulk_kept in page and bulk_skipped not in page, \
+                f"addActions stop must keep the clean prefix and never write the tail: {page}"
+
+            # Fail-closed replacement: the old list is cleared before the adds, so only the clean first
+            # replacement item remains; skipping finalisation is not a rollback.
+            repl_kept, repl_skipped = "E2E replace stop kept", "E2E replace stop skipped"
+            repl_stop = self._rm_stop_call(app_id, {"replaceActions": [
+                {"capability": "log", "message": repl_kept},
+                refused_spec,
+                {"capability": "log", "message": repl_skipped},
+            ]})
+            added = repl_stop.get("addedActions") or []
+            assert len(added) == 3 and added[0].get("success") is not False \
+                and not added[0].get("partial") and added[1].get("success") is False, \
+                f"expected a clean replacement item, then the refusal, then the skipped tail: {repl_stop}"
+            self._assert_bulk_stop(repl_stop, "replaceActions[1]", added[2:])
+            page = self._rule_page_text(app_id)
+            assert repl_kept in page and repl_skipped not in page and bulk_kept not in page, \
+                f"a stopped replaceActions must leave only its clean prefix (old list cleared, tail skipped): {page}"
         finally:
             self._delete_native(app_id)
 
@@ -8816,6 +8938,53 @@ class TestRunner:
                 {"addAction": {"capability": "log", "message": "p2"}},
             ]}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            sw = int(self.get_test_switch_id())
+            # A success:true + partial:true op stops the batch too. The enum Custom Attribute
+            # '*changed*' Required Expression is the live-proven partial (see
+            # test_set_rule_re_custom_attribute_enum_changed_not_representable).
+            op_kept, op_skipped = "E2E patch stop kept", "E2E patch stop skipped"
+            partial_stop = self._rm_stop_call(app_id, {"patches": [
+                {"addAction": {"capability": "log", "message": op_kept}},
+                {"addRequiredExpression": {"conditions": [
+                    {"capability": "Custom Attribute", "deviceIds": [sw],
+                     "attribute": "switch", "comparator": "*changed*"}]}},
+                {"addAction": {"capability": "log", "message": op_skipped}},
+            ]})
+            op_rows = partial_stop.get("patchResults") or partial_stop.get("patches") or []
+            assert len(op_rows) == 3 and op_rows[0].get("success") is not False \
+                and op_rows[1].get("op") == "addRequiredExpression" \
+                and op_rows[1].get("success") is not False and op_rows[1].get("partial") is True \
+                and op_rows[2].get("op") == "addAction", \
+                f"expected a clean op, then the partial Required Expression, then the skipped op: {partial_stop}"
+            self._assert_bulk_stop(partial_stop, "patches[1]", op_rows[2:], partial_item=True)
+
+            # An op's inner list stops at its own failed item and names the inner position; the later
+            # inner item and the later op are both skipped.
+            inner_kept, inner_skipped, later_skipped = \
+                "E2E inner stop kept", "E2E inner stop skipped", "E2E later op skipped"
+            inner_stop = self._rm_stop_call(app_id, {"patches": [
+                {"addActions": [
+                    {"capability": "log", "message": inner_kept},
+                    {"capability": "switch", "state": "on", "deviceIds": [sw]},
+                    {"capability": "log", "message": inner_skipped},
+                ]},
+                {"addAction": {"capability": "log", "message": later_skipped}},
+            ]})
+            inner_rows = inner_stop.get("patchResults") or inner_stop.get("patches") or []
+            # A checkpoint inside the inner list splits that op across rows; read its items in order.
+            inner_items = [item for row in inner_rows if row.get("op") == "addActions"
+                           for item in (row.get("results") or [])]
+            later_rows = [row for row in inner_rows if row.get("op") == "addAction"]
+            assert len(inner_items) == 3 and len(later_rows) == 1 \
+                and inner_items[0].get("success") is not False and inner_items[1].get("success") is False, \
+                f"expected a clean inner item, then the refusal, then the skipped tail: {inner_stop}"
+            self._assert_bulk_stop(inner_stop, "patches[0].addActions[1]", inner_items[2:] + later_rows)
+
+            page = self._rule_page_text(app_id)
+            assert op_kept in page and inner_kept in page \
+                and not any(marker in page for marker in (op_skipped, inner_skipped, later_skipped)), \
+                f"stopped patches must keep their clean prefixes and never write the skipped items: {page}"
         finally:
             self._delete_native(app_id)
 
@@ -8941,6 +9110,62 @@ class TestRunner:
                 self._assert_rule_healthy(app_id)
         finally:
             self._delete_native(app_id)
+
+        # Fail-closed create across sections: the clean trigger lands, the refused trigger stops the
+        # create, and the Required Expression and action sections are never written. A new rule has
+        # no pre-operation backup, so this fixture is deleted rather than restored.
+        self._native_rule_fixture_seq = getattr(self, "_native_rule_fixture_seq", 0) + 1
+        stop_label = f"{PREFIX}CreateStop_{_run_artifact_suffix()}_{self._native_rule_fixture_seq}"
+        skipped_msg = "E2E create stop skipped action"
+        sw_stop = self._soft_write(
+            lambda: self.client.call_tool("hub_manage_rule_machine", {
+                "tool": "hub_set_rule",
+                "args": {
+                    "name": stop_label,
+                    "addTriggers": [
+                        {"capability": "Switch", "deviceIds": [sw], "state": "on"},
+                        {"capability": "Temperature", "value": "increased"},
+                    ],
+                    "addRequiredExpression": {"conditions": [
+                        {"capability": "Switch", "deviceIds": [sw], "state": "on"}]},
+                    "addActions": [{"capability": "log", "message": skipped_msg}],
+                    "confirm": True,
+                }}),
+            lambda: self._find_app_id_by_label(stop_label),
+            "fail-closed create",
+        )
+        if sw_stop["relayDropped"]:
+            assert sw_stop["committed"], f"fail-closed create lost to relay 504 and never committed ({stop_label})"
+            stop_app_id = sw_stop["evidence"]
+            stopped = None
+        else:
+            stopped = sw_stop["response"]
+            stop_app_id = stopped.get("appId")
+            assert stop_app_id, f"fail-closed create did not return appId: {stopped}"
+        self.created_native_app_ids.append(str(stop_app_id))
+        try:
+            if stopped is None:
+                print("    fail-closed create: stop-envelope assertions skipped (relay 504); "
+                      "verifying the skipped sections by readback instead")
+            else:
+                triggers = stopped.get("triggers") or []
+                actions = stopped.get("actions") or []
+                assert len(triggers) == 2 and len(actions) == 1 \
+                    and triggers[0].get("success") is not False and not triggers[0].get("partial") \
+                    and triggers[1].get("success") is False, \
+                    f"expected a clean trigger, then the refusal, on the stopped create: {stopped}"
+                self._assert_bulk_stop(stopped, "triggers[1]", [stopped.get("requiredExpression"), *actions])
+            stop_settings = self._get_persisted_rule_config(stop_app_id).get("settings") or {}
+            assert any(str(key).startswith("tDev") and self._setting_holds_exact(value, sw)
+                       and str(stop_settings.get(f"tstate{str(key)[4:]}")).lower() == "on"
+                       for key, value in stop_settings.items()), \
+                f"the clean trigger before the stop must remain on the created rule: {stop_settings}"
+            assert not any(str(key).startswith("rCapab_") for key in stop_settings), \
+                f"the Required Expression after the stop was written: {stop_settings}"
+            assert not any(skipped_msg in str(value) for value in stop_settings.values()), \
+                f"the action after the stop was written: {stop_settings}"
+        finally:
+            self._delete_native(stop_app_id)
 
     @test("native_apps")
     def test_set_rule_discover_meta(self) -> None:
@@ -14071,9 +14296,10 @@ class TestRunner:
     # through HubitatMcpClient, which asserts modern headers on every call by design.
     #
     # So this group drives the same live hub through LegacyEraClient instead. It is
-    # deliberately small (three tests): the point is that the legacy wire still works
-    # end to end -- handshake, catalog, read, write -- not to re-prove tool behaviour the
-    # modern groups already cover on the same code.
+    # deliberately small (four tests): the point is that the legacy wire still works
+    # end to end -- handshake, catalog, read, write, and a fail-closed bulk stop that has no
+    # MRTR aggregation to lean on -- not to re-prove tool behaviour the modern groups already
+    # cover on the same code.
     # -----------------------------------------------------------------------
 
     @test("legacy_protocol")
@@ -14164,6 +14390,63 @@ class TestRunner:
         info = json.loads(text)
         assert isinstance(info, dict) and "platformUpdate" in info and "safeMode" in info, \
             f"legacy hub_get_info payload is not the hub-info shape: {sorted(info) if isinstance(info, dict) else type(info)}"
+
+    @test("legacy_protocol")
+    def test_legacy_bulk_stop_is_terminal(self) -> None:
+        """A legacy client receives a fail-closed bulk stop as a terminal envelope with no tail to re-issue.
+
+        A legacy client has no requestState: a budget checkpoint hands it the unprocessed items and it
+        re-issues them itself. That checkpoint is only reachable on a clean prefix, so the loop below
+        follows one the way a shipping client would, and the batch must still end at the failed item
+        with nothing handed back. The rule is tiny, so the call normally finishes in one round.
+        """
+        legacy = LegacyEraClient(self.client, verbose=self.verbose)
+        legacy.initialize(LEGACY_PROTOCOL_VERSION)
+        app_id = self._create_native_rule("LegacyStop")
+        kept, skipped = "E2E legacy stop kept", "E2E legacy stop skipped"
+        specs = [
+            {"capability": "log", "message": kept},
+            {"capability": "switch", "state": "on", "deviceIds": [int(self.get_test_switch_id())]},
+            {"capability": "log", "message": skipped},
+        ]
+
+        def _legacy_add(actions: list) -> dict:
+            try:
+                return legacy.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": {
+                    "appId": app_id, "confirm": True, "addActions": actions}})
+            except (McpError, McpToolError, requests.HTTPError) as exc:
+                if "504" not in str(exc):
+                    raise
+                raise RelayLostResponseError(
+                    "504 relay response loss erased the legacy fail-closed stop envelope; "
+                    "retry this test with its run-unique fixture"
+                ) from exc
+
+        try:
+            result = _legacy_add(specs)
+            rows: list = []
+            for _ in range(len(specs)):
+                if result.get("status") != "in_progress":
+                    break
+                remaining = result.get("addActionsRemaining") or []
+                slice_rows = result.get("actions") or []
+                assert result.get("success") is True and not result.get("partial") and remaining \
+                    and len(rows) + len(slice_rows) + len(remaining) == len(specs), \
+                    f"a legacy checkpoint must hand back a clean prefix and exactly the unrun items: {result}"
+                rows += slice_rows
+                result = _legacy_add(remaining)
+            offset = len(rows)
+            rows += result.get("actions") or []
+            assert len(rows) == 3 and rows[0].get("success") is not False \
+                and rows[1].get("success") is False, \
+                f"expected a clean action, then the refusal, then the skipped tail: rows={rows} final={result}"
+            # Without aggregation the stop is numbered within the round that ran it.
+            self._assert_bulk_stop(result, f"addActions[{1 - offset}]", rows[2:])
+            page = self._rule_page_text(app_id)
+            assert kept in page and skipped not in page, \
+                f"the legacy stop must keep the clean prefix and never write the tail: {page}"
+        finally:
+            self._delete_native(app_id)
 
     @test("legacy_protocol")
     def test_legacy_write_round_trip(self) -> None:

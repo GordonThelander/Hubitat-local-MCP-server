@@ -176,8 +176,10 @@ class MrtrWorkerBudgetSpec extends ToolSpecBase {
         operation << ['addActions', 'addTriggers']
     }
 
+    // A failed or partial first inner item stops the batch before its checkpoint, even with the worker budget
+    // spent, so the request ends in one slice and never hands the skipped items to a continuation.
     @Unroll
-    def "continued inner action batch retains its #outcome first-item outcome"() {
+    def "an inner action batch whose first item #outcome stops before its checkpoint"() {
         given:
         settingsMap.useGateways = false
         script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null ->
@@ -189,28 +191,26 @@ class MrtrWorkerBudgetSpec extends ToolSpecBase {
         def args = [appId: 1, confirm: true, patches: [[addActions: specs]]]
 
         when:
-        def paused = modernCall('hub_set_rule', args)
-        String stateId = paused.result.requestState
-
-        then:
-        assertPause(paused, stateId, 'hub_set_rule')
-        actions == specs.take(1)
-
-        when:
-        def complete = modernCall('hub_set_rule', args, stateId)
+        def complete = modernCall('hub_set_rule', args)
         def terminal = mcpDriver.parseInner(complete)
-        def rows = terminal.patchResults.collectMany { it.results }
+        Map records = atomicStateMap.mrtrRequests as Map
+        assert records.size() == 1
+        String stateId = records.keySet().first()
+        def rows = (terminal.patchResults ?: terminal.patches).collectMany { it.results }
 
         then:
         complete.result.resultType == 'complete'
         terminal.success == false
         terminal.partial == true
-        rows*.deviceIds == [[11], [12], [13]]
+        terminal.bulkStoppedAfter == 'patches[0].addActions[0]'
+        terminal.finalisationNotAttempted == true
+        terminal.error.startsWith("Stopped after patches[0].addActions[0] ${outcome == 'failed' ? 'failed' : 'reported partial'}")
         firstResult.every { key, value -> rows[0][key] == value }
-        rows.drop(1).every { it.success == true && it.partial != true }
-        actions == specs
-        clicks.count('updateRule') == 1
-        runInMillisCalls.size() == 2
+        rows.size() == 3
+        rows.drop(1).every { it.notAttempted == true }
+        actions == specs.take(1)
+        !clicks.contains('updateRule')
+        runInMillisCalls.size() == 1
         mcpDriver.parseInner(modernCall('hub_set_rule', args, stateId)) == terminal
 
         where:
@@ -328,8 +328,11 @@ class MrtrWorkerBudgetSpec extends ToolSpecBase {
         itemElapsed = { int index -> 10L }
     }
 
+    // A batch holding a replacement cannot cross a checkpoint, so the over-budget leading op does not pause it.
+    // The failed first replacement then stops the batch: the duplicate replacement is never attempted, and the
+    // stop is named in the original request's op index.
     @Unroll
-    def "an over-budget #leadingOp before replacement keeps the original batch and duplicate fence"() {
+    def "an over-budget #leadingOp before a failed replacement keeps the original batch and stops at the replacement"() {
         given:
         settingsMap.useGateways = false
         def triggers = []
@@ -354,19 +357,21 @@ class MrtrWorkerBudgetSpec extends ToolSpecBase {
         String stateId = records.keySet().first()
         def replay = modernCall('hub_set_rule', args, stateId)
 
-        then: 'the failed first replacement still owns the one-replacement fence for this batch'
+        then: 'the failed first replacement stops the batch and the duplicate is not attempted'
         complete.result.resultType == 'complete'
         def entries = (terminal.patchResults ?: terminal.patches).findAll { it.op == 'replaceRequiredExpression' }
         entries.size() == 2
         entries[0].requiredExpressionMissing == true
-        entries[1].success == false
-        entries[1].error.contains('only one replaceRequiredExpression is valid')
+        entries[1].notAttempted == true
+        terminal.bulkStoppedAfter == 'patches[1]'
+        terminal.finalisationNotAttempted == true
+        terminal.error.startsWith('Stopped after patches[1] failed')
         terminal.success == false
         terminal.partial == true
         actions.size() == (leadingOp == 'addAction' ? 1 : leadingOp == 'addActions' ? 3 : 0)
         triggers.size() == (leadingOp == 'addTriggers' ? 3 : 0)
         runInMillisCalls.size() == 1
-        clicks.count('updateRule') == 1
+        !clicks.contains('updateRule')
         !clicks.contains('cancelST')
         script._activeWrites().isEmpty()
         mcpDriver.parseInner(replay) == terminal
