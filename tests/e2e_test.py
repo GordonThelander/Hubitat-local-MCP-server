@@ -2046,6 +2046,42 @@ class TestRunner:
         hub_vars = (result or {}).get("hubVariables") or []
         return any((v or {}).get("name") == name for v in hub_vars)
 
+    def _create_hub_variable_visible(self, name: str, var_type: str, value: str) -> None:
+        """Create a HUB variable and wait until the bulk read (the condition pickers' source) lists it.
+
+        hub_create_variable has a known post-write visibility race, so each attempt is create-then-poll
+        and a miss re-issues the create. Tracked before the first call so cleanup always reaches it."""
+        self.created_variable_names.append(name)
+        for attempt in range(1, 4):
+            try:
+                self.client.call_tool("hub_manage_variables", {
+                    "tool": "hub_create_variable",
+                    "args": {"name": name, "type": var_type, "value": value, "confirm": True}})
+            except (McpError, McpToolError, requests.HTTPError) as exc:
+                print(f"    hub_create_variable '{name}' attempt {attempt} raised ({exc}); poll is authoritative")
+            deadline = time.time() + 12.0
+            while time.time() < deadline:
+                if self._hub_variable_visible_in_bulk(name):
+                    return
+                time.sleep(1.0)
+        raise AssertionError(f"hub variable '{name}' not visible after retries (create_variable race)")
+
+    @staticmethod
+    def _variable_condition_states(settings: dict, var_name: str) -> list[str]:
+        """state_<N> values of every condition slot whose variable picker holds var_name."""
+        slots = [str(key).rsplit("_", 1)[1] for key, value in settings.items()
+                 if str(value) == var_name and re.search(r"Var[A-Za-z]*_\d+$", str(key))]
+        return [str(settings.get(f"state_{slot}")).lower() for slot in slots]
+
+    def _navigate_new_action(self, app_id: Any) -> str:
+        """Open a new action editor and return its RM-assigned index."""
+        nav = self._set_rule(app_id, {"walkStep": {"page": "selectActions", "operation": "navigate",
+                                                   "navigate": {"targetPage": "doActPage"}}}, strict=True)
+        act_field = next((i.get("name") for i in ((nav.get("after") or {}).get("inputs") or [])
+                          if str(i.get("name")).startswith("actType.")), None)
+        assert act_field, f"doActPage should reveal an actType.<n> picker: {nav}"
+        return act_field.split(".", 1)[1]
+
     def _delete_variable_safe(self, name: str) -> None:
         try:
             # confirm=true is required by Hub Admin Write gate; without it the
@@ -6897,6 +6933,57 @@ class TestRunner:
         finally:
             self._delete_native(app_id)
 
+        # Structural outcomes on a second rule, so the half-built trigger above does not affect them.
+        # These drives run four steps and rely on the standard continuation when the budget is reached.
+        block_app = self._create_native_rule("WalkDriveBlock")
+        try:
+            def _log_action_steps(idx: str, message: str) -> list[dict]:
+                return [
+                    {"page": "doActPage", "operation": "write", "write": {f"actType.{idx}": "messageActs"}},
+                    {"page": "doActPage", "operation": "write", "write": {f"actSubType.{idx}": "getLogMsg"}},
+                    {"page": "doActPage", "operation": "write", "write": {f"logmsg.{idx}": message}},
+                    {"page": "doActPage", "operation": "click", "click": {"name": "actionDone"}},
+                ]
+
+            # (4) a complete drive builds a whole action and passes on a healthy rule.
+            done = self._set_rule(block_app, {"walkStep": {"operation": "drive",
+                "steps": _log_action_steps(self._navigate_new_action(block_app), "drive-complete")}}, strict=True)
+            assert done.get("success") is True and not done.get("structuralIssues"), \
+                f"a complete log-action drive should pass cleanly: {done}"
+
+            # (5) a drive that leaves a Repeat it opened without its End-Repeat is incomplete.
+            rep_idx = self._navigate_new_action(block_app)
+            opened = self.client.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": {
+                "appId": block_app, "confirm": True, "walkStep": {"operation": "drive", "steps": [
+                    {"page": "doActPage", "operation": "write", "write": {f"actType.{rep_idx}": "repeatActs"}},
+                    {"page": "doActPage", "operation": "write", "write": {f"actSubType.{rep_idx}": "getRepeat"}},
+                    {"page": "doActPage", "operation": "write", "write": {f"repeatMinute.{rep_idx}": 5}},
+                    {"page": "doActPage", "operation": "click", "click": {"name": "actionDone"}},
+                ]}}})
+            self._last_write_health = None
+            assert all(step.get("success") is not False for step in (opened.get("steps") or [])), \
+                f"every step of the Repeat drive should commit: {opened}"
+            assert opened.get("success") is False \
+                and any("never closed" in str(issue) for issue in (opened.get("structuralIssues") or [])) \
+                and not opened.get("preExistingStructuralIssues"), \
+                f"a drive that leaves its own Repeat open must fail with that structural issue: {opened}"
+
+            # (6) a later valid drive inside that existing open block passes and names the old issue.
+            inside = self._set_rule(block_app, {"walkStep": {"operation": "drive",
+                "steps": _log_action_steps(self._navigate_new_action(block_app), "inside-open-repeat")}}, strict=True)
+            assert inside.get("success") is True \
+                and any("never closed" in str(issue) for issue in (inside.get("preExistingStructuralIssues") or [])), \
+                f"a valid drive inside an already-open block should pass and report the pre-existing issue: {inside}"
+            page = json.dumps(self._get_persisted_rule_config(block_app).get("page") or {})
+            assert "drive-complete" in page and "inside-open-repeat" in page, \
+                f"both driven log actions should render on the rule: {page}"
+
+            self._set_rule(block_app, {"addAction": {"capability": "stopRepeat"}}, strict=True)
+            self._last_write_health = None
+            self._assert_rule_healthy(block_app)
+        finally:
+            self._delete_native(block_app)
+
     @test("native_apps")
     def test_set_rule_walkstep_action_after_required_expression(self) -> None:
         # P2c regression: an action authored ENTIRELY via SINGLE-STEP walkStep (not
@@ -7856,24 +7943,7 @@ class TestRunner:
         # via hub_create_variable -- hub_set_variable (the _create_variable helper) falls back to
         # the rule_engine namespace for a missing name and never appears in the picker. Poll for
         # the known create_variable post-write visibility race before the condition write.
-        self.created_variable_names.append(str_var)
-        for _attempt in range(1, 4):
-            try:
-                self.client.call_tool("hub_manage_variables", {
-                    "tool": "hub_create_variable",
-                    "args": {"name": str_var, "type": "String", "value": "init", "confirm": True}})
-            except (McpError, McpToolError, requests.HTTPError) as exc:
-                print(f"    hub_create_variable '{str_var}' attempt {_attempt} raised ({exc}); poll is authoritative")
-            _deadline = time.time() + 12.0
-            while time.time() < _deadline:
-                if self._hub_variable_visible_in_bulk(str_var):
-                    break
-                time.sleep(1.0)
-            else:
-                continue
-            break
-        else:
-            raise AssertionError(f"hub variable '{str_var}' not visible after retries (create_variable race)")
+        self._create_hub_variable_visible(str_var, "String", "init")
         contains_spec = {"conditions": [
             {"capability": "Variable", "variable": str_var,
              "comparator": "*contains*", "value": "error"}]}
@@ -7893,6 +7963,34 @@ class TestRunner:
             self._assert_rule_healthy(app_id)
         finally:
             self._delete_native(app_id)
+
+        # A Boolean variable has no comparator field: both the Required Expression (STPage) and an
+        # IF action (doActPage) write its true/false value directly. A second small rule keeps the
+        # String fixture above untouched.
+        bool_var = f"{PREFIX}bool_flag"
+        self._create_hub_variable_visible(bool_var, "Boolean", "false")
+        bool_app, bool_created = self._create_native_rule("BoolVarCond", {
+            "addRequiredExpression": {"conditions": [{"capability": "Variable", "variable": bool_var, "value": True}]},
+            "addActions": [
+                {"capability": "ifThen", "expression": {"conditions": [
+                    {"capability": "Variable", "variable": bool_var, "value": False}]}},
+                {"capability": "log", "message": "E2E boolean branch"},
+                {"capability": "endIf"},
+            ],
+        }, return_result=True)
+        try:
+            if bool_created is not None:
+                assert (bool_created.get("requiredExpression") or {}).get("success") is not False, \
+                    f"Boolean Required Expression reported failure: {bool_created}"
+                assert all(a.get("success") is not False for a in (bool_created.get("actions") or [])), \
+                    f"Boolean IF action reported failure: {bool_created}"
+            bool_settings = self._get_persisted_rule_config(bool_app).get("settings") or {}
+            states = self._variable_condition_states(bool_settings, bool_var)
+            assert sorted(states) == ["false", "true"], \
+                f"the Boolean RE (true) and IF (false) values did not persist on their variable slots: {bool_settings}"
+            self._assert_rule_healthy(bool_app)
+        finally:
+            self._delete_native(bool_app)
 
     @test("native_apps")
     def test_set_rule_remove_referenced_local_breaks_rule(self) -> None:
@@ -8830,6 +8928,15 @@ class TestRunner:
             settings = cfg.get("settings") or {}
             assert settings.get("comments") == "BAT_E2E raw settings", \
                 f"comments did not round-trip: {settings.get('comments')!r}"
+
+            # A raw sub-page write is applied one key at a time with page context and reports only
+            # the keys that landed. Open the trigger editor, then write its capability picker.
+            self._set_rule(app_id, {"button": "true", "stateAttribute": "moreCond", "pageName": "selectTriggers"}, strict=True)
+            sub = self._set_rule(app_id, {"pageName": "selectTriggers", "settings": {"tCapab1": "Switch"}}, strict=True)
+            assert sub.get("settingsApplied") == ["tCapab1"] and not sub.get("settingsNotLanded") \
+                and not sub.get("partial"), \
+                f"the sub-page capability write should be reported applied and landed: {sub}"
+            self._assert_rule_renders(app_id)
 
         finally:
             self._delete_native(app_id)
