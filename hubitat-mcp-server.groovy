@@ -3232,6 +3232,14 @@ private def _mrtrAggregateTerminal(Map rec, result) {
             out.partial = aggregate.anyPartial == true || out.partial == true
             break
         case "bulk_edit":
+            if (out.bulkStoppedAfter != null) {
+                // A stopped slice numbers items within its own remaining lists; restate them in the original request's.
+                int trigOffset = (aggregate.triggers instanceof List) ? (aggregate.triggers as List).size() : 0
+                int actOffset = (aggregate.actions instanceof List) ? (aggregate.actions as List).size() : 0
+                _mrtrRewriteStopRefs(out, { String text ->
+                    _mrtrShiftIndex(_mrtrShiftIndex(text, "addTriggers[", trigOffset), "addActions[", actOffset)
+                })
+            }
             out.triggers = ((aggregate.triggers instanceof List) ? aggregate.triggers : []) +
                 ((out.triggers instanceof List) ? out.triggers : [])
             out.actions = ((aggregate.actions instanceof List) ? aggregate.actions : []) +
@@ -3242,8 +3250,28 @@ private def _mrtrAggregateTerminal(Map rec, result) {
             out.note = "Results include all ${out.triggers.size()} triggers and ${out.actions.size()} actions across owner slices; inspect per-item outcomes and finalization fields."
             break
         case "patches":
-            out.patchResults = ((aggregate.patchResults instanceof List) ? aggregate.patchResults : []) +
-                _mrtrPatchResults(out)
+            def priorPatchRows = (aggregate.patchResults instanceof List) ? (aggregate.patchResults as List) : []
+            if (out.bulkStoppedAfter != null) {
+                // Each mid-op pause split one original op into two rows, and the first op of this slice
+                // continues the last paused one, so its inner indices start after the rows already run.
+                int opOffset = priorPatchRows.size() - priorPatchRows.count { it instanceof Map && it.pausedMidOp == true }
+                int innerOffset = 0
+                String innerOp = null
+                for (int r = priorPatchRows.size() - 1; r >= 0; r--) {
+                    def row = priorPatchRows[r]
+                    if (!(row instanceof Map) || row.pausedMidOp != true) break
+                    if (innerOp != null && innerOp != row.op?.toString()) break
+                    innerOp = row.op?.toString()
+                    innerOffset += (row.results instanceof List) ? (row.results as List).size() : 0
+                }
+                _mrtrRewriteStopRefs(out, { String text ->
+                    String shifted = innerOp ? _mrtrShiftIndex(text, "patches[0].${innerOp}[".toString(), innerOffset) : text
+                    _mrtrShiftIndex(shifted, "patches[", opOffset)
+                })
+            }
+            out.patchResults = (priorPatchRows + _mrtrPatchResults(out)).collect { row ->
+                (row instanceof Map && row.containsKey("pausedMidOp")) ? (row as Map).findAll { k, v -> k != "pausedMidOp" } : row
+            }
             if (out.patches instanceof List) out.patches = out.patchResults
             boolean patchesOk = out.patchResults.every { it?.success != false }
             out.success = out.success == true && patchesOk
@@ -3268,6 +3296,41 @@ private def _mrtrAggregateTerminal(Map rec, result) {
     out.mrtr = [continued: true, rounds: ((rec.rounds ?: 0) as Integer) + 1,
                 startedAt: rec.startedAt]
     return out
+}
+
+// Adds offset to every index written as token + digits + "]" in text.
+private String _mrtrShiftIndex(String text, String token, int offset) {
+    if (text == null || offset == 0 || !text.contains(token)) return text
+    StringBuilder out = new StringBuilder()
+    int from = 0
+    while (true) {
+        int at = text.indexOf(token, from)
+        if (at < 0) break
+        int digitsStart = at + token.length()
+        int digitsEnd = digitsStart
+        while (digitsEnd < text.length() && "0123456789".indexOf(text.substring(digitsEnd, digitsEnd + 1)) >= 0) digitsEnd++
+        out.append(text.substring(from, digitsStart))
+        if (digitsEnd > digitsStart && digitsEnd < text.length() && text.substring(digitsEnd, digitsEnd + 1) == "]") {
+            out.append(((text.substring(digitsStart, digitsEnd) as Integer) + offset).toString())
+        } else {
+            out.append(text.substring(digitsStart, digitsEnd))
+        }
+        from = digitsEnd
+    }
+    out.append(text.substring(from))
+    return out.toString()
+}
+
+// Applies fix to the item references a stopped slice writes: its stop location, error, hints, and item errors.
+private void _mrtrRewriteStopRefs(node, Closure fix) {
+    if (node instanceof Map) {
+        Map m = node as Map
+        ["bulkStoppedAfter", "error", "note"].each { k -> if (m[k] instanceof CharSequence) m[k] = fix(m[k].toString()) }
+        if (m.repairHints instanceof List) m.repairHints = (m.repairHints as List).collect { it instanceof CharSequence ? fix(it.toString()) : it }
+        ["triggers", "actions", "patches", "patchResults", "results", "addedResults"].each { k ->
+            if (m[k] instanceof List) (m[k] as List).each { _mrtrRewriteStopRefs(it, fix) }
+        }
+    }
 }
 
 private boolean _mrtrStoreTerminal(String stateId, Map originalRec, Map claim, result, boolean isError) {
@@ -10420,8 +10483,9 @@ Trailing-updateRule failure slots (`addRequiredExpression`, `addTrigger`, `addLo
 - `addTrigger`: `updateRuleFailed: true` + `subscriptionsNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The trigger row IS in the rule's appSettings but the running rule instance never re-subscribed to its device events -- retry `updateRule` to populate subscriptions.
 - `addLocalVariable`: `updateRuleFailed: true` + `variableNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The variable IS created on the hub but the rule's action map never re-evaluates against the new variable until updateRule fires -- retry as above.
 - `removeLocalVariable`: removes a local variable via RM's `deleteGV`/`delConfirm` wizard, then verifies it left `state.allLocalVars`. A verify miss returns `success: false` + `partial: true` + `repairHints` (the `delConfirm` commit is the fragile step; or the variable is still referenced by an action/expression -- remove those refs first). On a rejected trailing `updateRule`: `updateRuleFailed: true` + `variableNotLive: true` + `updateRuleError: <message>` -- retry as above. List current locals via `hub_list_rule_local_variables` (in `hub_read_rules`).
-- `addTriggers` / `addActions` (bulk path): `updateRuleFailed: true` + `subscriptionsNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The per-item adds IS committed (triggers/actions arrays still surface on the success-shape keys) but the running rule instance never re-subscribed -- retry as above.
-- `patches`: `updateRuleFailed: true` + `patchesNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The patch ops landed but the rule will not re-evaluate / re-subscribe until updateRule fires -- retry as above.
+- `addTriggers` / `addActions` (bulk path): `updateRuleFailed: true` + `subscriptionsNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The per-item adds IS committed (triggers/actions arrays still surface on the success-shape keys) but the running rule instance never re-subscribed -- retry as above. This applies only when finalisation was attempted and rejected.
+- Bulk early stop (`addTriggers` / `addActions`, create, `replaceActions`, and `patches` including each op's inner list): the first item or op that returns `success:false` or `partial:true` stops the request. Items after the stopping item return `notAttempted:true`, the remaining `updateRule` and Done are not fired, and the result carries `bulkStoppedAfter`, `finalisationNotAttempted:true` and an `error` naming the stopping item. On create, a Required Expression whose re-init `updateRule` was rejected also stops the request, so `bulkStoppedAfter:'requiredExpression'` can arrive together with `updateRuleFailed` + `updateRuleError`. Skipping finalisation is not a rollback: items before the stop remain written, actions self-bake, `replaceActions` has already cleared the old list, and create may already have finalised its trigger and Required Expression sections, so earlier writes can already affect an active rule. On an edit, repair the failed item and add the not-attempted items, or restore `backup.backupKey`; a newly created rule has no pre-operation backup, so repair it or delete and re-create it. Fire `updateRule` once the rule is complete.
+- `patches`: `updateRuleFailed: true` + `patchesNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The patch ops landed but the rule will not re-evaluate / re-subscribe until updateRule fires -- retry as above. This applies only when finalisation was attempted and rejected.
 - `removeTrigger` / `modifyTrigger` / `modifyAction` / `removeAction` / `clearActions` / `replaceActions` / `moveAction`: `updateRuleFailed: true` + `subscriptionsNotLive: true` + `updateRuleError: <message>` with the same `success`/`partial` flip. The mutation IS committed but the rule never re-subscribed -- retry as above.
 
 ### deviceId vs deviceIds normalization (all condition writes)
