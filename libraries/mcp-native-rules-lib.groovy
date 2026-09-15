@@ -82,7 +82,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
             name: "hub_set_rule",
             description: """Create OR edit a Hubitat Rule Machine rule (RM 5.1) — one upsert tool. Omit appId to CREATE (name required; optionally bundle addTriggers/addActions/addRequiredExpression to populate in the same call). Provide appId to EDIT. In trigger/action/condition specs use `capability` NOT `type`. RM-only — for NON-RM classic apps (Room Lighting, Button Controller, Notifier, Groups+Scenes, Visual Rule) use hub_set_native_app; not the legacy custom engine (hub_*_custom_rule). Requires the Write master + confirm=true + recent backup; each edit ensures a File Manager baseline exists (same-rule baselines are reused for one hour by default; backup.backupKey restores it through hub_manage_backup).
 
-Shortcuts, each orchestrating the full RM 5.1 wizard in one call: addTrigger, addAction, addRequiredExpression/replaceRequiredExpression, bulk addTriggers/addActions/replaceActions, removeAction/clearActions/moveAction/removeTrigger/modifyTrigger/modifyAction, addLocalVariable/removeLocalVariable, patches (atomic multi-op). ALWAYS prefer these one-call shortcuts; walkStep (one wizard page per call) and raw settings+button are LAST RESORTS for capabilities no shortcut can represent.
+Shortcuts, each orchestrating the full RM 5.1 wizard in one call: addTrigger, addAction, addRequiredExpression/replaceRequiredExpression, bulk addTriggers/addActions/replaceActions, removeAction/clearActions/moveAction/removeTrigger/modifyTrigger/modifyAction, addLocalVariable/removeLocalVariable, patches (several operations in one call). ALWAYS prefer these one-call shortcuts; walkStep (one wizard page per call) and raw settings+button are LAST RESORTS for capabilities no shortcut can represent.
 
 Partial-success (every shortcut): success:true can pair with partial:true — inspect partial/repairHints. A rejected trailing updateRule leaves the change written-but-not-live (subscriptionsNotLive / expressionNotLive / variableNotLive / patchesNotLive); retry hub_set_rule(button='updateRule', confirm=true). If wizardStuck:true, first hub_set_rule(button='cancelCapab', pageName=<page>, confirm=true) — restoreHint carries the exact command. On CREATE the new appId is returned even if a bundled item only partially bakes (partialTriggers/partialActions).
 
@@ -131,7 +131,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     patches: [
                         type: "array",
-                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
+                        description: "Multi-mutation in one call (not a transaction: ops before a stop stay written): each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
                         items: [type: "object"]
                     ],
                     removeAction: [
@@ -144,12 +144,12 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     replaceActions: [
                         type: "array",
-                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
+                        description: "Replace the entire action list (not a transaction): clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
                         items: [type: "object"]
                     ],
                     moveAction: [
                         type: "object",
-                        description: "Move one action up or down a slot: {index:<N>, direction:'up'|'down'}. For arbitrary reorders prefer replaceActions (one atomic op)."
+                        description: "Move one action up or down a slot: {index:<N>, direction:'up'|'down'}. For arbitrary reorders prefer replaceActions (one call)."
                     ],
                     removeTrigger: [
                         type: "object",
@@ -8497,6 +8497,11 @@ Map _rmWalkStep(Integer appId, Map spec) {
     if (!page.matches(/[A-Za-z0-9_]+/)) throw new IllegalArgumentException("walkStep.page must be alphanumeric/underscore")
     def operation = spec?.operation?.toString()?.trim() ?: "introspect"
     def validateEnum = spec?.validateEnum == true
+    // Within a drive, carry the page RM rendered in response to the previous write.
+    // Transient wizard state (e.g. the condition opened by cond=a) exists only in that response; a
+    // fresh GET re-renders the pre-write page. Any non-write operation invalidates the carry.
+    def walkCache = spec?.__pageCache instanceof Map ? (Map) spec.__pageCache : null
+    if (walkCache != null && operation != "write") walkCache.clear()
 
     // walkStep is a RAW action-authoring path that bypasses _rmAddAction. If a preceding
     // addRequiredExpression deferred its predCapabs clear (Step 4b), run it now -- before any
@@ -8549,7 +8554,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
         if (navResp?.navRetried == true) navRetriedBefore = true
         beforeCfg = navResp ? [configPage: navResp.configPage] : _rmFetchConfigJson(appId, page)
     } else {
-        beforeCfg = _rmFetchConfigJson(appId, page)
+        beforeCfg = _rmFetchConfigJson(appId, page, walkCache)
     }
     def beforeStatus = _rmFetchStatusJson(appId)
     def beforeSettings = (beforeStatus?.appSettings ?: []).collectEntries { [(it?.name?.toString()): it?.value] }
@@ -8583,24 +8588,34 @@ Map _rmWalkStep(Integer appId, Map spec) {
         // in a numeric index with the same stem/delimiter, and there must be exactly
         // one live candidate.  With zero or multiple candidates we retain the legacy
         // warning + exact-key attempt rather than risk mutating the wrong action.
-        def schemaInput = beforeSchema.inputs.find { it.name == writtenKey }
-        if (!schemaInput && page == "doActPage") {
-            def requestedMatcher = (writtenKey =~ /^(.+[._-])(\d+)$/)
-            if (requestedMatcher.matches()) {
-                def requestedStem = requestedMatcher.group(1)
-                def liveCandidates = beforeSchema.inputs.findAll { input ->
-                    def candidateName = input?.name?.toString() ?: ""
-                    def candidateMatcher = (candidateName =~ /^(.+[._-])(\d+)$/)
-                    candidateMatcher.matches() && candidateMatcher.group(1) == requestedStem
-                }
-                if (liveCandidates.size() == 1) {
-                    def requestedKey = writtenKey
-                    schemaInput = liveCandidates[0]
-                    writtenKey = schemaInput.name.toString()
-                    opResult.rebound = [requestedKey: requestedKey, resolvedKey: writtenKey]
-                }
+        def requestedWriteKey = writtenKey
+        def resolveWriteKey = { Map schema ->
+            def exact = schema.inputs.find { it.name == requestedWriteKey }
+            if (exact || page != "doActPage") return [input: exact, key: requestedWriteKey]
+            def requestedMatcher = (requestedWriteKey =~ /^(.+[._-])(\d+)$/)
+            if (!requestedMatcher.matches()) return [input: null, key: requestedWriteKey]
+            def requestedStem = requestedMatcher.group(1)
+            def liveCandidates = schema.inputs.findAll { input ->
+                def candidateName = input?.name?.toString() ?: ""
+                def candidateMatcher = (candidateName =~ /^(.+[._-])(\d+)$/)
+                candidateMatcher.matches() && candidateMatcher.group(1) == requestedStem
             }
+            return liveCandidates.size() == 1 ? [input: liveCandidates[0], key: liveCandidates[0].name.toString(), rebound: true] : [input: null, key: requestedWriteKey]
         }
+        def resolved = resolveWriteKey(beforeSchema)
+        if (resolved.input == null && walkCache != null && !walkCache.isEmpty()) {
+            // Carry miss recovery: a carried POST echo can lag one render and omit the field the
+            // previous write revealed. Drop the carry and resolve once against a live page before
+            // concluding the key is absent. The previous write is never re-posted.
+            walkCache.clear()
+            beforeCfg = _rmFetchConfigJson(appId, page, walkCache)
+            beforeSchema = _rmCollectWalkSchema(beforeCfg?.configPage, beforeSettings)
+            resolved = resolveWriteKey(beforeSchema)
+            opResult.carryRefetched = true
+        }
+        def schemaInput = resolved.input
+        writtenKey = resolved.key
+        if (resolved.rebound) opResult.rebound = [requestedKey: requestedWriteKey, resolvedKey: writtenKey]
         // Validate against schema if asked.
         if (!schemaInput) {
             opResult.warning = "Field '${writtenKey}' not in current schema for page '${page}'. Available: ${beforeSchema.inputs.collect { it.name }}. The write will be attempted but the hub may silently drop it."
@@ -8634,9 +8649,28 @@ Map _rmWalkStep(Integer appId, Map spec) {
             } catch (Exception verExc) {
                 mcpLog("warn", "rm-native", "walkStep: href-context version fetch for app ${appId} on page '${hrefContext.fromPage ?: page}' failed (${verExc.message}) -- POSTing write without version field; hub may reject on concurrent-edit conflict")
             }
-            _rmPostSettings(appId, body)
+            // Every write path takes the drive cache so the carried before-page is dropped and the
+            // after-read below sees the page this write produced.
+            _rmPostSettings(appId, body, walkCache)
+        } else if (page && page != "mainPage" && schemaInput != null) {
+            // Sub-page writes need formAction/currentPage/pageBreadcrumbs, or RM silently no-ops
+            // wizard pickers such as doActPage cond (see _rmWriteSettingOnPage).
+            def pageApplied = []
+            def pageSkipped = []
+            _rmWriteSettingOnPage(appId, page, writtenKey, writtenValue, pageApplied, null, pageSkipped, walkCache)
+            _rmVerifySubPageMultipleFlags(appId, page, [(writtenKey): writtenValue], fullSchemaMap, walkCache)
+            if (pageSkipped) opResult.skipped = pageSkipped
+        } else if (page && page != "mainPage") {
+            // Unresolved key: keep walkStep's contract of attempting the exact requested key (with the
+            // schema warning above), but with page context so a wizard picker is not silently dropped.
+            def body = _rmBuildSettingsBody(appId, [(writtenKey): writtenValue], fullSchemaMap)
+            body.formAction = "update"
+            body.currentPage = page
+            body.pageBreadcrumbs = '["mainPage"]'
+            if (beforeCfg?.app?.version != null) body.version = beforeCfg.app.version.toString()
+            _rmPostSettings(appId, body, walkCache)
         } else {
-            _rmUpdateAppSettings(appId, [(writtenKey): writtenValue], fullSchemaMap)
+            _rmUpdateAppSettings(appId, [(writtenKey): writtenValue], fullSchemaMap, walkCache)
         }
         opResult.wrote = [(writtenKey): writtenValue]
     } else if (operation == "click") {
@@ -8738,7 +8772,8 @@ Map _rmWalkStep(Integer appId, Map spec) {
         if (navResp?.navRetried == true) opResult.navRetried = true
         afterCfg = navResp ? [configPage: navResp.configPage] : _rmFetchConfigJson(appId, page)
     } else {
-        afterCfg = _rmFetchConfigJson(appId, page)
+        if (walkCache != null && operation != "write") walkCache.clear()
+        afterCfg = _rmFetchConfigJson(appId, page, walkCache)
     }
     def afterStatus = _rmFetchStatusJson(appId)
     def afterSettings = (afterStatus?.appSettings ?: []).collectEntries { [(it?.name?.toString()): it?.value] }
@@ -8812,7 +8847,12 @@ Map _rmWalkStep(Integer appId, Map spec) {
     // replays a needlessly failed envelope). And an UNREADABLE probe (a transient
     // fetch failure -- no evidence of breakage either way) must never fail the
     // committed work; only positive evidence may.
-    def health = _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
+    // Inside a drive, defer the probe for every mutating step to the drive's final health
+    // check. The probe renders other rule pages, which resets RM's in-flight wizard (doActPage and STPage
+    // condition builders alike); gating on the step's operation, not its page, also covers `done`.
+    def health = (walkCache != null && operation in ["write", "click", "navigate", "done"]) ?
+        _rmEmptyHealthVerdict(ok: true, skipped: true, source: "deferred", note: "health probe deferred to the end of the drive (wizard in progress)") :
+        _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
     def silentRejection = (operation == "write") &&
         appeared.isEmpty() && disappeared.isEmpty() &&
         valueEcho?.match == false
@@ -8859,6 +8899,33 @@ Map _rmWalkStep(Integer appId, Map spec) {
     return result
 }
 
+// Sub-page writes go through _rmWriteSettingOnPage for page context, which skips the sticky multiple-flag check
+// _rmUpdateAppSettings performs. Only inputs declared multiple=true are checked; a flipped flag gets one re-POST of
+// the same group with page context, and a divergence that survives it throws.
+private void _rmVerifySubPageMultipleFlags(Integer appId, String pageName, Map settingsMap, Map schema, Map cache = null) {
+    def touched = settingsMap.keySet().collect { it.toString() }
+    if (!touched.any { schema?.get(it)?.multiple == true }) return
+    try {
+        _rmVerifyMultipleFlags(appId, schema, touched)
+    } catch (IllegalStateException divergence) {
+        mcpLog("warn", "rm-native", "Marshal divergence on app ${appId} page ${pageName} -- retrying with page context: ${divergence.message}")
+        def body = _rmBuildSettingsBody(appId, settingsMap, schema)
+        body.formAction = "update"
+        body.currentPage = pageName
+        body.pageBreadcrumbs = '["mainPage"]'
+        // The carried POST echo already holds the current version token; a live read is the fallback.
+        def cfg = _rmFetchConfigJson(appId, pageName, cache)
+        if (cfg?.app?.version != null) body.version = cfg.app.version.toString()
+        _rmPostSettings(appId, body, cache)
+        try {
+            _rmVerifyMultipleFlags(appId, schema, touched)
+        } catch (IllegalStateException persistent) {
+            // The shared verifier's advice is to re-POST the group, which this helper has just done.
+            throw new IllegalStateException("${persistent.message} Automatic recovery was already attempted: one full-group re-POST with page context on page '${pageName}' did not restore the flag. The write may already be committed, so do not resend it; check hub_get_rule_health(appId=${appId}) and restore the pre-write backup if the rule is damaged.".toString())
+        }
+    }
+}
+
 // The trailing health probe for a walkStep op, budget-aware: once the transport
 // time budget is spent the probe is SKIPPED (an ok-shaped verdict flagged
 // skipped:true, with a pointer to hub_get_rule_health) so the committed op's
@@ -8882,6 +8949,38 @@ private boolean _rmHealthGatePass(Map health) {
     return health?.ok == true || health?.unreadable == true
 }
 
+// Structural issues of an RM rule computed the same way the health check does, from the compiled action list and
+// statusJson settings only. Null for an app that is not an RM rule; a compiled-state read that failed throws, so the
+// caller can say why the baseline is missing rather than mistaking the failure for a non-RM app.
+List _rmStructuralBaseline(Integer appId) {
+    def cs = _ruleCompiledState(appId)
+    if (cs?.readError != null) throw new IllegalStateException("compiled rule state could not be read: ${cs.readError}")
+    if (cs == null || cs.ruleFormat != "rm") return null
+    def settingsByName = _rmFetchSettingsByName(appId)
+    return _rmStructuralIssuesFromSequence(_rmStructuralSequenceFromSettings(settingsByName, ([] as Set), _rmCoerceActionIndices(cs.actionList)))
+        .collect { it?.toString() }
+}
+
+// Non-empty list when the final verdict fails ONLY on structural issues that were all present in the baseline
+// taken before the drive; null otherwise (no baseline, any new issue, or any other kind of breakage still fails).
+// orphanedActionRows are left out on purpose: the health contract keeps them diagnostic, outside issues and ok.
+private List _rmPreExistingStructuralOnly(List baseline, Map finalHealth) {
+    if (baseline == null || !(finalHealth instanceof Map) || finalHealth.ok == true || finalHealth.unreadable == true) return null
+    if (finalHealth.broken == true || (finalHealth.brokenMarkers as List) ||
+            (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null ||
+            finalHealth.label?.toString()?.contains("*BROKEN*")) return null
+    def after = ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }
+    if (!after) return null
+    return _rmPreExistingStructuralSubset(baseline, finalHealth).size() == after.size() ? after : null
+}
+
+// Final structural issues that were already present in the baseline, matched one by one; empty without a baseline.
+private List _rmPreExistingStructuralSubset(List baseline, Map finalHealth) {
+    if (baseline == null || !(finalHealth instanceof Map)) return []
+    def before = baseline.collect { it?.toString() } as Set
+    return ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }.findAll { before.contains(it) }
+}
+
 // Auto-driver for walkStep (operation='drive'): run an ordered list of
 // single-step operations in one call, composing _rmWalkStep per step. Each
 // step is a normal walkStep spec ({operation, page?, write?/click?/navigate?/
@@ -8903,6 +9002,7 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     def currentPage = spec?.page?.toString()?.trim()
     def allOk = true
     def lastStepOperation = null
+    def driveWalkCache = [:]   // per-drive page carry, see _rmWalkStep
     // Time-budget self-pause: set when the budget is reached BETWEEN steps so the
     // post-loop path returns an in_progress envelope with the unrun steps instead of
     // the normal fail-loud rollup. Null whenever no pause fires (within budget, or
@@ -8923,6 +9023,16 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             throw new IllegalArgumentException("walkStep.drive steps cannot nest operation='drive' (step ${i + 1})")
         }
     }
+    // Structural baseline before any step, from the compiled action list and app settings (no page render, so an
+    // in-flight wizard is never reset). The terminal gate then fails only on structural issues this drive introduced.
+    List baselineStructural = null
+    String baselineUnavailable = null
+    // Without a baseline the strict gate stays in force; a failed read is logged and explained if it decides the result.
+    try { baselineStructural = _rmStructuralBaseline(appId) }
+    catch (Exception baselineExc) {
+        baselineUnavailable = baselineExc.message ?: baselineExc.toString()
+        mcpLog("warn", "rm-native", "walkStep drive: structural baseline read failed for app ${appId} (${baselineUnavailable}) -- issues already present before the drive cannot be exempted")
+    }
     int idx = 0
     for (def rawStep : steps) {
         idx++
@@ -8942,6 +9052,7 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         // above then fires before the next step. stepsRemaining is built from the
         // raw list via _stripInternalClock, so the clock never leaks into an echo.
         if (spec?.__reqT0 != null) step.__reqT0 = spec.__reqT0
+        step.__pageCache = driveWalkCache
         def stepOp = step.operation?.toString()?.trim() ?: "introspect"
         // Inherit the page the previous step ended on when this step omits one.
         if (!step.page && currentPage) step.page = currentPage
@@ -8991,9 +9102,9 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             if (stopOnError) break
         }
     }
-    // Budget-aware final probe: on a pause (or any budget-spent exit) the probe is
-    // skipped -- the pause exists to beat the transport ceiling, and burning the
-    // remaining window on a diagnostic fetch defeats it.
+    // The final probe is the drive's only health check for its mutating steps, whose per-step probes were
+    // deferred. It is budget-aware: on a pause (or any budget-spent exit) it is skipped, because the pause exists
+    // to beat the transport ceiling; a finished drive whose probe was skipped reports itself unverified below.
     def finalHealth = _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
     // Paused (budget reached between steps): return an in_progress envelope
     // and skip the fail-loud rollup below -- a pause is NOT an error. success:true holds
@@ -9017,10 +9128,12 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             ]
         ]
     }
-    // An unreadable final probe (transient fetch failure, no evidence either way)
-    // must not fail a drive whose every step committed cleanly; a skipped probe
-    // (budget shed) likewise. Positive evidence of breakage still gates.
+    // An unreadable final probe (transient fetch failure, no evidence either way) does not fail the gate; positive
+    // evidence of breakage does. A probe the budget skipped also passes the gate here, but a finished drive with
+    // mutating steps is then reported healthUnverified below.
     boolean finalHealthGate = _rmHealthGatePass(finalHealth)
+    def preExistingStructural = _rmPreExistingStructuralOnly(baselineStructural, finalHealth)
+    if (!finalHealthGate && preExistingStructural) finalHealthGate = true
     def result = [
         success: allOk && finalHealthGate,
         operation: "drive",
@@ -9031,6 +9144,11 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         steps: stepResults,
         health: finalHealth
     ]
+    // A terminal drive that leaves any structural issue it introduced (an unclosed block included) is incomplete;
+    // issues already present before the drive (e.g. building inside an open IF across calls) are reported, not failed.
+    if (!finalHealthGate && (finalHealth?.structuralIssues as List)) result.structuralIssues = finalHealth.structuralIssues
+    def preExistingSubset = _rmPreExistingStructuralSubset(baselineStructural, finalHealth)
+    if (preExistingSubset) result.preExistingStructuralIssues = preExistingSubset
     // Fail-loud rollup: a success:false drive must ALWAYS carry a top-level reason. A step
     // error caught per-step otherwise lives only in steps[].error -- a weak signal for an
     // LLM caller that sees success:false with no top-level `error`. Surface the first failed
@@ -9039,11 +9157,27 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     def firstFailed = stepResults.find { it.success == false }
     if (firstFailed != null) {
         result.error = "drive halted at step ${firstFailed.step} (${firstFailed.operation}): ${firstFailed.error ?: 'step reported success:false -- inspect its valueEcho/silentRejection/health'}".toString()
-        result.repairHints = (result.repairHints ?: []) + ["Drive stopped at step ${firstFailed.step}. Inspect steps[${firstFailed.step - 1}] for the failure detail, correct it, and re-run the drive from that step.".toString()]
+        boolean recoveryExhausted = firstFailed.error?.toString()?.contains("Automatic recovery was already attempted") == true
+        result.repairHints = (result.repairHints ?: []) + [(recoveryExhausted ?
+            "Drive stopped at step ${firstFailed.step} after its automatic recovery was already attempted. Do not re-run that step: its write may already be committed. Inspect steps[${firstFailed.step - 1}] and hub_get_rule_health(appId=${appId}), and restore the pre-write backup if the rule is damaged." :
+            "Drive stopped at step ${firstFailed.step}. Inspect steps[${firstFailed.step - 1}] for the failure detail, correct it, and re-run the drive from that step.").toString()]
     } else if (!finalHealthGate) {
         result.error = "drive completed all ${stepResults.size()} step(s) but the rule is unhealthy: ${(finalHealth.issues ?: ['see health']).join('; ')}".toString()
+        if (baselineUnavailable != null && (finalHealth?.structuralIssues as List)) {
+            result.baselineUnavailable = baselineUnavailable
+            result.repairHints = (result.repairHints ?: []) + ["The pre-drive structural baseline could not be read (${baselineUnavailable}), so issues that were already present, such as a block left open by an earlier call, could not be told apart from new ones. Compare with hub_get_rule_health(appId=${appId}); if every issue predates this drive, the steps still committed and need no re-run.".toString()]
+        }
     } else if (finalHealth.unreadable == true) {
         result.repairHints = (result.repairHints ?: []) + ["The final health probe could not be read -- no evidence of breakage either way (a transient failure, or the rule may since have been removed); every step committed. Verify via hub_get_rule_health(${appId}).".toString()]
+    }
+    // Only a paused drive may defer the final check. A finished drive whose probe the time budget shed never
+    // looked at the rule it changed, so it reports itself unverified instead of complete.
+    if (allOk && finalHealth?.skipped == true && stepResults.any { it.operation in ["write", "click", "navigate", "done"] }) {
+        result.success = false
+        result.partial = true
+        result.healthUnverified = true
+        result.error = "drive ran all ${stepResults.size()} step(s) but its final health check was skipped because the time budget ran out, so the rule's state is unverified".toString()
+        result.repairHints = (result.repairHints ?: []) + ["Every step committed, so do not re-run the drive. Check the rule with hub_get_rule_health(appId=${appId}) and repair anything it reports, such as an unclosed block, before treating the rule as complete.".toString()]
     }
     return result
 }
@@ -10986,6 +11120,7 @@ private Map _rmRevealStep(Integer appId, String page, String pattern, Closure tr
 // end field -> hasAll
 // Variable          -- rCapab -> re-fetch -> discover variable picker -> write name ->
 // re-fetch -> RelrDev_<N> -> re-fetch -> state_<N> -> hasAll
+// (Boolean var) state_<N> true/false directly, no comparator field -> hasAll
 // Custom Attribute  -- rCapab -> rDev_<N> -> rCustomAttr_<N> -> re-fetch ->
 // (free attr) RelrDev_<N> -> re-fetch -> state_<N> -> hasAll
 // (enum attr) state_<N> directly (no comparator) -> hasAll
@@ -11417,9 +11552,15 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             cancelInFlightCond()
             throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'variable' (the hub variable name) and 'comparator'. Got: ${cond}")
         }
+        // A Boolean variable exposes state_<N> (true/false) directly and has no comparator
+        // field, so an omitted comparator is allowed only with a true/false literal; otherwise fail loud.
         if (!cond.comparator) {
-            cancelInFlightCond()
-            throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
+            def rhs = cond.state != null ? cond.state : cond.value
+            boolean booleanLiteral = rhs instanceof Boolean || rhs?.toString()?.toLowerCase() in ["true", "false"]
+            if (!booleanLiteral) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'), or value true/false for a Boolean variable. Got: ${cond}")
+            }
         }
         // compareToVariable (variable-vs-variable RHS) and value/state (constant RHS)
         // are mutually exclusive -- RM renders one OR the other, never both. Reject the
@@ -11466,18 +11607,77 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             throw new IllegalArgumentException("conditions[${condIdx}]: Variable: hub variable '${varName}' not in the revealed picker for '${varPickerField}'. Available: ${varOpts.sort().join(', ')}")
         }
 
-        // Reveal 2: write variable name as the trigger -> RelrDev_<N> comparator appears
-        def normalizedComparator = _rmNormalizeComparator(cond.comparator.toString())
-        def relrReveal = revealStep(appId, page, /RelrDev_\d+/, {
+        // Reveal 2: write variable name as the trigger -> RelrDev_<N> comparator appears,
+        // or state_<N> directly for a Boolean variable.
+        def normalizedComparator = cond.comparator ? _rmNormalizeComparator(cond.comparator.toString()) : null
+        def relrReveal = revealStep(appId, page, "RelrDev_${cIdx}|state_${cIdx}".toString(), {
             writeST(hrefParams, varPickerField, varName)
         })
-        if (!relrReveal.input) {
+        // Classify on every matching field, not the first in page order: a static schema can list state_<N>
+        // ahead of RelrDev_<N>, and a comparator field means a comparison slot whatever else is present.
+        def revealedInputs = relrReveal.postInputs ?: []
+        def relrInput = revealedInputs.find { it?.name?.toString() == "RelrDev_${cIdx}".toString() }
+        def stateInput = revealedInputs.find { it?.name?.toString() == "state_${cIdx}".toString() }
+        if (relrInput == null && stateInput != null) {
+            def stateOptions = _rmReadPickerOptionStrings(stateInput)
+            boolean trueFalseOptions = stateOptions && stateOptions.every { it?.toString()?.toLowerCase() in ["true", "false"] }
+            if (stateOptions && !trueFalseOptions) {
+                cancelInFlightCond()
+                throw new IllegalStateException("conditions[${condIdx}]: Variable: state_${cIdx} offers ${stateOptions} rather than true/false and no comparator field (RelrDev_${cIdx}) was revealed, so '${varName}' is neither a Boolean nor a comparison slot. Visible fields: ${relrReveal.visibleNames?.join(', ') ?: '(none)'}")
+            }
+            if (relrReveal.fallbackToExisting && !trueFalseOptions) {
+                cancelInFlightCond()
+                throw new IllegalStateException("conditions[${condIdx}]: Variable: state_${cIdx} was present before '${varName}' was selected and lists no true/false options, so its Boolean type cannot be established. Refusing to guess.")
+            }
+            if (relrReveal.fallbackToExisting) {
+                // state_<cIdx> was already on the page before the variable write (static schema or a
+                // leftover slot). Accept it only if the variable picker echoes the variable just chosen.
+                def varEcho = (relrReveal.postInputs ?: []).find { it?.name?.toString() == varPickerField }
+                def echoed = varEcho?.value != null ? varEcho.value : varEcho?.currentValue
+                if (echoed?.toString() != varName) {
+                    cancelInFlightCond()
+                    throw new IllegalStateException("conditions[${condIdx}]: Variable: ambiguous schema -- state_${cIdx} was present before '${varName}' was selected and the picker '${varPickerField}' does not echo it (got '${echoed}'). Refusing to guess between a Boolean value field and a leftover slot.")
+                }
+            }
+            // Boolean variable: implicit equality against true/false; RM persists RelrDev_<N>='=' itself
+            // (observed on a rule built through the native UI).
+            if (cond.compareToVariable != null) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; RM compares it only to true/false, not to another variable.")
+            }
+            if (normalizedComparator != null && normalizedComparator != _rmNormalizeComparator("=")) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; only '=' is supported (use not:true to negate). Got comparator '${cond.comparator}'.")
+            }
+            def boolRaw = cond.state != null ? cond.state : cond.value
+            def boolStr = (boolRaw instanceof Boolean) ? boolRaw.toString() : boolRaw?.toString()?.toLowerCase()
+            def boolField = stateInput.name.toString()
+            def boolOpts = stateOptions
+            if (!(boolStr in ["true", "false"]) || (boolOpts && !(boolStr in boolOpts))) {
+                cancelInFlightCond()
+                throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; value must be true or false. Got '${boolRaw}'. Options: ${boolOpts}")
+            }
+            writeST(hrefParams, boolField, boolStr)
+            if (cond.not == true) {
+                writeST(hrefParams, "not${cIdx}".toString(), true)
+            }
+            if (cond.rawSettings instanceof Map) {
+                (cond.rawSettings as Map).each { rk, rv -> writeST(hrefParams, rk.toString(), rv) }
+            }
+            _rmClickAppButton(appId, "hasAll", null, page, cache)
+            return
+        }
+        if (relrInput && !cond.comparator) {
+            cancelInFlightCond()
+            throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' revealed a comparator field (RelrDev_${cIdx}), so it is not a Boolean variable and requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
+        }
+        if (!relrInput) {
             cancelInFlightCond()
             def visible = relrReveal.visibleNames?.join(', ') ?: "(none)"
             throw new IllegalStateException("conditions[${condIdx}]: Variable: RelrDev_<N> (comparator) not revealed after variable name write. Visible fields: ${visible}")
         }
         // Use the firmware-assigned field name discovered from the live schema.
-        def relrField = relrReveal.input.name.toString()
+        def relrField = relrInput.name.toString()
 
         // Variable-vs-variable RHS path. When the caller supplies compareToVariable,
         // the RHS is another hub variable rather than a numeric constant. RM exposes a
@@ -13407,8 +13607,11 @@ private String _rmBulkStopError(String stoppedAfter, stopItem) {
     if (!itemError) itemError = item.updateRuleError?.toString()?.trim()
     if (!itemError && item.settingsSkipped instanceof List) {
         def informational = _rmInformationalSkippedReasons()
-        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason && !(it.reason in informational) }
-        if (skip != null) itemError = "field '${skip.key}' was not applied (${skip.reason})".toString()
+        // The isCondTrig.<N> finalize toggle is a cosmetic best-effort write, never why an item stopped.
+        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason &&
+            !(it.reason in informational) && !it.key.toString().startsWith("isCondTrig.") }
+        // Not every skip means the value was lost (a force-written comparator is written but unverified), so name the reason.
+        if (skip != null) itemError = "field '${skip.key}' reported ${skip.reason}".toString()
     }
     if (!itemError && item.repairHints instanceof List) {
         itemError = (item.repairHints as List).find { it != null && it.toString().trim() }?.toString()?.trim()
@@ -14137,11 +14340,9 @@ def _applyNativeAppEdit(args) {
         if (replaceStopAfter) {
             return _rmBulkStoppedResult(appId, backup, replaceStopAfter, replaceStopItem, [removedIndices: removed ?: null, addedActions: addedResults])
         }
-        // Trailing updateRule fires AFTER mutation block completes. Hoisted
-        // out of the per-item try so a rejection here doesn't get routed
-        // through the generic "mutation errored partway" shape -- the mutation
-        // state IS committed and callers need the dedicated failure slots to
-        // detect the subscriptions-not-live consequence without log-grep.
+        // Trailing updateRule fires only when no added item stopped the batch (that case returned above).
+        // Hoisted out of the per-item try so a rejection gets the dedicated not-live slots rather than
+        // the generic "mutation errored partway" shape: the mutation state IS committed.
         try { _rmClickAppButton(appId, "updateRule") }
         catch (Exception updateExc) {
             updateRuleFailed = true
@@ -14453,7 +14654,7 @@ def _applyNativeAppEdit(args) {
     }
 
     if (patchesList != null) {
-        // Multi-mutation atomic patch. Each item in the patches
+        // Multi-mutation patch. Each item in the patches
         // list is a dict with one of the supported sub-operations:
         //   {addRequiredExpression: {...}}
         //   {addTrigger: {...}} | {addTriggers: [...]}
@@ -14463,10 +14664,9 @@ def _applyNativeAppEdit(args) {
         //   {removeAction: {index}} | {clearActions: true} | {replaceActions: [...]}
         //   {moveAction: {index, direction}}
         //   {button: <name>, stateAttribute?, pageName?}
-        // Operations apply sequentially. updateRule fires ONCE at the end
-        // — not after each sub-op — so the rule's actions[] map and
-        // subscriptions bake from a fully-loaded state. This mirrors
-        // Operations are atomic from the rule's perspective.
+        // Operations apply sequentially and updateRule fires once at the end, so the rule's
+        // actions[] map and subscriptions bake from a fully-loaded state. It is not a
+        // transaction: a failed or partial op stops the batch and leaves earlier ops written.
         def patchResults = []
         def patchErr = null
         // Trailing-updateRule failure propagation: when the post-patch updateRule
@@ -14834,14 +15034,9 @@ def _applyNativeAppEdit(args) {
                     patchStopItem = innerStopItem ?: patchResults.last()
                 }
             }
-            // Fire updateRule once at the end so the rule's actions[]
-            // map and event subscriptions bake from the fully-loaded
-            // post-patch state. Honour the comment: silent failure here means
-            // the patches landed but never bake into the running rule, so
-            // surface via dedicated envelope slots (sibling pattern from F2:
-            // addRequiredExpression slot propagation in the
-            // `addRequiredExpressionSpec` dispatcher branch and F1's
-            // counterpart in the `addTriggerSpec` dispatcher branch).
+            // Fire updateRule once at the end, and only when no op stopped the batch, so the rule's
+            // actions[] map and event subscriptions bake from the fully-loaded post-patch state. A
+            // rejected click means the ops landed but never bake, so it gets dedicated envelope slots.
             if (!patchStopAfter) try { _rmClickAppButton(appId, "updateRule") }
             catch (Exception updateExc) {
                 updateRuleFailed = true
@@ -14861,6 +15056,7 @@ def _applyNativeAppEdit(args) {
         }
         def opsOk = patchResults.count { it?.success != false }
         def health = _rmCheckRuleHealth(appId)
+        def deferredRestoreHints = []
         // Batch-end restore for DEFERRED replaceRequiredExpression ops (re-homed destructive-
         // window contract). Restore on two triggers, by attributability: the batch-end updateRule
         // failing (always -- that one click makes every deferred RE live), or a health regression
@@ -14897,15 +15093,22 @@ def _applyNativeAppEdit(args) {
                         success: false, partial: true, requiredExpressionReplaced: false,
                         note: "Required Expression replace ROLLED BACK in batch: ${why}; the original was restored."]
                     anyRestored = true
+                    // The rollback lives in patches[idx]; name it at the top level too so callers see the recovery outcome.
+                    deferredRestoreHints << (restoreOutcome.requiredExpressionRestored == true ?
+                        "patches[${idx}] replaceRequiredExpression was rolled back because ${why}; the original Required Expression was restored and confirmed. See patches[${idx}] for details." :
+                        "patches[${idx}] replaceRequiredExpression was rolled back because ${why}, but the original Required Expression could not be confirmed restored: ${restoreOutcome.error ?: 'see patches[' + idx + ']'}").toString()
                 }
             }
             // Recompute the success rollup after any deferred-restore reclassification above.
             if (anyRestored) opsOk = patchResults.count { it?.success != false }
         }
         if (patchStopAfter && patchErr == null) {
-            return _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+            def stopped = _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+            if (deferredRestoreHints) stopped.repairHints = deferredRestoreHints + (stopped.repairHints ?: [])
+            return stopped
         }
         def repairHints = []
+        repairHints.addAll(deferredRestoreHints)
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the patch ops committed. The patch settings are baked but the rule will not re-evaluate / re-subscribe until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
         }
@@ -15143,11 +15346,9 @@ def _applyNativeAppEdit(args) {
         if (bulkStopAfter) {
             return _rmBulkStoppedResult(appId, backup, bulkStopAfter, bulkStopItem, [triggers: triggerResults, actions: actionResults])
         }
-        // Trailing updateRule fires AFTER per-item adds complete. Hoisted out
-        // of the per-item try so a rejection here doesn't get routed through
-        // the generic "bulk path errored partway" shape -- per-item state IS
-        // committed and callers need the dedicated failure slots to detect
-        // the subscriptions-not-live consequence without log-grep. Each
+        // Trailing updateRule fires only when every item completed cleanly (a stop returned above).
+        // Hoisted out of the per-item try so a rejection gets the dedicated not-live slots rather than
+        // the generic "bulk path errored partway" shape: per-item state IS committed. Each
         // _rmAddAction self-bakes its own action via the doActPage->
         // selectActions navigation, so this trailing click is just for the
         // final re-init (mirrors the UI's top-level "Update Rule" / "Done"
@@ -15225,7 +15426,17 @@ def _applyNativeAppEdit(args) {
                     unknownSettings << k.toString()
                 }
             }
-            if (knownSettings) {
+            def isSubPageWrite = (pageName && pageName != "mainPage")
+            def subPageApplied = []
+            def subPageSkipped = []
+            if (knownSettings && isSubPageWrite) {
+                // Write sub-page keys one at a time with page context and verify each landed, including
+                // the sticky multiple flag; settingsApplied lists only confirmed keys.
+                knownSettings.each { k, v ->
+                    _rmWriteSettingOnPage(appId, pageName, k.toString(), v, subPageApplied, null, subPageSkipped)
+                    _rmVerifySubPageMultipleFlags(appId, pageName, [(k.toString()): v], schema)
+                }
+            } else if (knownSettings) {
                 _rmUpdateAppSettings(appId, knownSettings, schema)
             }
             // Auto-fire updateRule only for main-page writes. On sub-pages
@@ -15250,7 +15461,11 @@ def _applyNativeAppEdit(args) {
                 _rmClickAppButton(appId, editCommitButton)
                 implicitCommitButton = editCommitButton
             }
-            result.settingsApplied = knownSettings.keySet().toList()
+            result.settingsApplied = isSubPageWrite ? subPageApplied : knownSettings.keySet().toList()
+            if (isSubPageWrite && subPageSkipped) {
+                result.settingsNotLanded = subPageSkipped
+                result.partial = true
+            }
             if (unknownSettings) {
                 result.settingsSkipped = unknownSettings
                 def settingWord = (unknownSettings.size() == 1) ? "Setting" : "Settings"

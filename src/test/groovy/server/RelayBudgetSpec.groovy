@@ -537,14 +537,17 @@ class RelayBudgetSpec extends ToolSpecBase {
             [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop'], [key: 'tstate1', reason: 'silent_rejection']],
              repairHints: ['later hint']],
             [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']], repairHints: ['', 'Re-add the comparator.']],
-            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']]]
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']]],
+            [success: true, partial: true, settingsSkipped: [[key: 'isCondTrig.1', reason: 'not_in_schema'],
+                                                             [key: 'ReltDev1', reason: 'comparator_force_written_unverified']]]
         ]
         expected << [
             'Stopped after addActions[1] reported partial: kept first. Later items were not attempted and finalisation was not fired.',
             'Stopped after addActions[1] reported partial: updateRule rejected. Later items were not attempted and finalisation was not fired.',
-            "Stopped after addActions[1] reported partial: field 'tstate1' was not applied (silent_rejection). Later items were not attempted and finalisation was not fired.",
+            "Stopped after addActions[1] reported partial: field 'tstate1' reported silent_rejection. Later items were not attempted and finalisation was not fired.",
             'Stopped after addActions[1] reported partial: Re-add the comparator. Later items were not attempted and finalisation was not fired.',
-            'Stopped after addActions[1] reported partial. Later items were not attempted and finalisation was not fired.'
+            'Stopped after addActions[1] reported partial. Later items were not attempted and finalisation was not fired.',
+            "Stopped after addActions[1] reported partial: field 'ReltDev1' reported comparator_force_written_unverified. Later items were not attempted and finalisation was not fired."
         ]
     }
 

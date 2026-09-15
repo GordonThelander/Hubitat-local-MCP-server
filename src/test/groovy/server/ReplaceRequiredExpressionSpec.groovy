@@ -1170,6 +1170,10 @@ class ReplaceRequiredExpressionSpec extends ToolSpecBase {
         and: "the batch envelope reflects the failure (success false, partial true)"
         result.success == false
         result.partial == true
+
+        and: "the top-level repair hints carry both the rejected click and the rollback summary"
+        result.repairHints?.any { it.contains("updateRule click was rejected") }
+        result.repairHints?.any { it.contains("patches[0] replaceRequiredExpression was rolled back") }
     }
 
     def "BUG-2b: a sibling-introduced NEW imbalance in a MULTI-op batch does NOT over-restore the deferred replace"() {
@@ -1266,6 +1270,9 @@ class ReplaceRequiredExpressionSpec extends ToolSpecBase {
         replEntry?.success == false
         replEntry?.requiredExpressionReplaced == false
         !restoreFileRead.isEmpty()
+
+        and: "the top-level repair hints name the rollback, so a caller need not dig into the patch row"
+        result.repairHints?.any { it.contains("patches[0] replaceRequiredExpression was rolled back") && it.contains("restored and confirmed") }
     }
 
     def "BUG-8-batch: a MULTI-op batch with an UNCHANGED pre-existing **Broken Condition** does NOT restore the replace"() {

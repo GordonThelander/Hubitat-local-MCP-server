@@ -10677,13 +10677,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     }
 
     def "walkStep drive reports success=false when the rule ends unhealthy even though every step passed"() {
-        // The drive success gate is `allOk && finalHealth.ok`. A drive whose steps ALL pass
-        // (allOk=true) but whose post-run health check comes back broken must still report
-        // success:false. The compiled-state read (/app/ruleBuilderJson, hit exactly once per
-        // _rmCheckRuleHealth and nowhere else) is the lever: healthy for the step's own health
-        // check, broken on the trailing finalHealth read -- which isolates the finalHealth.ok
-        // conjunct (a step's own success is also health-gated, so a uniformly-broken rule
-        // couldn't distinguish the two AND-operands).
+        // A drive whose steps ALL pass but whose final health check comes back broken must still
+        // report success:false. Mutating steps in a drive defer their own probe to that final check;
+        // this read-only step still probes, so the compiled-state read (/app/ruleBuilderJson, hit once
+        // per _rmCheckRuleHealth and once by the pre-drive structural baseline) is the lever: healthy
+        // for the step's probe, broken on the final read, which isolates the final gate.
         given:
         enableWrite()
         def rb = [n: 0]
@@ -10692,11 +10690,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             ruleConfigJson(100, "r", [[name: "tCapab1", type: "enum", options: ["Switch"]]])
         }
         hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
-        // 1-step drive => two health checks total: the step's own (read #1, clean) and the
-        // post-loop finalHealth (read #2, broken). Flip broken:true on read #2+.
+        // 1-step drive => three compiled-state reads: the pre-drive structural baseline (#1), the step's
+        // own health check (#2, clean) and the post-loop finalHealth (#3, broken). Flip broken:true on read #3+.
         hubGet.register('/app/ruleBuilderJson/100') { params ->
             rb.n = rb.n + 1
-            JsonOutput.toJson([broken: (rb.n >= 2)])
+            JsonOutput.toJson([broken: (rb.n >= 3)])
         }
         script.metaClass.uploadHubFile = { String fn, byte[] b -> }
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
@@ -34299,6 +34297,885 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
         and: "state_1 written with value (consequence-gated: appeared only after RelrDev_1 written)"
         writtenFields["state_1"].toString() == "42"
+    }
+
+    // ---- Boolean Variable conditions: RM reveals state_<N> (true/false) and not<N> directly after the
+    // variable is chosen, with no RelrDev_<N> comparator field.
+
+    private Closure booleanDoActPage(Map flags, boolean staticState = false) {
+        return { params ->
+            flags.seq = (flags.seq ?: 0) + 1
+            def inputs = [
+                [name: "actType.1", type: "enum", options: ["condActs": "Conditional Actions"]],
+                [name: "actSubType.1", type: "enum", options: ["getIfThen": "IF Expression THEN"]],
+                [name: "cond", type: "enum", options: ["a": "New condition"]],
+                [name: "rCapab_1", type: "enum", options: ["Variable", "Switch"]],
+                [name: "hasAll", type: "button"]
+            ]
+            if (staticState) inputs = inputs + [[name: "state_1", type: "enum", options: ["true", "false"]]]
+            if (flags.rCapab) inputs = inputs + [[name: "xVar_1", type: "enum", options: ["myBool": "myBool"], value: flags.echoVar]]
+            if (flags.xVar && !staticState) inputs = inputs + [[name: "state_1", type: "enum", options: ["true", "false"]], [name: "not1", type: "bool"]]
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "doActPage", title: "T", install: false, error: null,
+                             sections: [[title: "", input: inputs, paragraphs: ["seq ${flags.seq}".toString()]]]],
+                settings: [:], childApps: []
+            ])
+        }
+    }
+
+    private Map stubBooleanWizard(Map flags, Map writtenFields, boolean staticState = false, Closure doActPage = null) {
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (body?.name != null && body?.containsKey("settings[" + body.name + "]")) flags.clicks = (flags.clicks ?: []) + [body.name]
+            if (path == "/installedapp/update/json" && body?.currentPage == "doActPage") {
+                body.each { k, v ->
+                    def key = _settingKeyOf(k)
+                    if (key != null) {
+                        writtenFields[key] = v
+                        if (key == "rCapab_1") flags.rCapab = true
+                        if (key == "xVar_1") flags.xVar = true
+                    }
+                }
+            }
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params -> actSelectActionsJson(100) }
+        hubGet.register('/installedapp/configure/json/100/doActPage', doActPage ?: booleanDoActPage(flags, staticState))
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> actMainPageBakedJson(100, "IF myBool is true THEN") }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        return flags
+    }
+
+    def "addAction ifThen: Boolean Variable condition writes state_<N> directly and never a comparator"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields)
+
+        when: "no comparator is supplied, as a Boolean variable has none"
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then:
+        result.success == true
+        writtenFields["xVar_1"] == "myBool"
+        writtenFields["state_1"] == "true"
+        !writtenFields.containsKey("RelrDev_1")
+    }
+
+    def "addAction ifThen: Boolean Variable condition rejects a non-equality comparator before writing state_<N>"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields)
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", comparator: "<", value: true]]]],
+            confirm: true])
+
+        then:
+        result.success == false
+        result.toString().contains("only '=' is supported")
+        !writtenFields.containsKey("state_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    def "addAction ifThen: a pre-existing state_<N> without a variable echo fails as an ambiguous schema"() {
+        given: "state_1 is already on the page before the variable is chosen, and the picker does not echo it"
+        enableWrite()
+        def flags = [echoVar: null]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, true)
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then: "it refuses explicitly instead of writing state_1 or falling into the comparator path"
+        result.success == false
+        result.toString().contains("ambiguous schema")
+        !writtenFields.containsKey("state_1")
+        !writtenFields.containsKey("RelrDev_1")
+    }
+
+    def "addAction ifThen: a pre-existing state_<N> is accepted when the variable picker echoes the chosen variable"() {
+        given:
+        enableWrite()
+        def flags = [echoVar: "myBool"]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, true)
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: false]]]],
+            confirm: true])
+
+        then:
+        result.success == true
+        writtenFields["state_1"] == "false"
+        !writtenFields.containsKey("RelrDev_1")
+    }
+
+    def "addAction ifThen: Boolean Variable condition rejects compareToVariable before writing state_<N>"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields)
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", comparator: "=", compareToVariable: "otherBool"]]]],
+            confirm: true])
+
+        then:
+        result.success == false
+        result.toString().contains("not to another variable")
+        !writtenFields.containsKey("state_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    // A doActPage whose state_1 field has no comparator beside it, with a chosen shape: revealed after the
+    // variable pick or already present, and with the given options.
+    private Closure stateOnlyDoActPage(Map flags, Map stateInput, boolean staticState) {
+        return { params ->
+            flags.seq = (flags.seq ?: 0) + 1
+            def inputs = [
+                [name: "actType.1", type: "enum", options: ["condActs": "Conditional Actions"]],
+                [name: "actSubType.1", type: "enum", options: ["getIfThen": "IF Expression THEN"]],
+                [name: "cond", type: "enum", options: ["a": "New condition"]],
+                [name: "rCapab_1", type: "enum", options: ["Variable", "Switch"]],
+                [name: "hasAll", type: "button"]
+            ]
+            if (staticState) inputs = inputs + [stateInput]
+            if (flags.rCapab) inputs = inputs + [[name: "xVar_1", type: "enum", options: ["myBool": "myBool"], value: flags.echoVar]]
+            if (flags.xVar && !staticState) inputs = inputs + [stateInput]
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "doActPage", title: "T", install: false, error: null,
+                             sections: [[title: "", input: inputs, paragraphs: ["seq ${flags.seq}".toString()]]]],
+                settings: [:], childApps: []
+            ])
+        }
+    }
+
+    def "addAction ifThen: a state_<N> offering non-true/false options with no comparator field is refused and cancelled"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, false,
+            stateOnlyDoActPage(flags, [name: "state_1", type: "enum", options: ["low", "high"]], false))
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then: "neither a Boolean nor a comparison slot, so nothing is guessed"
+        result.success == false
+        result.toString().contains("rather than true/false")
+        !writtenFields.containsKey("state_1")
+        !writtenFields.containsKey("RelrDev_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    def "addAction ifThen: an already-present state_<N> with no true/false options is refused and cancelled"() {
+        given: "state_1 is on the page before the variable is chosen, lists no options, and the picker echoes the variable"
+        enableWrite()
+        def flags = [echoVar: "myBool"]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, true,
+            stateOnlyDoActPage(flags, [name: "state_1", type: "text"], true))
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then: "its Boolean type cannot be established, so nothing is written"
+        result.success == false
+        result.toString().contains("lists no true/false options")
+        !writtenFields.containsKey("state_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    def "addAction ifThen: Boolean Variable condition rejects a value outside the revealed true/false options"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields)
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", comparator: "=", value: "maybe"]]]],
+            confirm: true])
+
+        then:
+        result.success == false
+        result.toString().contains("value must be true or false")
+        !writtenFields.containsKey("state_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    // ---- walkStep drive: page carry, lagged-echo recovery, and deferred per-step health.
+
+    def "walkStep drive: a lagged POST echo omitting the next field triggers one live refetch, never a re-post"() {
+        given:
+        enableWrite()
+        def actTypeWritten = false
+        def posts = []
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params ->
+            def inputs = [[name: "actType.2", type: "enum", options: ["modeActs", "condActs"]]]
+            if (actTypeWritten) inputs = inputs + [[name: "actSubType.2", type: "enum", options: ["getSetVariable"]]]
+            ruleConfigJson(100, "r", inputs)
+        }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100, actTypeWritten ? [[name: "actType.2", type: "enum", value: "modeActs"]] : []) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            if (body?.containsKey("settings[actType.2]")) actTypeWritten = true
+            // The echo lags one render: it never contains the field the write just revealed.
+            [status: 200, location: null, data: JsonOutput.toJson([
+                app: [id: 100, version: 7],
+                configPage: [name: "doActPage", sections: [[input: [[name: "actType.2", type: "enum", value: "modeActs"]]]]]
+            ])]
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            walkStep: [operation: "drive", steps: [
+                [page: "doActPage", operation: "write", write: ["actType.2": "modeActs"]],
+                [page: "doActPage", operation: "write", write: ["actSubType.2": "getSetVariable"]]
+            ]],
+            confirm: true])
+
+        then: "the second write resolved its key against a live page"
+        result.steps[1].opResult?.carryRefetched == true
+        posts.any { it.body?.containsKey("settings[actSubType.2]") }
+
+        and: "the first write was posted exactly once"
+        posts.count { it.body?.containsKey("settings[actType.2]") } == 1
+    }
+
+    def "walkStep drive defers the per-step health probe for mutating steps on STPage and doActPage"() {
+        given:
+        enableWrite()
+        def healthCalls = 0
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            healthCalls++
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        ["STPage", "doActPage"].each { pg ->
+            hubGet.register("/installedapp/configure/json/100/${pg}".toString()) { params ->
+                ruleConfigJson(100, "r", [[name: "stopOnST", type: "bool"], [name: "hasAll", type: "button"]])
+            }
+        }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            walkStep: [operation: "drive", stopOnError: false, steps: [
+                [page: "STPage", operation: "introspect"],
+                [page: "STPage", operation: "click", click: [name: "hasAll"]],
+                [page: "doActPage", operation: "click", click: [name: "hasAll"]]
+            ]],
+            confirm: true])
+
+        then: "mutating steps carry a deferred verdict; the read-only step still probes"
+        result.steps[0].health?.source != "deferred"
+        result.steps[1].health?.source == "deferred"
+        result.steps[2].health?.source == "deferred"
+
+        and: "only the introspect probe and the final drive probe ran"
+        healthCalls == 2
+    }
+
+    def "walkStep drive: a terminal open block it introduced fails; only a budget pause with declared steps remaining may return in_progress"() {
+        given:
+        enableWrite()
+        def verdict = null
+        def healthy = [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                       multipleFlagPoison: [], configPageError: null, structuralIssues: [], issues: []]
+        // The pre-drive structural baseline is clean, so every final issue is new to the drive.
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" -> verdict }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "hasAll", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+        def drive = [appId: 100, walkStep: [operation: "drive", steps: [[page: "doActPage", operation: "click", click: [name: "hasAll"]]]], confirm: true]
+        def base = [ok: false, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                    multipleFlagPoison: [], configPageError: null]
+
+        def openIssue = "action 2 (IF) opened a block that was never closed — rule is missing an END-IF"
+
+        when: "a terminal drive ends with only an IF awaiting its END-IF"
+        verdict = base + [structuralIssues: [openIssue], issues: ["structural imbalance"]]
+        def open = script.toolSetRule(drive)
+
+        and: "a terminal drive ends with an open block plus an orphaned row"
+        verdict = base + [structuralIssues: [openIssue], orphanedActionRows: ["action 3 leftover"], issues: ["x"]]
+        def broken = script.toolSetRule(drive)
+
+        and: "the budget is spent after the first of two declared steps"
+        verdict = base + [structuralIssues: [openIssue], issues: ["structural imbalance"]]
+        script.metaClass._resumableBudgetExceeded = { Long t0 -> true }
+        def paused = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "doActPage", operation: "click", click: [name: "hasAll"]],
+            [page: "doActPage", operation: "click", click: [name: "hasAll"]]]], confirm: true])
+
+        then: "both terminal drives fail with the structural issue at the top level"
+        open.success == false
+        open.structuralIssues == [openIssue]
+        broken.success == false
+        broken.structuralIssues == [openIssue]
+
+        and: "only the pause with a declared step remaining returns in_progress"
+        paused.status == "in_progress"
+        paused.stepsRemaining?.size() == 1
+    }
+
+    def "_rmStructuralBaseline reports an open IF from the compiled action list and settings without a page render"() {
+        given:
+        def configFetches = 0
+        hubGet.register('/installedapp/configure/json/100') { params -> configFetches++; ruleConfigJson(100, "r", []) }
+        hubGet.register('/app/ruleBuilderJson/100') { params -> JsonOutput.toJson([broken: false, actionList: [2, 3]]) }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, [[name: "actType.2", value: "condActs"], [name: "actSubType.2", value: "getIfThen"],
+                             [name: "actType.3", value: "switchActs"], [name: "actSubType.3", value: "getOnOffSwitch"]])
+        }
+
+        when:
+        def issues = script._rmStructuralBaseline(100)
+
+        then: "the same open-block issue the health check reports, and no config page was rendered"
+        issues?.size() == 1
+        issues[0].contains("action 2 (IF) opened a block that was never closed")
+        configFetches == 0
+    }
+
+    def "walkStep drive inside a block that was already open passes and reports the pre-existing issue; a new issue still fails"() {
+        given:
+        enableWrite()
+        def openIssue = "action 5 (IF) opened a block that was never closed — rule is missing an END-IF"
+        def base = [ok: false, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                    multipleFlagPoison: [], configPageError: null, issues: ["structural imbalance"]]
+        def baseline = null
+        def verdict = null
+        def baselineCalls = 0
+        def renderSources = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> baselineCalls++; baseline }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" -> renderSources << source; verdict }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "actionDone", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+        def drive = [appId: 100, walkStep: [operation: "drive", steps: [[page: "doActPage", operation: "click", click: [name: "actionDone"]]]], confirm: true]
+
+        when: "the IF was open before the drive and the drive leaves exactly that issue"
+        baseline = [openIssue]
+        verdict = base + [structuralIssues: [openIssue]]
+        def inside = script.toolSetRule(drive)
+
+        and: "the drive leaves a second structural issue that was not in the baseline"
+        verdict = base + [structuralIssues: [openIssue, "action 7 (IF) opened a block that was never closed — rule is missing an END-IF"]]
+        def added = script.toolSetRule(drive)
+
+        and: "the baseline issue persists alongside an unchanged orphaned row"
+        verdict = base + [structuralIssues: [openIssue], orphanedActionRows: ["action 8 leftover"]]
+        def orphan = script.toolSetRule(drive)
+
+        and: "the baseline issue persists but the label carries the *BROKEN* marker"
+        verdict = base + [structuralIssues: [openIssue], label: "r *BROKEN*"]
+        def brokenLabel = script.toolSetRule(drive)
+
+        then: "building inside the existing block succeeds and names the pre-existing issue"
+        inside.success == true
+        inside.preExistingStructuralIssues == [openIssue]
+        !inside.containsKey("structuralIssues")
+
+        and: "anything the drive introduced still fails, and the pre-existing subset is still named"
+        added.success == false
+        added.structuralIssues.size() == 2
+        added.preExistingStructuralIssues == [openIssue]
+        brokenLabel.success == false
+        brokenLabel.structuralIssues == [openIssue]
+
+        and: "an orphaned row is diagnostic only, so it does not block building inside the existing block"
+        orphan.success == true
+        orphan.preExistingStructuralIssues == [openIssue]
+        orphan.health.orphanedActionRows == ["action 8 leftover"]
+
+        and: "one structural baseline per drive, taken without the page-rendering health probe"
+        baselineCalls == 4
+        renderSources.size() == 4
+    }
+
+    private Closure numericStaticDoActPage(Map flags) {
+        return { params ->
+            flags.seq = (flags.seq ?: 0) + 1
+            // A static page lists state_1 ahead of RelrDev_1 before any variable is chosen.
+            def inputs = [
+                [name: "actType.1", type: "enum", options: ["condActs": "Conditional Actions"]],
+                [name: "actSubType.1", type: "enum", options: ["getIfThen": "IF Expression THEN"]],
+                [name: "cond", type: "enum", options: ["a": "New condition"]],
+                [name: "rCapab_1", type: "enum", options: ["Variable", "Switch"]],
+                [name: "hasAll", type: "button"],
+                [name: "state_1", type: "decimal"],
+                [name: "RelrDev_1", type: "enum", options: ["=", "<", ">"]]
+            ]
+            if (flags.rCapab) inputs = inputs + [[name: "xVar_1", type: "enum", options: ["counter": "counter"], value: flags.echoVar]]
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "doActPage", title: "T", install: false, error: null,
+                             sections: [[title: "", input: inputs, paragraphs: ["seq ${flags.seq}".toString()]]]],
+                settings: [:], childApps: []
+            ])
+        }
+    }
+
+    def "addAction ifThen: a static schema listing state_<N> before RelrDev_<N> is still a numeric comparison"() {
+        given: "state_1 precedes RelrDev_1 on a static page and the picker echoes the numeric variable"
+        enableWrite()
+        def flags = [echoVar: "counter"]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, false, numericStaticDoActPage(flags))
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "counter", comparator: "=", value: 42]]]],
+            confirm: true])
+
+        then: "the comparator field decides the shape, so the value is written as a comparison"
+        result.success == true
+        writtenFields["RelrDev_1"] == "="
+        writtenFields["state_1"].toString() == "42"
+        !result.toString().contains("value must be true or false")
+    }
+
+    def "addRequiredExpression: a Boolean Variable condition on STPage writes state_<N> directly, and a rejected one is cancelled"() {
+        given:
+        enableWrite()
+        def rCapabWritten = false
+        def varPickerWritten = false
+        def writtenFields = [:]
+        def clicks = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (body?.name != null && body?.containsKey("settings[" + body.name + "]")) clicks << body.name
+            if (path == "/installedapp/update/json" && body["_action_previous"] != "Done") {
+                body.each { k, v ->
+                    def key = _settingKeyOf(k)
+                    if (key != null) {
+                        writtenFields[key] = v
+                        if (key == "rCapab_1") rCapabWritten = true
+                        if (key == "lVar_1") varPickerWritten = true
+                    }
+                }
+            }
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", [[name: "useST", type: "bool"]]) }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "mainPage", title: "Edit Rule", install: true, error: null,
+                             sections: [[title: "", input: [[name: "useST", type: "bool"]],
+                                         body: [[element: "paragraph", description: "IF myBool is true"]]]]],
+                settings: [useST: "true"], childApps: []
+            ])
+        }
+        def stFetchSeq = 0
+        hubGet.register('/installedapp/configure/json/100/STPage') { params ->
+            stFetchSeq++
+            def inputs = [
+                [name: "cond", type: "enum", options: ["a": "New condition"]],
+                [name: "rCapab_1", type: "enum", options: ["Variable", "Switch"]],
+                [name: "hasAll", type: "button"],
+                [name: "cancelCapab", type: "button"],
+                [name: "doneST", type: "button"]
+            ]
+            if (rCapabWritten) inputs = inputs + [[name: "lVar_1", type: "enum", options: ["myBool": "myBool"]]]
+            // A Boolean variable reveals its true/false value directly, with no comparator field.
+            if (varPickerWritten) inputs = inputs + [[name: "state_1", type: "enum", options: ["true", "false"]], [name: "not1", type: "bool"]]
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "STPage", title: "RE", install: false, error: null,
+                             sections: [[title: "", input: inputs, paragraphs: ["seq ${stFetchSeq}".toString()]]]],
+                settings: [:], childApps: []
+            ])
+        }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params -> ruleConfigJson(100, "r", [[name: "N", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addRequiredExpression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]],
+            confirm: true])
+
+        then:
+        result.success == true
+        writtenFields["lVar_1"] == "myBool"
+        writtenFields["state_1"] == "true"
+        !writtenFields.containsKey("RelrDev_1")
+
+        when: "a non-equality comparator is refused after the pickers are written"
+        rCapabWritten = false
+        varPickerWritten = false
+        writtenFields.clear()
+        clicks.clear()
+        def rejected = script.toolSetRule([appId: 100,
+            addRequiredExpression: [conditions: [[capability: "Variable", variable: "myBool", comparator: ">", value: true]]],
+            confirm: true])
+
+        then: "the Boolean value is never written and the in-flight condition is cancelled"
+        rejected.success == false
+        rejected.toString().contains("only '=' is supported")
+        !writtenFields.containsKey("state_1")
+        clicks.contains("cancelCapab")
+    }
+
+    def "walkStep drive: a mainPage write returns the page it produced and the next step sees the new schema"() {
+        given:
+        enableWrite()
+        def useSTWritten = false
+        def posts = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", useSTWritten ?
+                [[name: "useST", type: "bool"], [name: "stComment", type: "text"]] :
+                [[name: "useST", type: "bool"], [name: "isFunction", type: "bool"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, useSTWritten ? [[name: "useST", type: "bool", value: "true"], [name: "stComment", type: "text", value: "note"]] : [])
+        }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            if (body?.containsKey("settings[useST]")) useSTWritten = true
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "mainPage", operation: "write", write: [useST: true]],
+            [page: "mainPage", operation: "write", write: [stComment: "note"]]
+        ]], confirm: true])
+
+        then: "the first step reports the real schema change, not the carried before-page"
+        result.steps[0].diff.appeared == ["stComment"]
+        result.steps[0].diff.disappeared == ["isFunction"]
+
+        and: "the second step found its field on the current page without a refetch or warning"
+        result.steps[1].opResult?.carryRefetched != true
+        result.steps[1].opResult?.warning == null
+        posts.any { it.body?.containsKey("settings[stComment]") }
+    }
+
+    def "walkStep drive: an href-context write drops the carried page, so the next step sees the field it revealed"() {
+        given:
+        enableWrite()
+        def values = [:]
+        def posts = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> ruleConfigJson(100, "r", []) }
+        // gate is written with href context; beta only renders once gate holds a value.
+        hubGet.register('/installedapp/configure/json/100/subPage') { params ->
+            def inputs = [[name: "alpha", type: "text", value: values.alpha], [name: "gate", type: "text", value: values.gate]]
+            if (values.gate) inputs = inputs + [[name: "beta", type: "text", value: values.beta]]
+            ruleConfigJson(100, "r", inputs, null, values.clone())
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, values.collect { k, v -> [name: k, type: "text", value: v] })
+        }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            ["alpha", "gate", "beta"].each { k -> if (body?.containsKey("settings[" + k + "]")) values[k] = body["settings[" + k + "]"] }
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "subPage", operation: "write", write: [alpha: "a"]],
+            [page: "subPage", operation: "write", write: [gate: "g"],
+             hrefContext: [fromPage: "mainPage", hrefName: "subLink", hrefParams: [n: 1]]],
+            [page: "subPage", operation: "write", write: [beta: "b"]]
+        ]], confirm: true])
+
+        then: "every step committed"
+        result.steps*.success == [true, true, true]
+
+        and: "the third step found beta on the current page, not on the page carried from the first write"
+        result.steps[2].opResult?.carryRefetched != true
+        result.steps[2].opResult?.warning == null
+        values.beta == "b"
+    }
+
+    def "walkStep drive: a field visible only in the previous write's POST response is written by the next step"() {
+        given:
+        enableWrite()
+        def posts = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        // A fresh GET re-renders the pre-write page, so it never shows the field the write revealed.
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params ->
+            ruleConfigJson(100, "r", [[name: "actType.2", type: "enum", options: ["modeActs", "condActs"]]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, [[name: "actType.2", type: "enum", value: "modeActs"], [name: "actSubType.2", type: "enum", value: "getSetVariable"]])
+        }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: JsonOutput.toJson([
+                app: [id: 100, version: 7 + posts.size()],
+                configPage: [name: "doActPage", sections: [[input: [
+                    [name: "actType.2", type: "enum", value: "modeActs"],
+                    [name: "actSubType.2", type: "enum", options: ["getSetVariable"]]]]]]
+            ])]
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            walkStep: [operation: "drive", steps: [
+                [page: "doActPage", operation: "write", write: ["actType.2": "modeActs"]],
+                [page: "doActPage", operation: "write", write: ["actSubType.2": "getSetVariable"]]
+            ]],
+            confirm: true])
+
+        then: "the second write resolved its key from the carried response, with no refetch or warning"
+        result.steps[1].opResult?.carryRefetched != true
+        result.steps[1].opResult?.warning == null
+
+        and: "it was posted with page context and the carried version token"
+        def subTypePost = posts.find { it.body?.containsKey("settings[actSubType.2]") }
+        subTypePost?.body?.currentPage == "doActPage"
+        subTypePost?.body?.version == "8"
+    }
+
+    def "walkStep sub-page write re-posts once with page context when the multiple flag flips, and fails if it stays flipped"() {
+        given:
+        enableWrite()
+        def posts = []
+        def recover = true
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            ruleConfigJson(100, "r", [[name: "tDev1", type: "capability.switch", multiple: true]])
+        }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        hubGet.register('/device/fullJson/9') { params -> '{"id":"9","name":"S2"}' }
+        def tDevPosts = { posts.count { p -> p.body?.keySet()?.any { it.toString().contains("tDev1") } } }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            int n = tDevPosts()
+            // RM's sticky bug: the first write flips multiple to false; the re-post restores it unless it persists.
+            boolean flipped = n == 1 || (n > 1 && !recover)
+            statusJson(100, [[name: "tDev1", type: "capability.switch", multiple: !flipped, deviceIdsForDeviceList: [8, 9]]])
+        }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+        def drive = [appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "selectTriggers", operation: "write", write: [tDev1: [8, 9]]]]], confirm: true]
+
+        when: "the flag flips once"
+        def recovered = script.toolSetRule(drive)
+        def recoveredPosts = posts.findAll { p -> p.body?.keySet()?.any { it.toString().contains("tDev1") } }
+
+        then: "one recovery re-post with page context, and the step succeeds"
+        recovered.steps[0].success == true
+        recoveredPosts.size() == 2
+        recoveredPosts.every { it.body.currentPage == "selectTriggers" }
+
+        when: "the flag stays flipped after the re-post"
+        recover = false
+        posts.clear()
+        def persistent = script.toolSetRule(drive)
+
+        then: "the step fails with the divergence after exactly one retry"
+        persistent.steps[0].success == false
+        persistent.steps[0].error?.contains("multiple=true flag flipped")
+        persistent.steps[0].error?.contains("Automatic recovery was already attempted")
+        persistent.steps[0].error?.contains("do not resend it")
+        persistent.repairHints?.any { it.contains("Do not re-run that step") }
+        !persistent.repairHints?.any { it.contains("re-run the drive from that step") }
+        posts.count { p -> p.body?.keySet()?.any { it.toString().contains("tDev1") } } == 2
+
+        when: "a raw settings write on the same sub-page meets the persistent flip"
+        posts.clear()
+        def settingsResult = script.toolSetRule([appId: 100, pageName: "selectTriggers", settings: [tDev1: [8, 9]], confirm: true])
+
+        then: "it returns the public failure envelope with the divergence, the exhausted recovery and the backup"
+        settingsResult.success == false
+        settingsResult.error?.contains("multiple=true flag flipped")
+        settingsResult.error?.contains("Automatic recovery was already attempted")
+        settingsResult.backup?.backupKey != null
+        settingsResult.restoreHint?.contains(settingsResult.backup.backupKey)
+    }
+
+    def "settings with a sub-page pageName lists only confirmed keys and reports the keys that did not land"() {
+        given:
+        enableWrite()
+        def landed = [:]
+        def clicks = []
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            ruleConfigJson(100, "r", [[name: "tCapab1", type: "enum", options: ["Switch"]],
+                                      [name: "tstate1", type: "enum", options: ["on", "off"]]], null, landed)
+        }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (body?.name != null && body?.containsKey("settings[" + body.name + "]")) clicks << body.name
+            // Only tCapab1 persists; the hub silently drops tstate1.
+            if (body?.containsKey("settings[tCapab1]")) landed.tCapab1 = "Switch"
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, pageName: "selectTriggers",
+            settings: [tCapab1: "Switch", tstate1: "on"], confirm: true])
+
+        then:
+        result.settingsApplied == ["tCapab1"]
+        result.settingsNotLanded*.key == ["tstate1"]
+        result.settingsNotLanded[0].reason == "silent_rejection"
+        result.partial == true
+        !clicks.contains("updateRule")
+    }
+
+    def "walkStep drive: a finished drive whose final health check the time budget shed reports itself unverified"() {
+        given:
+        enableWrite()
+        def healthCalls = 0
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            healthCalls++
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "hasAll", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+
+        when: "the budget runs out during the last and only mutating step"
+        def result = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "doActPage", operation: "click", click: [name: "hasAll"]]]], confirm: true])
+
+        and: "a read-only drive under the same budget"
+        def readOnly = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "doActPage", operation: "introspect"]]], confirm: true])
+
+        then: "the mutating drive is not presented as complete"
+        result.status != "in_progress"
+        result.success == false
+        result.partial == true
+        result.healthUnverified == true
+        result.error?.contains("unverified")
+        result.repairHints?.any { it.contains("do not re-run the drive") }
+        healthCalls == 0
+
+        and: "a drive that changed nothing is not flagged"
+        readOnly.success == true
+        readOnly.healthUnverified != true
+    }
+
+    def "walkStep drive: a failed structural baseline read is logged and explained when it decides the result"() {
+        given:
+        enableWrite()
+        def openIssue = "action 5 (IF) opened a block that was never closed — rule is missing an END-IF"
+        def verdict = null
+        def warnings = []
+        script.metaClass.mcpLog = { String level, String component, String msg -> if (level == "warn") warnings << msg }
+        script.metaClass._rmStructuralBaseline = { Integer id -> throw new IllegalStateException("compiled rule state could not be read: 503 hub busy") }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" -> verdict }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", [[name: "actionDone", type: "button"]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+        def drive = [appId: 100, walkStep: [operation: "drive", steps: [[page: "doActPage", operation: "click", click: [name: "actionDone"]]]], confirm: true]
+
+        when: "the drive ends inside a block that was open before it, but the baseline could not be read"
+        verdict = [ok: false, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], validationErrors: [],
+                   multipleFlagPoison: [], configPageError: null, issues: ["structural imbalance"], structuralIssues: [openIssue]]
+        def result = script.toolSetRule(drive)
+
+        and: "the same drive ends healthy"
+        verdict = [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        def healthyResult = script.toolSetRule(drive)
+
+        then: "the strict gate holds, and the result says why the issue could not be exempted"
+        result.success == false
+        result.baselineUnavailable?.contains("503 hub busy")
+        result.repairHints?.any { it.contains("baseline could not be read") }
+        warnings.any { it.contains("structural baseline read failed") }
+
+        and: "a healthy drive says nothing about the baseline"
+        healthyResult.success == true
+        !healthyResult.containsKey("baselineUnavailable")
+    }
+
+    def "_rmStructuralBaseline throws on a failed compiled-state read and stays null for an app that is not an RM rule"() {
+        given:
+        hubGet.register('/app/ruleBuilderJson/100') { params -> throw new RuntimeException("503 hub busy") }
+        hubGet.register('/app/ruleBuilder20Json/100') { params -> throw new RuntimeException("503 hub busy") }
+        hubGet.register('/app/ruleBuilderJson/101') { params -> '{}' }
+        hubGet.register('/app/ruleBuilder20Json/101') { params -> '{"success":false}' }
+
+        when:
+        script._rmStructuralBaseline(100)
+
+        then:
+        def failure = thrown(IllegalStateException)
+        failure.message.contains("503 hub busy")
+
+        when:
+        def none = script._rmStructuralBaseline(101)
+
+        then:
+        none == null
     }
 
     // ---- Fail-closed bulk mutation: once an item fails, nothing further is written, so a failed block
