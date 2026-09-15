@@ -82,7 +82,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
             name: "hub_set_rule",
             description: """Create OR edit a Hubitat Rule Machine rule (RM 5.1) — one upsert tool. Omit appId to CREATE (name required; optionally bundle addTriggers/addActions/addRequiredExpression to populate in the same call). Provide appId to EDIT. In trigger/action/condition specs use `capability` NOT `type`. RM-only — for NON-RM classic apps (Room Lighting, Button Controller, Notifier, Groups+Scenes, Visual Rule) use hub_set_native_app; not the legacy custom engine (hub_*_custom_rule). Requires the Write master + confirm=true + recent backup; each edit ensures a File Manager baseline exists (same-rule baselines are reused for one hour by default; backup.backupKey restores it through hub_manage_backup).
 
-Shortcuts, each orchestrating the full RM 5.1 wizard in one call: addTrigger, addAction, addRequiredExpression/replaceRequiredExpression, bulk addTriggers/addActions/replaceActions, removeAction/clearActions/moveAction/removeTrigger/modifyTrigger/modifyAction, addLocalVariable/removeLocalVariable, patches (atomic multi-op). ALWAYS prefer these one-call shortcuts; walkStep (one wizard page per call) and raw settings+button are LAST RESORTS for capabilities no shortcut can represent.
+Shortcuts, each orchestrating the full RM 5.1 wizard in one call: addTrigger, addAction, addRequiredExpression/replaceRequiredExpression, bulk addTriggers/addActions/replaceActions, removeAction/clearActions/moveAction/removeTrigger/modifyTrigger/modifyAction, addLocalVariable/removeLocalVariable, patches (several operations in one call). ALWAYS prefer these one-call shortcuts; walkStep (one wizard page per call) and raw settings+button are LAST RESORTS for capabilities no shortcut can represent.
 
 Partial-success (every shortcut): success:true can pair with partial:true — inspect partial/repairHints. A rejected trailing updateRule leaves the change written-but-not-live (subscriptionsNotLive / expressionNotLive / variableNotLive / patchesNotLive); retry hub_set_rule(button='updateRule', confirm=true). If wizardStuck:true, first hub_set_rule(button='cancelCapab', pageName=<page>, confirm=true) — restoreHint carries the exact command. On CREATE the new appId is returned even if a bundled item only partially bakes (partialTriggers/partialActions).
 
@@ -131,7 +131,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     patches: [
                         type: "array",
-                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
+                        description: "Multi-mutation in one call (not a transaction: ops before a stop stay written): each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
                         items: [type: "object"]
                     ],
                     removeAction: [
@@ -144,12 +144,12 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     replaceActions: [
                         type: "array",
-                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
+                        description: "Replace the entire action list (not a transaction): clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
                         items: [type: "object"]
                     ],
                     moveAction: [
                         type: "object",
-                        description: "Move one action up or down a slot: {index:<N>, direction:'up'|'down'}. For arbitrary reorders prefer replaceActions (one atomic op)."
+                        description: "Move one action up or down a slot: {index:<N>, direction:'up'|'down'}. For arbitrary reorders prefer replaceActions (one call)."
                     ],
                     removeTrigger: [
                         type: "object",
@@ -8917,7 +8917,12 @@ private void _rmVerifySubPageMultipleFlags(Integer appId, String pageName, Map s
         def cfg = _rmFetchConfigJson(appId, pageName, cache)
         if (cfg?.app?.version != null) body.version = cfg.app.version.toString()
         _rmPostSettings(appId, body, cache)
-        _rmVerifyMultipleFlags(appId, schema, touched)
+        try {
+            _rmVerifyMultipleFlags(appId, schema, touched)
+        } catch (IllegalStateException persistent) {
+            // The shared verifier's advice is to re-POST the group, which this helper has just done.
+            throw new IllegalStateException("${persistent.message} Automatic recovery was already attempted: one full-group re-POST with page context on page '${pageName}' did not restore the flag. The write may already be committed, so do not resend it; check hub_get_rule_health(appId=${appId}) and restore the pre-write backup if the rule is damaged.".toString())
+        }
     }
 }
 
@@ -9123,9 +9128,9 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             ]
         ]
     }
-    // An unreadable final probe (transient fetch failure, no evidence either way)
-    // must not fail a drive whose every step committed cleanly; a skipped probe
-    // (budget shed) likewise. Positive evidence of breakage still gates.
+    // An unreadable final probe (transient fetch failure, no evidence either way) does not fail the gate; positive
+    // evidence of breakage does. A probe the budget skipped also passes the gate here, but a finished drive with
+    // mutating steps is then reported healthUnverified below.
     boolean finalHealthGate = _rmHealthGatePass(finalHealth)
     def preExistingStructural = _rmPreExistingStructuralOnly(baselineStructural, finalHealth)
     if (!finalHealthGate && preExistingStructural) finalHealthGate = true
@@ -9152,7 +9157,10 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     def firstFailed = stepResults.find { it.success == false }
     if (firstFailed != null) {
         result.error = "drive halted at step ${firstFailed.step} (${firstFailed.operation}): ${firstFailed.error ?: 'step reported success:false -- inspect its valueEcho/silentRejection/health'}".toString()
-        result.repairHints = (result.repairHints ?: []) + ["Drive stopped at step ${firstFailed.step}. Inspect steps[${firstFailed.step - 1}] for the failure detail, correct it, and re-run the drive from that step.".toString()]
+        boolean recoveryExhausted = firstFailed.error?.toString()?.contains("Automatic recovery was already attempted") == true
+        result.repairHints = (result.repairHints ?: []) + [(recoveryExhausted ?
+            "Drive stopped at step ${firstFailed.step} after its automatic recovery was already attempted. Do not re-run that step: its write may already be committed. Inspect steps[${firstFailed.step - 1}] and hub_get_rule_health(appId=${appId}), and restore the pre-write backup if the rule is damaged." :
+            "Drive stopped at step ${firstFailed.step}. Inspect steps[${firstFailed.step - 1}] for the failure detail, correct it, and re-run the drive from that step.").toString()]
     } else if (!finalHealthGate) {
         result.error = "drive completed all ${stepResults.size()} step(s) but the rule is unhealthy: ${(finalHealth.issues ?: ['see health']).join('; ')}".toString()
         if (baselineUnavailable != null && (finalHealth?.structuralIssues as List)) {
@@ -13599,8 +13607,11 @@ private String _rmBulkStopError(String stoppedAfter, stopItem) {
     if (!itemError) itemError = item.updateRuleError?.toString()?.trim()
     if (!itemError && item.settingsSkipped instanceof List) {
         def informational = _rmInformationalSkippedReasons()
-        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason && !(it.reason in informational) }
-        if (skip != null) itemError = "field '${skip.key}' was not applied (${skip.reason})".toString()
+        // The isCondTrig.<N> finalize toggle is a cosmetic best-effort write, never why an item stopped.
+        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason &&
+            !(it.reason in informational) && !it.key.toString().startsWith("isCondTrig.") }
+        // Not every skip means the value was lost (a force-written comparator is written but unverified), so name the reason.
+        if (skip != null) itemError = "field '${skip.key}' reported ${skip.reason}".toString()
     }
     if (!itemError && item.repairHints instanceof List) {
         itemError = (item.repairHints as List).find { it != null && it.toString().trim() }?.toString()?.trim()
@@ -14329,11 +14340,9 @@ def _applyNativeAppEdit(args) {
         if (replaceStopAfter) {
             return _rmBulkStoppedResult(appId, backup, replaceStopAfter, replaceStopItem, [removedIndices: removed ?: null, addedActions: addedResults])
         }
-        // Trailing updateRule fires AFTER mutation block completes. Hoisted
-        // out of the per-item try so a rejection here doesn't get routed
-        // through the generic "mutation errored partway" shape -- the mutation
-        // state IS committed and callers need the dedicated failure slots to
-        // detect the subscriptions-not-live consequence without log-grep.
+        // Trailing updateRule fires only when no added item stopped the batch (that case returned above).
+        // Hoisted out of the per-item try so a rejection gets the dedicated not-live slots rather than
+        // the generic "mutation errored partway" shape: the mutation state IS committed.
         try { _rmClickAppButton(appId, "updateRule") }
         catch (Exception updateExc) {
             updateRuleFailed = true
@@ -14645,7 +14654,7 @@ def _applyNativeAppEdit(args) {
     }
 
     if (patchesList != null) {
-        // Multi-mutation atomic patch. Each item in the patches
+        // Multi-mutation patch. Each item in the patches
         // list is a dict with one of the supported sub-operations:
         //   {addRequiredExpression: {...}}
         //   {addTrigger: {...}} | {addTriggers: [...]}
@@ -14655,10 +14664,9 @@ def _applyNativeAppEdit(args) {
         //   {removeAction: {index}} | {clearActions: true} | {replaceActions: [...]}
         //   {moveAction: {index, direction}}
         //   {button: <name>, stateAttribute?, pageName?}
-        // Operations apply sequentially. updateRule fires ONCE at the end
-        // — not after each sub-op — so the rule's actions[] map and
-        // subscriptions bake from a fully-loaded state. This mirrors
-        // Operations are atomic from the rule's perspective.
+        // Operations apply sequentially and updateRule fires once at the end, so the rule's
+        // actions[] map and subscriptions bake from a fully-loaded state. It is not a
+        // transaction: a failed or partial op stops the batch and leaves earlier ops written.
         def patchResults = []
         def patchErr = null
         // Trailing-updateRule failure propagation: when the post-patch updateRule
@@ -15026,14 +15034,9 @@ def _applyNativeAppEdit(args) {
                     patchStopItem = innerStopItem ?: patchResults.last()
                 }
             }
-            // Fire updateRule once at the end so the rule's actions[]
-            // map and event subscriptions bake from the fully-loaded
-            // post-patch state. Honour the comment: silent failure here means
-            // the patches landed but never bake into the running rule, so
-            // surface via dedicated envelope slots (sibling pattern from F2:
-            // addRequiredExpression slot propagation in the
-            // `addRequiredExpressionSpec` dispatcher branch and F1's
-            // counterpart in the `addTriggerSpec` dispatcher branch).
+            // Fire updateRule once at the end, and only when no op stopped the batch, so the rule's
+            // actions[] map and event subscriptions bake from the fully-loaded post-patch state. A
+            // rejected click means the ops landed but never bake, so it gets dedicated envelope slots.
             if (!patchStopAfter) try { _rmClickAppButton(appId, "updateRule") }
             catch (Exception updateExc) {
                 updateRuleFailed = true
@@ -15053,6 +15056,7 @@ def _applyNativeAppEdit(args) {
         }
         def opsOk = patchResults.count { it?.success != false }
         def health = _rmCheckRuleHealth(appId)
+        def deferredRestoreHints = []
         // Batch-end restore for DEFERRED replaceRequiredExpression ops (re-homed destructive-
         // window contract). Restore on two triggers, by attributability: the batch-end updateRule
         // failing (always -- that one click makes every deferred RE live), or a health regression
@@ -15089,15 +15093,22 @@ def _applyNativeAppEdit(args) {
                         success: false, partial: true, requiredExpressionReplaced: false,
                         note: "Required Expression replace ROLLED BACK in batch: ${why}; the original was restored."]
                     anyRestored = true
+                    // The rollback lives in patches[idx]; name it at the top level too so callers see the recovery outcome.
+                    deferredRestoreHints << (restoreOutcome.requiredExpressionRestored == true ?
+                        "patches[${idx}] replaceRequiredExpression was rolled back because ${why}; the original Required Expression was restored and confirmed. See patches[${idx}] for details." :
+                        "patches[${idx}] replaceRequiredExpression was rolled back because ${why}, but the original Required Expression could not be confirmed restored: ${restoreOutcome.error ?: 'see patches[' + idx + ']'}").toString()
                 }
             }
             // Recompute the success rollup after any deferred-restore reclassification above.
             if (anyRestored) opsOk = patchResults.count { it?.success != false }
         }
         if (patchStopAfter && patchErr == null) {
-            return _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+            def stopped = _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+            if (deferredRestoreHints) stopped.repairHints = deferredRestoreHints + (stopped.repairHints ?: [])
+            return stopped
         }
         def repairHints = []
+        repairHints.addAll(deferredRestoreHints)
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the patch ops committed. The patch settings are baked but the rule will not re-evaluate / re-subscribe until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
         }
@@ -15335,11 +15346,9 @@ def _applyNativeAppEdit(args) {
         if (bulkStopAfter) {
             return _rmBulkStoppedResult(appId, backup, bulkStopAfter, bulkStopItem, [triggers: triggerResults, actions: actionResults])
         }
-        // Trailing updateRule fires AFTER per-item adds complete. Hoisted out
-        // of the per-item try so a rejection here doesn't get routed through
-        // the generic "bulk path errored partway" shape -- per-item state IS
-        // committed and callers need the dedicated failure slots to detect
-        // the subscriptions-not-live consequence without log-grep. Each
+        // Trailing updateRule fires only when every item completed cleanly (a stop returned above).
+        // Hoisted out of the per-item try so a rejection gets the dedicated not-live slots rather than
+        // the generic "bulk path errored partway" shape: per-item state IS committed. Each
         // _rmAddAction self-bakes its own action via the doActPage->
         // selectActions navigation, so this trailing click is just for the
         // final re-init (mirrors the UI's top-level "Update Rule" / "Done"
