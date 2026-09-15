@@ -8481,7 +8481,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
     if (!page.matches(/[A-Za-z0-9_]+/)) throw new IllegalArgumentException("walkStep.page must be alphanumeric/underscore")
     def operation = spec?.operation?.toString()?.trim() ?: "introspect"
     def validateEnum = spec?.validateEnum == true
-    // Fork patch A2: within a drive, carry the page RM rendered in response to the previous write.
+    // Within a drive, carry the page RM rendered in response to the previous write.
     // Transient wizard state (e.g. the condition opened by cond=a) exists only in that response; a
     // fresh GET re-renders the pre-write page. Any non-write operation invalidates the carry.
     def walkCache = spec?.__pageCache instanceof Map ? (Map) spec.__pageCache : null
@@ -8588,7 +8588,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
         }
         def resolved = resolveWriteKey(beforeSchema)
         if (resolved.input == null && walkCache != null && !walkCache.isEmpty()) {
-            // Fork patch A2 miss recovery: a carried POST echo can lag one render and omit the field the
+            // Carry miss recovery: a carried POST echo can lag one render and omit the field the
             // previous write revealed. Drop the carry and resolve once against a live page before
             // concluding the key is absent. The previous write is never re-posted.
             walkCache.clear()
@@ -8633,13 +8633,16 @@ Map _rmWalkStep(Integer appId, Map spec) {
             } catch (Exception verExc) {
                 mcpLog("warn", "rm-native", "walkStep: href-context version fetch for app ${appId} on page '${hrefContext.fromPage ?: page}' failed (${verExc.message}) -- POSTing write without version field; hub may reject on concurrent-edit conflict")
             }
-            _rmPostSettings(appId, body)
+            // Every write path takes the drive cache so the carried before-page is dropped and the
+            // after-read below sees the page this write produced.
+            _rmPostSettings(appId, body, walkCache)
         } else if (page && page != "mainPage" && schemaInput != null) {
-            // Fork patch A: sub-page writes need formAction/currentPage/pageBreadcrumbs, or RM
-            // silently no-ops wizard pickers such as doActPage cond (see _rmWriteSettingOnPage).
+            // Sub-page writes need formAction/currentPage/pageBreadcrumbs, or RM silently no-ops
+            // wizard pickers such as doActPage cond (see _rmWriteSettingOnPage).
             def pageApplied = []
             def pageSkipped = []
             _rmWriteSettingOnPage(appId, page, writtenKey, writtenValue, pageApplied, null, pageSkipped, walkCache)
+            _rmVerifySubPageMultipleFlags(appId, page, [(writtenKey): writtenValue], fullSchemaMap, walkCache)
             if (pageSkipped) opResult.skipped = pageSkipped
         } else if (page && page != "mainPage") {
             // Unresolved key: keep walkStep's contract of attempting the exact requested key (with the
@@ -8651,7 +8654,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
             if (beforeCfg?.app?.version != null) body.version = beforeCfg.app.version.toString()
             _rmPostSettings(appId, body, walkCache)
         } else {
-            _rmUpdateAppSettings(appId, [(writtenKey): writtenValue], fullSchemaMap)
+            _rmUpdateAppSettings(appId, [(writtenKey): writtenValue], fullSchemaMap, walkCache)
         }
         opResult.wrote = [(writtenKey): writtenValue]
     } else if (operation == "click") {
@@ -8828,7 +8831,7 @@ Map _rmWalkStep(Integer appId, Map spec) {
     // replays a needlessly failed envelope). And an UNREADABLE probe (a transient
     // fetch failure -- no evidence of breakage either way) must never fail the
     // committed work; only positive evidence may.
-    // Fork patch A3: inside a drive, defer the probe for every mutating step to the drive's final health
+    // Inside a drive, defer the probe for every mutating step to the drive's final health
     // check. The probe renders other rule pages, which resets RM's in-flight wizard (doActPage and STPage
     // condition builders alike); gating on the step's operation, not its page, also covers `done`.
     def health = (walkCache != null && operation in ["write", "click", "navigate", "done"]) ?
@@ -8880,6 +8883,28 @@ Map _rmWalkStep(Integer appId, Map spec) {
     return result
 }
 
+// Sub-page writes go through _rmWriteSettingOnPage for page context, which skips the sticky multiple-flag check
+// _rmUpdateAppSettings performs. Only inputs declared multiple=true are checked; a flipped flag gets one re-POST of
+// the same group with page context, and a divergence that survives it throws.
+private void _rmVerifySubPageMultipleFlags(Integer appId, String pageName, Map settingsMap, Map schema, Map cache = null) {
+    def touched = settingsMap.keySet().collect { it.toString() }
+    if (!touched.any { schema?.get(it)?.multiple == true }) return
+    try {
+        _rmVerifyMultipleFlags(appId, schema, touched)
+    } catch (IllegalStateException divergence) {
+        mcpLog("warn", "rm-native", "Marshal divergence on app ${appId} page ${pageName} -- retrying with page context: ${divergence.message}")
+        def body = _rmBuildSettingsBody(appId, settingsMap, schema)
+        body.formAction = "update"
+        body.currentPage = pageName
+        body.pageBreadcrumbs = '["mainPage"]'
+        // The carried POST echo already holds the current version token; a live read is the fallback.
+        def cfg = _rmFetchConfigJson(appId, pageName, cache)
+        if (cfg?.app?.version != null) body.version = cfg.app.version.toString()
+        _rmPostSettings(appId, body, cache)
+        _rmVerifyMultipleFlags(appId, schema, touched)
+    }
+}
+
 // The trailing health probe for a walkStep op, budget-aware: once the transport
 // time budget is spent the probe is SKIPPED (an ok-shaped verdict flagged
 // skipped:true, with a pointer to hub_get_rule_health) so the committed op's
@@ -8904,9 +8929,11 @@ private boolean _rmHealthGatePass(Map health) {
 }
 
 // Structural issues of an RM rule computed the same way the health check does, from the compiled action list and
-// statusJson settings only. Null when the rule is not a readable RM rule.
+// statusJson settings only. Null for an app that is not an RM rule; a compiled-state read that failed throws, so the
+// caller can say why the baseline is missing rather than mistaking the failure for a non-RM app.
 List _rmStructuralBaseline(Integer appId) {
     def cs = _ruleCompiledState(appId)
+    if (cs?.readError != null) throw new IllegalStateException("compiled rule state could not be read: ${cs.readError}")
     if (cs == null || cs.ruleFormat != "rm") return null
     def settingsByName = _rmFetchSettingsByName(appId)
     return _rmStructuralIssuesFromSequence(_rmStructuralSequenceFromSettings(settingsByName, ([] as Set), _rmCoerceActionIndices(cs.actionList)))
@@ -8915,9 +8942,10 @@ List _rmStructuralBaseline(Integer appId) {
 
 // Non-empty list when the final verdict fails ONLY on structural issues that were all present in the baseline
 // taken before the drive; null otherwise (no baseline, any new issue, or any other kind of breakage still fails).
+// orphanedActionRows are left out on purpose: the health contract keeps them diagnostic, outside issues and ok.
 private List _rmPreExistingStructuralOnly(List baseline, Map finalHealth) {
     if (baseline == null || !(finalHealth instanceof Map) || finalHealth.ok == true || finalHealth.unreadable == true) return null
-    if (finalHealth.broken == true || (finalHealth.brokenMarkers as List) || (finalHealth.orphanedActionRows as List) ||
+    if (finalHealth.broken == true || (finalHealth.brokenMarkers as List) ||
             (finalHealth.validationErrors as List) || (finalHealth.multipleFlagPoison as List) || finalHealth.configPageError != null ||
             finalHealth.label?.toString()?.contains("*BROKEN*")) return null
     def after = ((finalHealth.structuralIssues as List) ?: []).collect { it?.toString() }
@@ -8953,7 +8981,7 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     def currentPage = spec?.page?.toString()?.trim()
     def allOk = true
     def lastStepOperation = null
-    def driveWalkCache = [:]   // fork patch A2: per-drive page carry, see _rmWalkStep
+    def driveWalkCache = [:]   // per-drive page carry, see _rmWalkStep
     // Time-budget self-pause: set when the budget is reached BETWEEN steps so the
     // post-loop path returns an in_progress envelope with the unrun steps instead of
     // the normal fail-loud rollup. Null whenever no pause fires (within budget, or
@@ -8977,7 +9005,13 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
     // Structural baseline before any step, from the compiled action list and app settings (no page render, so an
     // in-flight wizard is never reset). The terminal gate then fails only on structural issues this drive introduced.
     List baselineStructural = null
-    try { baselineStructural = _rmStructuralBaseline(appId) } catch (Exception ignored) { /* no baseline: strict gate */ }
+    String baselineUnavailable = null
+    // Without a baseline the strict gate stays in force; a failed read is logged and explained if it decides the result.
+    try { baselineStructural = _rmStructuralBaseline(appId) }
+    catch (Exception baselineExc) {
+        baselineUnavailable = baselineExc.message ?: baselineExc.toString()
+        mcpLog("warn", "rm-native", "walkStep drive: structural baseline read failed for app ${appId} (${baselineUnavailable}) -- issues already present before the drive cannot be exempted")
+    }
     int idx = 0
     for (def rawStep : steps) {
         idx++
@@ -9047,9 +9081,9 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
             if (stopOnError) break
         }
     }
-    // Budget-aware final probe: on a pause (or any budget-spent exit) the probe is
-    // skipped -- the pause exists to beat the transport ceiling, and burning the
-    // remaining window on a diagnostic fetch defeats it.
+    // The final probe is the drive's only health check for its mutating steps, whose per-step probes were
+    // deferred. It is budget-aware: on a pause (or any budget-spent exit) it is skipped, because the pause exists
+    // to beat the transport ceiling; a finished drive whose probe was skipped reports itself unverified below.
     def finalHealth = _rmWalkStepHealth(appId, spec?.__reqT0 as Long)
     // Paused (budget reached between steps): return an in_progress envelope
     // and skip the fail-loud rollup below -- a pause is NOT an error. success:true holds
@@ -9105,8 +9139,21 @@ private Map _rmDriveWalkSteps(Integer appId, Map spec) {
         result.repairHints = (result.repairHints ?: []) + ["Drive stopped at step ${firstFailed.step}. Inspect steps[${firstFailed.step - 1}] for the failure detail, correct it, and re-run the drive from that step.".toString()]
     } else if (!finalHealthGate) {
         result.error = "drive completed all ${stepResults.size()} step(s) but the rule is unhealthy: ${(finalHealth.issues ?: ['see health']).join('; ')}".toString()
+        if (baselineUnavailable != null && (finalHealth?.structuralIssues as List)) {
+            result.baselineUnavailable = baselineUnavailable
+            result.repairHints = (result.repairHints ?: []) + ["The pre-drive structural baseline could not be read (${baselineUnavailable}), so issues that were already present, such as a block left open by an earlier call, could not be told apart from new ones. Compare with hub_get_rule_health(appId=${appId}); if every issue predates this drive, the steps still committed and need no re-run.".toString()]
+        }
     } else if (finalHealth.unreadable == true) {
         result.repairHints = (result.repairHints ?: []) + ["The final health probe could not be read -- no evidence of breakage either way (a transient failure, or the rule may since have been removed); every step committed. Verify via hub_get_rule_health(${appId}).".toString()]
+    }
+    // Only a paused drive may defer the final check. A finished drive whose probe the time budget shed never
+    // looked at the rule it changed, so it reports itself unverified instead of complete.
+    if (allOk && finalHealth?.skipped == true && stepResults.any { it.operation in ["write", "click", "navigate", "done"] }) {
+        result.success = false
+        result.partial = true
+        result.healthUnverified = true
+        result.error = "drive ran all ${stepResults.size()} step(s) but its final health check was skipped because the time budget ran out, so the rule's state is unverified".toString()
+        result.repairHints = (result.repairHints ?: []) + ["Every step committed, so do not re-run the drive. Check the rule with hub_get_rule_health(appId=${appId}) and repair anything it reports, such as an unclosed block, before treating the rule as complete.".toString()]
     }
     return result
 }
@@ -11022,6 +11069,7 @@ private Map _rmRevealStep(Integer appId, String page, String pattern, Closure tr
 // end field -> hasAll
 // Variable          -- rCapab -> re-fetch -> discover variable picker -> write name ->
 // re-fetch -> RelrDev_<N> -> re-fetch -> state_<N> -> hasAll
+// (Boolean var) state_<N> true/false directly, no comparator field -> hasAll
 // Custom Attribute  -- rCapab -> rDev_<N> -> rCustomAttr_<N> -> re-fetch ->
 // (free attr) RelrDev_<N> -> re-fetch -> state_<N> -> hasAll
 // (enum attr) state_<N> directly (no comparator) -> hasAll
@@ -11453,7 +11501,7 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             cancelInFlightCond()
             throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'variable' (the hub variable name) and 'comparator'. Got: ${cond}")
         }
-        // Fork patch B: a Boolean variable exposes state_<N> (true/false) directly and has no comparator
+        // A Boolean variable exposes state_<N> (true/false) directly and has no comparator
         // field, so an omitted comparator is allowed only with a true/false literal; otherwise fail loud.
         if (!cond.comparator) {
             def rhs = cond.state != null ? cond.state : cond.value
@@ -11509,12 +11557,27 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
         }
 
         // Reveal 2: write variable name as the trigger -> RelrDev_<N> comparator appears,
-        // or state_<N> directly for a Boolean variable (fork patch B).
+        // or state_<N> directly for a Boolean variable.
         def normalizedComparator = cond.comparator ? _rmNormalizeComparator(cond.comparator.toString()) : null
         def relrReveal = revealStep(appId, page, "RelrDev_${cIdx}|state_${cIdx}".toString(), {
             writeST(hrefParams, varPickerField, varName)
         })
-        if (relrReveal.input && relrReveal.input.name.toString() == "state_${cIdx}".toString()) {
+        // Classify on every matching field, not the first in page order: a static schema can list state_<N>
+        // ahead of RelrDev_<N>, and a comparator field means a comparison slot whatever else is present.
+        def revealedInputs = relrReveal.postInputs ?: []
+        def relrInput = revealedInputs.find { it?.name?.toString() == "RelrDev_${cIdx}".toString() }
+        def stateInput = revealedInputs.find { it?.name?.toString() == "state_${cIdx}".toString() }
+        if (relrInput == null && stateInput != null) {
+            def stateOptions = _rmReadPickerOptionStrings(stateInput)
+            boolean trueFalseOptions = stateOptions && stateOptions.every { it?.toString()?.toLowerCase() in ["true", "false"] }
+            if (stateOptions && !trueFalseOptions) {
+                cancelInFlightCond()
+                throw new IllegalStateException("conditions[${condIdx}]: Variable: state_${cIdx} offers ${stateOptions} rather than true/false and no comparator field (RelrDev_${cIdx}) was revealed, so '${varName}' is neither a Boolean nor a comparison slot. Visible fields: ${relrReveal.visibleNames?.join(', ') ?: '(none)'}")
+            }
+            if (relrReveal.fallbackToExisting && !trueFalseOptions) {
+                cancelInFlightCond()
+                throw new IllegalStateException("conditions[${condIdx}]: Variable: state_${cIdx} was present before '${varName}' was selected and lists no true/false options, so its Boolean type cannot be established. Refusing to guess.")
+            }
             if (relrReveal.fallbackToExisting) {
                 // state_<cIdx> was already on the page before the variable write (static schema or a
                 // leftover slot). Accept it only if the variable picker echoes the variable just chosen.
@@ -11526,7 +11589,7 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
                 }
             }
             // Boolean variable: implicit equality against true/false; RM persists RelrDev_<N>='=' itself
-            // (observed on rule 3243 built through the native UI).
+            // (observed on a rule built through the native UI).
             if (cond.compareToVariable != null) {
                 cancelInFlightCond()
                 throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; RM compares it only to true/false, not to another variable.")
@@ -11537,8 +11600,8 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             }
             def boolRaw = cond.state != null ? cond.state : cond.value
             def boolStr = (boolRaw instanceof Boolean) ? boolRaw.toString() : boolRaw?.toString()?.toLowerCase()
-            def boolField = relrReveal.input.name.toString()
-            def boolOpts = _rmReadPickerOptionStrings(relrReveal.input)
+            def boolField = stateInput.name.toString()
+            def boolOpts = stateOptions
             if (!(boolStr in ["true", "false"]) || (boolOpts && !(boolStr in boolOpts))) {
                 cancelInFlightCond()
                 throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' is Boolean; value must be true or false. Got '${boolRaw}'. Options: ${boolOpts}")
@@ -11553,17 +11616,17 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
             _rmClickAppButton(appId, "hasAll", null, page, cache)
             return
         }
-        if (relrReveal.input && !cond.comparator) {
+        if (relrInput && !cond.comparator) {
             cancelInFlightCond()
-            throw new IllegalArgumentException("conditions[${condIdx}]: Variable condition requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
+            throw new IllegalArgumentException("conditions[${condIdx}]: Variable '${varName}' revealed a comparator field (RelrDev_${cIdx}), so it is not a Boolean variable and requires 'comparator' (e.g. '=', '!=', '<', '>'). Got: ${cond}")
         }
-        if (!relrReveal.input) {
+        if (!relrInput) {
             cancelInFlightCond()
             def visible = relrReveal.visibleNames?.join(', ') ?: "(none)"
             throw new IllegalStateException("conditions[${condIdx}]: Variable: RelrDev_<N> (comparator) not revealed after variable name write. Visible fields: ${visible}")
         }
         // Use the firmware-assigned field name discovered from the live schema.
-        def relrField = relrReveal.input.name.toString()
+        def relrField = relrInput.name.toString()
 
         // Variable-vs-variable RHS path. When the caller supplies compareToVariable,
         // the RHS is another hub variable rather than a numeric constant. RM exposes a
@@ -15242,9 +15305,12 @@ def _applyNativeAppEdit(args) {
             def subPageApplied = []
             def subPageSkipped = []
             if (knownSettings && isSubPageWrite) {
-                // Fork patch A: write sub-page keys one at a time with page context and verify each
-                // landed; settingsApplied lists only confirmed keys.
-                knownSettings.each { k, v -> _rmWriteSettingOnPage(appId, pageName, k.toString(), v, subPageApplied, null, subPageSkipped) }
+                // Write sub-page keys one at a time with page context and verify each landed, including
+                // the sticky multiple flag; settingsApplied lists only confirmed keys.
+                knownSettings.each { k, v ->
+                    _rmWriteSettingOnPage(appId, pageName, k.toString(), v, subPageApplied, null, subPageSkipped)
+                    _rmVerifySubPageMultipleFlags(appId, pageName, [(k.toString()): v], schema)
+                }
             } else if (knownSettings) {
                 _rmUpdateAppSettings(appId, knownSettings, schema)
             }
