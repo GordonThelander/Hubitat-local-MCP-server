@@ -104,7 +104,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     addTriggers: [
                         type: "array",
-                        description: "Bulk-add triggers (each item the same shape as addTrigger); updateRule fires ONCE at the end. Pairs with addActions to build a whole rule in one call.",
+                        description: "Bulk-add triggers (each item the same shape as addTrigger); updateRule fires ONCE at the end. The first failed or partial item stops the batch: later items are notAttempted and updateRule is not fired. Pairs with addActions to build a whole rule in one call.",
                         items: [type: "object"]
                     ],
                     addRequiredExpression: [
@@ -118,7 +118,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
 
                     addActions: [
                         type: "array",
-                        description: "Bulk-add actions (each item the same shape as addAction; actions self-bake via doActPage); updateRule fires once at the end. Pairs with addTriggers.",
+                        description: "Bulk-add actions (each item the same shape as addAction; actions self-bake via doActPage); updateRule fires once at the end. The first failed or partial item stops the batch: later items are notAttempted and updateRule is not fired. Pairs with addTriggers.",
                         items: [type: "object"]
                     ],
                     addLocalVariable: [
@@ -131,7 +131,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     patches: [
                         type: "array",
-                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i] (one op failing doesn't abort the rest).",
+                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
                         items: [type: "object"]
                     ],
                     removeAction: [
@@ -144,7 +144,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     replaceActions: [
                         type: "array",
-                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
+                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
                         items: [type: "object"]
                     ],
                     moveAction: [
@@ -554,13 +554,13 @@ private void registerRmRule(Map combined, def r, String version) {
     if (id == null) return
     def key = id.toString()
     if (!combined.containsKey(key)) {
-        combined[key] = [
+        combined.put(key, [
             id: id,
             label: label,
             name: name,
             type: type,
             rmVersion: version
-        ]
+        ])
     }
 }
 
@@ -1127,23 +1127,39 @@ private Map _collectLiveApps() {
         mcpLog("warn", "rm-interop", "_collectLiveApps: /hub2/appsList parse failed (${e.message})")
         return null
     }
+    if (!(parsed instanceof Map) || !(parsed.apps instanceof List)) {
+        mcpLog("warn", "rm-interop", "_collectLiveApps: /hub2/appsList is missing its apps list")
+        return null
+    }
     def apps = [:]
+    boolean complete = true
     def walk
     walk = { node ->
-        if (node == null) return
-        def idVal = node?.data?.id ?: node?.id
+        // A leaf may carry "children": null; only a present non-List value is malformed.
+        if (!(node instanceof Map) || (node.data != null && !(node.data instanceof Map))
+                || (node.children != null && !(node.children instanceof List))) {
+            complete = false
+            return
+        }
+        def idVal = node.data?.id != null ? node.data.id : node.id
         if (idVal != null) {
             try {
                 // Store the RAW disabled value (may be null when the key is absent) —
                 // coercing to == true here would erase the "field missing" signal that
                 // _rmAnnotateRuleStatus needs to classify the rule as per-entry unknown.
-                apps[(idVal as Integer)] = [name: node?.data?.name, disabled: node?.data?.disabled]
-            } catch (Exception ignored) { /* skip non-int ids */ }
+                if (!(idVal.toString() ==~ /[1-9][0-9]*/)) throw new IllegalArgumentException("Invalid app ID")
+                apps.put(idVal as Integer, [name: node.data?.name, disabled: node.data?.disabled])
+            } catch (Exception ignored) { complete = false }
+        } else if (node.data) {
+            // An idless structural container is safe only when all its children can be read;
+            // absent children are an empty container, not a malformed one.
+            complete = false
         }
         (node?.children ?: []).each { walk(it) }
     }
-    (parsed?.apps ?: []).each { walk(it) }
-    return apps
+    parsed.apps.each { walk(it) }
+    if (!complete) mcpLog("warn", "rm-interop", "_collectLiveApps: /hub2/appsList contains malformed app nodes; absence cannot be established")
+    return complete ? apps : null
 }
 
 // Normalize an atTime string to the form RM 5.1 expects:
@@ -2547,7 +2563,7 @@ private Map _rmAddTrigger(Integer appId, Map triggerSpec) {
             "Yearly":  [weekOfMonth: "weeklyYC${pn}", dayOfWeek: "dailyYC${pn}", monthEnum: "yearlyMonthCX${pn}", time: "startingYC${pn}"],
             "Cron String": [cron: "cronStr${pn}"]
         ]
-        def fields = freqFieldMap[freq] ?: [:]
+        def fields = freqFieldMap.get(freq) ?: [:]
         // (Periodic arg validation -- Seconds/Minutes restricted-enum count and
         // the Monthly dayOfMonth/weekOfMonth mutual-exclusivity -- already ran
         // up front, before the trigger editor opened.)
@@ -3920,7 +3936,7 @@ private List _rmLiveActionIndicesFromSettings(Map status) {
         def m = (n =~ /^act(?:Type|SubType)\.(\d+)$/)
         if (!m.matches()) return
         def idx = (m[0][1] as Integer)
-        if (s?.value?.toString()?.trim()) live[idx] = true
+        if (s?.value?.toString()?.trim()) live.put(idx, true)
     }
     return live.keySet().sort()
 }
@@ -4271,7 +4287,7 @@ private Map _rmModifyTrigger(Integer appId, Integer triggerIdx, Map mods) {
     // apply the shared guard predicate and fail SAFE (do not reject) when the capability is
     // unresolved (null) -- a missed guard beats falsely rejecting a legitimate edit.
     if (_rmLooksLikeStateChangeToken(mods.state)) {
-        def committedCap = triggerCaps[triggerIdx]
+        def committedCap = triggerCaps.get(triggerIdx)
         // committedCap != null distinguishes "capability read successfully but unlisted" (a
         // non-null string the deny-list guards) from "capability could not be read" (statusJson
         // carried no tCapab value -> null -> SKIP the guard, fail safe). The deny-list returns TRUE
@@ -4373,7 +4389,7 @@ private Map _rmModifyAction(Integer appId, Integer actionIdx, Map mods, Long req
         def indices = _rmActionIndicesFromSettings(_rmFetchStatusJson(appId))
         throw new IllegalArgumentException("modifyAction.index ${actionIdx} not found in rule ${appId}. Existing indices: ${indices.sort().join(', ')}. RM is not touched.")
     }
-    def entry = reverse[actSubType]
+    def entry = reverse.get(actSubType)
     def actType = committedSettings["actType.${actionIdx}".toString()]?.toString()
     if (actType != "rulesActs" || entry == null) {
         throw new IllegalArgumentException("modifyAction currently supports only rule-targeting actions (runRule, cancelTimers, pauseRule, privateBoolean). Action ${actionIdx} is actType='${actType}' actSubType='${actSubType}'. Rebuild other action shapes with removeAction + addAction (one patches call keeps it atomic). RM is not touched.")
@@ -4818,7 +4834,7 @@ private Map _rmNavigateToPage(Integer appId, String fromPage, String targetPage,
     ]
     if (hrefParams != null && !hrefParams.isEmpty()) {
         def paramsMarker = "params_for_action_href_${hrefName}|${targetPage}|${hrefIndex}".toString()
-        body[paramsMarker] = groovy.json.JsonOutput.toJson(hrefParams)
+        body.put(paramsMarker, groovy.json.JsonOutput.toJson(hrefParams))
     }
     try {
         def cfg = _rmFetchConfigJson(appId, fromPage, cache)
@@ -6230,7 +6246,7 @@ Map _rmAddAction(Integer appId, Map actionSpec, boolean intraBatch = false, Set 
                 // statusJson answered (an empty map means the rule simply has no locals).
                 allVars = [:]
                 localsRead.vars.each { lvName, lvMeta ->
-                    allVars[lvName?.toString()] = [type: (lvMeta instanceof Map ? lvMeta?.type?.toString() : null)]
+                    allVars.put(lvName?.toString(), [type: (lvMeta instanceof Map ? lvMeta?.type?.toString() : null)])
                 }
             } else {
                 mcpLog("warn", "rm-native", "setLocalVariable: local-variable read (statusJson appState.allLocalVars) unavailable for app ${appId} (${localsRead.error}) -- variable-name validation skipped; write will proceed unvalidated")
@@ -6270,7 +6286,7 @@ Map _rmAddAction(Integer appId, Map actionSpec, boolean intraBatch = false, Set 
             // exist, so a null or non-numeric token means we cannot prove it is numeric -- reject
             // rather than silently allowing an un-typeable target through to a doomed reveal walk.
             if (actionSpec.value != null || actionSpec.fromDevice != null || actionSpec.math != null) {
-                def targetMeta = allVars[targetVar]
+                def targetMeta = allVars.get(targetVar)
                 def targetType = (targetMeta instanceof Map) ? targetMeta?.type?.toString() : null
                 if (!_rmIsNumericVarType(targetType)) {
                     def modeName = actionSpec.value != null ? "numeric-constant (value)"
@@ -6387,7 +6403,7 @@ Map _rmAddAction(Integer appId, Map actionSpec, boolean intraBatch = false, Set 
             "speech": "SpeechSynthesis", "SpeechSynthesis": "SpeechSynthesis"
         ]
         def capFilterRaw = actionSpec.capabilityFilter ?: "Switch"
-        def capFilter = friendlyToKey[capFilterRaw.toString()] ?: capFilterRaw.toString()
+        def capFilter = friendlyToKey.get(capFilterRaw.toString()) ?: capFilterRaw.toString()
         fields = [
             "useLastDev.@N": (actionSpec.useLastEventDevice == true),
             "myCapab.@N": capFilter,
@@ -9240,7 +9256,7 @@ private Map _rmSubmitFullPageForm(Integer appId, String pageName, Map cfg, Map s
         // submit (stale version token, auth, malformed envelope, etc.) instead
         // of just a bare status code.
         def bodyPreview = resp?.data?.toString()?.take(200)
-        throw new IllegalStateException("Full-form submit on ${pageName} for app ${appId} failed: status=${resp.status}${bodyPreview ? "; body=" + bodyPreview : ""}. The submit was rejected so nothing was committed (a 4xx is usually a stale version token -- re-fetch via hub_get_app_config(appId=${appId}) and retry). The page may be left in trash-confirmation mode; on this hard-fail path the tool backs it out automatically via cancelTrash. Do NOT treat this as a partial delete.")
+        throw new IllegalStateException("Full-form submit on ${pageName} for app ${appId} failed: status=${resp.status}${bodyPreview ? "; body=" + bodyPreview : ""}. The outcome has not been verified. Recovery is best-effort; inspect the rule with hub_get_app_config(appId=${appId}) before retrying.")
     }
     // Surface any non-button inputs the wholesale-replace blanked (absent from
     // currentSettings AND not in extraSettings) so a caller can refuse a
@@ -9261,7 +9277,10 @@ private boolean _rmReusableBackupFileMatches(Map entry, Integer ruleId) {
         // One retry: a transient File Manager read hiccup must not be mistaken for a
         // deleted backup -- the discard path unlinks the manifest handle for good.
         for (int attempt = 0; attempt < 2; attempt++) {
-            try { bytes = downloadHubFile(fileName) } catch (Exception readErr) { bytes = null }
+            try { bytes = downloadHubFile(fileName) } catch (Exception readErr) {
+                bytes = null
+                if (attempt == 1) mcpLog("debug", "rm-native", "Backup file '${fileName}' could not be read on retry: ${readErr.message}")
+            }
             if (bytes != null && bytes.length > 0) break
             if (attempt == 0) pauseExecution(300L)
         }
@@ -9297,14 +9316,18 @@ private boolean _rmReusableBackupFileMatches(Map entry, Integer ruleId) {
 // backups are enabled. Destructive delete and Required Expression restore callers
 // continue to call _rmBackupRuleSnapshot directly, so they always get a fresh image.
 Map _rmBackupBeforeEdit(Integer ruleId, String reason) {
+    return _withBackupLock("rule ${ruleId} baseline (${reason})") { _rmBackupBeforeEditLocked(ruleId, reason) }
+}
+
+private Map _rmBackupBeforeEditLocked(Integer ruleId, String reason) {
     if (settings?.backupEveryRuleWrite == true || reason == "pre-replaceRequiredExpression") {
         return _rmBackupRuleSnapshot(ruleId, reason)
     }
 
     long nowMs = now()
-    def mfst = atomicState.itemBackupManifest ?: [:]
+    def mfst = _itemBackupManifest()
     def recent = mfst.findAll { key, value ->
-        if (!(value instanceof Map) || value.type?.toString() != "rm-rule") return false
+        if (!(value instanceof Map) || value.deletePending || value.type?.toString() != "rm-rule") return false
         def savedRuleId = value.ruleId != null ? value.ruleId : value.id
         if (savedRuleId?.toString() != ruleId?.toString()) return false
         Long savedAt = null
@@ -9314,32 +9337,18 @@ Map _rmBackupBeforeEdit(Integer ruleId, String reason) {
         return age >= 0L && age < 60L * 60L * 1000L
     }.max { a, b -> (a.value.timestamp as Long) <=> (b.value.timestamp as Long) }
 
-    // The JVM mirror is authoritative when it is newer than the manifest scan: a
-    // worker execution can read an atomicState snapshot that predates the previous
-    // worker's manifest write, and that gap must not cost a redundant baseline.
-    synchronized (RM_BASELINE_HANDLES) {
-        def mirrored = RM_BASELINE_HANDLES[ruleId?.toString()]
-        if (mirrored instanceof Map && mirrored.entry instanceof Map) {
-            Long mirroredAt = null
-            try { mirroredAt = (mirrored.entry as Map).timestamp as Long } catch (Exception ignored) { }
-            long mirroredAge = mirroredAt == null ? -1L : nowMs - mirroredAt
-            boolean inWindow = mirroredAt != null && mirroredAge >= 0L && mirroredAge < 60L * 60L * 1000L
-            boolean newerThanScan = recent == null ||
-                mirroredAt > ((recent.value.timestamp as Long) ?: 0L)
-            if (inWindow && newerThanScan) {
-                recent = [key: mirrored.key?.toString(), value: new LinkedHashMap(mirrored.entry as Map)]
-            }
-        }
-    }
-
     if (recent != null && !_rmReusableBackupFileMatches(recent.value as Map, ruleId)) {
         def staleFile = recent.value?.fileName?.toString()
         mcpLog("warn", "rm-native", "Recent backup ${recent.key} for rule ${ruleId} is missing or does not match its manifest; discarding the stale handle and taking a fresh baseline")
-        try { unlinkItemBackupManifestFile(staleFile, recent.key?.toString()) } catch (Exception ignored) { }
+        try { unlinkItemBackupManifestFile(staleFile, recent.key?.toString()) }
+        catch (Exception unlinkErr) { mcpLog("warn", "rm-native", "Could not unlink the stale backup handle ${recent.key} for rule ${ruleId}: ${unlinkErr.message}; a fresh baseline is taken but the stale entry remains in the manifest") }
         recent = null
     }
 
     if (recent != null) {
+        // Repair only a validated handle: trimming to protect a handle that is then
+        // discarded would evict one live rollback point for nothing.
+        _repairItemBackupRetention(mfst, recent.key.toString(), recent.value as Map)
         def config = null
         try {
             config = _rmFetchConfigJson(ruleId)
@@ -9374,8 +9383,12 @@ Map _rmBackupBeforeEdit(Integer ruleId, String reason) {
 //
 // Entries get type="rm-rule" so hub_list_backups + hub_restore_backup
 // (the existing tools) handle them too — no separate RM-only backup
-// tools. Backup key pattern: rm-rule_<ruleId>_<yyyyMMdd-HHmmss-SSS>.
+// tools. Backup key pattern: rm-rule_<ruleId>_<yyyyMMdd-HHmmss-SSS>[-<uuid>].
 Map _rmBackupRuleSnapshot(Integer ruleId, String reason) {
+    return _withBackupLock("rule ${ruleId} snapshot (${reason})") { _rmBackupRuleSnapshotLocked(ruleId, reason) }
+}
+
+private Map _rmBackupRuleSnapshotLocked(Integer ruleId, String reason) {
     def config
     def status
     try {
@@ -9498,7 +9511,9 @@ Map _rmBackupRuleSnapshot(Integer ruleId, String reason) {
     }
 
     def ts = new Date(now()).format("yyyyMMdd-HHmmss-SSS")
-    def fileName = "mcp-rm-backup-${ruleId}-${ts}.json"
+    String namePrefix = "mcp-rm-backup-${ruleId}-"
+    String nameExt = ".json"
+    def fileName = _itemBackupFileName(namePrefix + ts + nameExt)
 
     def jsonBytes
     try {
@@ -9512,9 +9527,8 @@ Map _rmBackupRuleSnapshot(Integer ruleId, String reason) {
         throw new IllegalArgumentException("Cannot save backup file '${fileName}' for rule ${ruleId}: ${e.message}")
     }
 
-    // atomicState read-modify-write: read the full manifest, mutate locally, write back.
-    def mfst = atomicState.itemBackupManifest ?: [:]
-    def backupKey = "rm-rule_${ruleId}_${ts}"
+    def suffix = fileName.substring(namePrefix.length(), fileName.length() - nameExt.length())
+    String backupKey = "rm-rule_${ruleId}_${suffix}"
     def entry = [
         type: "rm-rule",
         id: ruleId,
@@ -9525,27 +9539,7 @@ Map _rmBackupRuleSnapshot(Integer ruleId, String reason) {
         timestamp: snapshot.timestamp,
         sourceLength: jsonBytes.length  // reusing the existing field name for byte size
     ]
-    mfst[backupKey] = entry
-
-    // Reuse backupItemSource's prune budget (20 entries total across all
-    // backup types). Oldest pruned first -- same policy as app/driver.
-    if (mfst.size() > 20) {
-        def oldest = mfst.min { it.value.timestamp }
-        if (oldest) {
-            try { deleteHubFile(oldest.value.fileName) } catch (Exception e) {
-                mcpLog("warn", "rm-native", "Could not prune backup ${oldest.value.fileName}: ${e.message}")
-            }
-            mfst.remove(oldest.key)
-        }
-    }
-    atomicState.itemBackupManifest = mfst
-    // Mirror the newest per-rule handle in JVM statics: another worker execution
-    // scheduled seconds from now may read an atomicState snapshot that predates
-    // this write, and reuse must not depend on that visibility (see
-    // RM_BASELINE_HANDLES in the host app).
-    synchronized (RM_BASELINE_HANDLES) {
-        RM_BASELINE_HANDLES[ruleId.toString()] = [key: backupKey.toString(), entry: new LinkedHashMap(entry)]
-    }
+    _publishUploadedItemBackup(backupKey, entry)
 
     mcpLog("info", "rm-native", "Backed up rule ${ruleId} (${reason}) to ${fileName} (${jsonBytes.length} bytes)")
     // brokenBefore: the rule's pre-write broken state, derived from the config this snapshot
@@ -9742,7 +9736,7 @@ Map _setRuleFromEnvelope(Map env) {
         // EXCEPT 'settings', whose payload is a raw {inputName: value} map that may legitimately
         // contain a single input literally named 'settings'; unwrapping there would misread it.
         def val = payload
-        if (op != 'settings' && val instanceof Map && val.size() == 1 && val.containsKey(op)) val = val[op]
+        if (op != 'settings' && val instanceof Map && val.size() == 1 && val.containsKey(op)) val = val.get(op)
         // List-shaped ops take a BARE array. For the spec-list ops a caller who wrapped it under
         // any single key (e.g. {actions:[...]}) is unwrapped here. NOT for patches: its items are
         // {op: spec} maps, so a single-key map like {addActions:[...]} is a malformed payload, not
@@ -9756,7 +9750,7 @@ Map _setRuleFromEnvelope(Map env) {
                 throw new IllegalArgumentException("hub_set_rule operation='${op}': args must be a bare array, e.g. args:[{...},...] (got ${got}). Call without confirm to see the schema.")
             }
         }
-        legacy[op] = val
+        legacy.put(op, val)
     }
     return [args: legacy]
 }
@@ -10121,21 +10115,26 @@ def _createNativeAppShell(args) {
         // populate from a fully-loaded rule (avoids N redundant inits).
         def triggerSpecs = args?.triggers instanceof List ? (args.triggers as List) : []
         def triggerResults = []
+        // Fail closed: the first failed or partial item stops every later mutation and finalisation.
+        String createStopAfter = null
+        def createStopItem = null
         if (triggerSpecs) {
             triggerSpecs.eachWithIndex { spec, i ->
+                if (createStopAfter) { triggerResults << _rmBulkNotAttempted(createStopAfter); return }
                 if (!(spec instanceof Map)) {
                     triggerResults << [success: false, error: "triggers[${i}] is not a Map", spec: spec]
-                    return
+                } else {
+                    try {
+                        triggerResults << _rmAddTrigger(newId, spec as Map)
+                    } catch (Exception te) {
+                        triggerResults << [success: false, error: te.message, specCapability: spec.capability]
+                        mcpLog("warn", "rm-native", "hub_set_rule: trigger ${i} (capability=${spec.capability}) failed -- ${te.message}")
+                    }
                 }
-                try {
-                    triggerResults << _rmAddTrigger(newId, spec as Map)
-                } catch (Exception te) {
-                    triggerResults << [success: false, error: te.message, specCapability: spec.capability]
-                    mcpLog("warn", "rm-native", "hub_set_rule: trigger ${i} (capability=${spec.capability}) failed -- ${te.message}")
-                }
+                if (_rmBulkItemBlocks(triggerResults.last())) { createStopAfter = "triggers[${i}]".toString(); createStopItem = triggerResults.last() }
             }
             // Re-init once after all triggers are committed.
-            _rmClickAppButton(newId, "updateRule")
+            if (!createStopAfter) _rmClickAppButton(newId, "updateRule")
         }
 
         // Optional Required Expression creation. Runs BEFORE actions: the RE
@@ -10152,7 +10151,9 @@ def _createNativeAppShell(args) {
         // re-init click is rejected rather than silently swallowing it.
         def reSpec = args?.requiredExpression instanceof Map ? (args.requiredExpression as Map) : null
         def reResult = null
-        if (reSpec != null) {
+        if (reSpec != null && createStopAfter) {
+            reResult = _rmBulkNotAttempted(createStopAfter)
+        } else if (reSpec != null) {
             try {
                 reResult = _rmAddRequiredExpression(newId, reSpec)
             } catch (Exception ree) {
@@ -10165,7 +10166,8 @@ def _createNativeAppShell(args) {
             // harmless (triggers->updateRule->actions->updateRule already fires
             // multiple per session). On failure, degrade reResult honestly so a
             // dormant RE is not reported as live.
-            if (reResult instanceof Map && reResult.success != false) {
+            if (_rmBulkItemBlocks(reResult)) { createStopAfter = "requiredExpression"; createStopItem = reResult }
+            if (reResult instanceof Map && !createStopAfter) {
                 try {
                     _rmClickAppButton(newId, "updateRule")
                 } catch (Exception reUpdExc) {
@@ -10175,6 +10177,7 @@ def _createNativeAppShell(args) {
                     reResult.partial = true
                     mcpLog("warn", "rm-native", "hub_set_rule: requiredExpression trailing updateRule click failed for app ${newId} -- expression may not be live: ${reUpdExc.message}")
                 }
+                if (_rmBulkItemBlocks(reResult)) { createStopAfter = "requiredExpression"; createStopItem = reResult }
             }
         }
 
@@ -10188,18 +10191,20 @@ def _createNativeAppShell(args) {
         if (actionSpecs) {
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
-            def actionsValidRuleIds = _rmSpecListTargetsRule(actionSpecs) ? _rmValidRuleIds() : null
+            def actionsValidRuleIds = (!createStopAfter && _rmSpecListTargetsRule(actionSpecs)) ? _rmValidRuleIds() : null
             actionSpecs.eachWithIndex { spec, i ->
+                if (createStopAfter) { actionResults << _rmBulkNotAttempted(createStopAfter); return }
                 if (!(spec instanceof Map)) {
                     actionResults << [success: false, error: "actions[${i}] is not a Map", spec: spec]
-                    return
+                } else {
+                    try {
+                        actionResults << _rmAddAction(newId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, actionsValidRuleIds)
+                    } catch (Exception ae) {
+                        actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                        mcpLog("warn", "rm-native", "hub_set_rule: action ${i} (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                    }
                 }
-                try {
-                    actionResults << _rmAddAction(newId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, actionsValidRuleIds)
-                } catch (Exception ae) {
-                    actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                    mcpLog("warn", "rm-native", "hub_set_rule: action ${i} (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                }
+                if (_rmBulkItemBlocks(actionResults.last())) { createStopAfter = "actions[${i}]".toString(); createStopItem = actionResults.last() }
             }
             // After bulk-add, navigate selectActions → mainPage via
             // _action_previous=Done — mirrors the live UI's "Done with
@@ -10209,19 +10214,21 @@ def _createNativeAppShell(args) {
             // commit ends with a Done navigation up to mainPage before
             // updateRule fires. Without this, state.editAct can linger
             // and updateRule may fire from the wrong page state.
-            try {
-                _rmSubmitSubPageDone(newId, "selectActions", "mainPage", "name", null)
-            } catch (Exception subPageDoneExc) {
-                mcpLog("warn", "rm-native", "hub_set_rule: trailing _rmSubmitSubPageDone(selectActions->mainPage) failed for app ${newId} (${subPageDoneExc.message}) -- relying on updateRule below; lingering state.editAct markers may corrupt subsequent edits")
+            if (!createStopAfter) {
+                try {
+                    _rmSubmitSubPageDone(newId, "selectActions", "mainPage", "name", null)
+                } catch (Exception subPageDoneExc) {
+                    mcpLog("warn", "rm-native", "hub_set_rule: trailing _rmSubmitSubPageDone(selectActions->mainPage) failed for app ${newId} (${subPageDoneExc.message}) -- relying on updateRule below; lingering state.editAct markers may corrupt subsequent edits")
+                }
+                _rmClickAppButton(newId, "updateRule")
             }
-            _rmClickAppButton(newId, "updateRule")
         }
 
         // Final commit: click the Done button on mainPage. The live UI
         // ALWAYS fires this as the last step of every create/modify session
         // (verified). Without it, the rule's session-end state
         // can be incomplete and subsequent reads/edits may behave oddly.
-        def createDone = _rmSubmitMainPageDone(newId)
+        def createDone = createStopAfter ? null : _rmSubmitMainPageDone(newId)
 
         def status = _rmFetchStatusJson(newId)
         def health = _rmCheckRuleHealth(newId)
@@ -10307,6 +10314,15 @@ def _createNativeAppShell(args) {
                 result.success = false
             }
             result.repairHints = (result.repairHints ?: []) + ["The session-end mainPage Done click did not commit (${createDone.reason}). Settings are already written, but the app's update lifecycle did not run -- verify via hub_get_app_config(appId=${newId}) and re-commit via hub_set_native_app(appId=${newId}, button='updateRule') for RM-family apps.".toString()]
+        }
+        if (createStopAfter) {
+            result.success = false
+            result.partial = true
+            result.bulkStoppedAfter = createStopAfter
+            result.finalisationNotAttempted = true
+            result.error = _rmBulkStopError(createStopAfter, createStopItem)
+            result.note = "Created ${appType} app (id=${newId}) but stopped after ${createStopAfter} failed or was partial: items after the stopping item were not attempted, and the remaining updateRule and mainPage Done were not fired. Sections before the stop may already have been finalised.".toString()
+            result.repairHints = (result.repairHints ?: []) + ["Creation stopped fail-closed after ${createStopAfter}. A new rule has no pre-operation backup: inspect with hub_get_app_config(appId=${newId}), then either delete the incomplete rule and re-create it, or repair the failed item and add the notAttempted items, fire hub_set_rule(button='updateRule') and re-run hub_get_rule_health.".toString()]
         }
         if (triggerSpecs) result.triggers = triggerResults
         if (actionSpecs) result.actions = actionResults
@@ -10907,14 +10923,27 @@ private void _rmClearPredCapabsViaGhostIfThen(Integer appId, String caller) {
 // Best-effort + idempotent: a clean predCapabs re-clears harmlessly, and a failed clear degrades to
 // the pre-deferral worst case (a possible IF(Broken Condition) wrap, surfaced as a warn).
 private void _rmRunPendingPredCapabsClear(Integer appId) {
-    def pending = atomicState.predClearPending ?: [:]
-    if (!pending[appId.toString()]) return
+    def pending = _rmPendingPredClearSnapshot()
+    def observedGeneration = pending.get(appId.toString())
+    if (!observedGeneration) return
     try {
         _rmClearPredCapabsViaGhostIfThen(appId, "addAction (deferred from addRequiredExpression)")
     } catch (Exception e) {
         mcpLog("warn", "rm-native", "addAction: deferred predCapabs clear (ghost ifThen) failed for app ${appId} (${e.message ?: e.toString()}) -- this action may render under IF(**Broken Condition**); verify rule render or restore backup if needed")
     }
-    _rmDropPredClearPending(appId)
+    try { _rmDropPredClearPending(appId, observedGeneration) }
+    catch (Exception cleanupError) {
+        mcpLog("warn", "rm-native", "addAction: deferred predicate-clear bookkeeping failed for app ${appId}: ${cleanupError.message}; the recovery record is retained for a later attempt")
+    }
+}
+
+void _rmMarkPredClearPending(Integer appId) {
+    synchronized (PRED_CLEAR_STORES) {
+        Map pending = _rmPendingPredClearSnapshot()
+        // An inventory fetched before this generation cannot discard this intent.
+        pending.put(appId.toString(), java.util.UUID.randomUUID().toString())
+        _rmCommitPredClearPending(pending)
+    }
 }
 
 // Drop a rule's deferred predCapabs-clear flag WITHOUT firing the clear -- used when the rule's
@@ -10922,8 +10951,22 @@ private void _rmRunPendingPredCapabsClear(Integer appId) {
 // rule deleted), so a stale flag can't trigger a wasted ghost clear on a later addAction or linger
 // in atomicState after the rule is gone.
 private void _rmDropPredClearPending(Integer appId) {
-    def m = atomicState.predClearPending ?: [:]
-    if (m.remove(appId.toString()) != null) atomicState.predClearPending = m
+    synchronized (PRED_CLEAR_STORES) {
+        Map pending = _rmPendingPredClearSnapshot()
+        if (pending.remove(appId.toString()) != null) _rmCommitPredClearPending(pending)
+    }
+}
+
+// A clear may finish after a concurrent rule edit published fresh recovery intent.
+private void _rmDropPredClearPending(Integer appId, Object observedGeneration) {
+    if (observedGeneration == null) return
+    synchronized (PRED_CLEAR_STORES) {
+        Map pending = _rmPendingPredClearSnapshot()
+        String key = appId.toString()
+        if (pending.get(key) != observedGeneration) return
+        pending.remove(key)
+        _rmCommitPredClearPending(pending)
+    }
 }
 
 // Low-level reveal-step primitive for RM 5.1 progressive-disclosure wizard pages.
@@ -11209,7 +11252,7 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
     // below so a change token on a discrete cap gets the same "author it as a trigger row" steer
     // as every other condition surface; the discrete-event guard owns only the numeric-shape comparator (>, =, <, ...)
     // with no value, whose recovery is a state value.
-    def discreteValid = DISCRETE_EVENT_CAPS[capCanonical]
+    def discreteValid = DISCRETE_EVENT_CAPS.get(capCanonical)
     if (discreteValid != null && cond.comparator != null && !_rmComparatorIsRhsOptional(cond.comparator)
             && cond.state == null && cond.value == null) {
         cancelInFlightCond()
@@ -11378,8 +11421,8 @@ private void _rmWalkConditionReveal(Integer appId, Map ctx, Map cond, Integer cI
         }
         // Map caller-facing type names to firmware enum values.
         def typeToWire = [clock: "A specific time", sunrise: "Sunrise", sunset: "Sunset"]
-        def startTypeWire = typeToWire[startType]
-        def endTypeWire   = typeToWire[endType]
+        def startTypeWire = typeToWire.get(startType)
+        def endTypeWire   = typeToWire.get(endType)
 
         // Validate that the required time/offset values are present before any hub writes.
         // Validating here (not after reveals) avoids hub round-trips on a caller error.
@@ -12767,9 +12810,7 @@ private Map _rmAddRequiredExpression(Integer appId, Map exprSpec, boolean preVal
     //   required-FIELDS check (appUI.js:559-563 empty required device buttons / 700-701 errorCount),
     //   NOT a routing/editAct check -- so STPage opens cleanly without the ghost ifThen. (The helper's
     //   old "routing reset" comment only undid the ghost ifThen's OWN nav to doActPage.)
-    def _predPending = atomicState.predClearPending ?: [:]
-    _predPending[appId.toString()] = true
-    atomicState.predClearPending = _predPending
+    _rmMarkPredClearPending(appId)
 
     // Step 5. Post-commit validation. RM 5.1's STPage silently accepts
     // many invalid inputs at the field-write level (e.g. unknown device
@@ -13109,10 +13150,8 @@ private Map _rmFinalizeRequiredExpressionWrite(Integer appId, Map innerResult, M
 // - replay + read-back both confirm -> restored:true.
 // - restore threw -> restored:false, "DELETED ... auto-restore ALSO failed".
 private Map _rmRestoreCommittedREFromBackup(Integer appId, Map backup, String errMsg, Map carry = [:]) {
-    // A rollback discards the failed new-RE build, so drop any predClearPending it flagged: the
-    // restored rule's predCapabs comes from a clean backup, and a leftover flag would fire a wasted
-    // ghost clear on the rule's next addAction.
-    _rmDropPredClearPending(appId)
+    // Keep recovery intent until rollback is confirmed; a newer mark belongs to another edit.
+    def observedGeneration = _rmPendingPredClearSnapshot().get(appId.toString())
     if (backup?.fileName == null) {
         // No usable backup handle -- cannot auto-restore. Say so loudly; the old RE
         // is gone and the caller must recover by hand.
@@ -13177,6 +13216,11 @@ private Map _rmRestoreCommittedREFromBackup(Integer appId, Map backup, String er
                 requiredExpressionRestored: false,
                 error: "${errMsg} Auto-restore from backup ${backup.backupKey} replayed but the original Required Expression could NOT be confirmed re-activated (the rule may be left UNGATED). Verify via hub_get_app_config(appId=${appId}, includeSettings=true) and manually restore via hub_restore_backup(backupKey='${backup.backupKey}') if the gate is missing."
             ]
+        }
+        try {
+            _rmDropPredClearPending(appId, observedGeneration)
+        } catch (Exception cleanupError) {
+            mcpLog("warn", "rm-native", "Required Expression restored for app ${appId}, but its pending predicate-clear record could not be removed: ${cleanupError.message}; the recovery record is retained")
         }
         mcpLog("info", "rm-native", "replaceRequiredExpression: post-delete failure on app ${appId}; auto-restored the original Required Expression from backup ${backup.backupKey} (re-activation confirmed on STPage): ${errMsg}")
         return carry + [
@@ -13536,17 +13580,61 @@ private _stripInternalClock(rem) {
     return (rem instanceof Map) ? ((Map) rem).findAll { k, v -> k?.toString() != "__reqT0" } : rem
 }
 
-// Time-budget pause envelope for the bulk addTriggers/addActions path -- mirrors the
-// in_progress shape the walkStep-drive step loop and the patches op loop return. The
-// checkpoint stops the batch as soon as the time budget is exceeded (protecting the
-// response from a transport drop) REGARDLESS of whether an earlier item failed; the outer
-// success/partial here are computed from the committed items exactly like the
-// normal-completion return, so a committed-but-degraded or failed item is bubbled up (not
-// masked as clean) across the resume boundary. Health is intentionally NOT gated: the
-// trailing updateRule is deferred to the resume call, so subscriptions are legitimately
-// not-yet-live at a pause and gating success on health would falsely fail every pause. The
-// unprocessed items are handed back (minus the internal __reqT0 clock) for the caller to
-// re-issue.
+// Fail-closed bulk contract: a failed or partial item stops every later mutation and finalisation.
+private boolean _rmBulkItemBlocks(r) {
+    return r instanceof Map && (r.success == false || r.partial == true)
+}
+
+private Map _rmBulkNotAttempted(String stoppedAfter) {
+    return [success: false, notAttempted: true, error: "not attempted: bulk stopped after ${stoppedAfter} failed or was partial".toString()]
+}
+
+// Top-level error for a stopped batch, naming the stopping item and why. The MRTR recentWrites record keeps
+// only success, ids and error from a terminal result, so this is all a client that never saw the response gets.
+private String _rmBulkStopError(String stoppedAfter, stopItem) {
+    def item = (stopItem instanceof Map) ? (Map) stopItem : [:]
+    String why = item.success == false ? "failed" : "reported partial"
+    String itemError = item.error?.toString()?.trim()
+    // A partial item usually has no error of its own; recentWrites keeps only this string, so carry its most specific reason.
+    if (!itemError) itemError = item.updateRuleError?.toString()?.trim()
+    if (!itemError && item.settingsSkipped instanceof List) {
+        def informational = _rmInformationalSkippedReasons()
+        def skip = (item.settingsSkipped as List).find { it instanceof Map && it.key && it.reason && !(it.reason in informational) }
+        if (skip != null) itemError = "field '${skip.key}' was not applied (${skip.reason})".toString()
+    }
+    if (!itemError && item.repairHints instanceof List) {
+        itemError = (item.repairHints as List).find { it != null && it.toString().trim() }?.toString()?.trim()
+    }
+    while (itemError?.endsWith(".")) itemError = itemError.substring(0, itemError.length() - 1)
+    String detail = itemError ? ": ${itemError}" : ""
+    return "Stopped after ${stoppedAfter} ${why}${detail}. Later items were not attempted and finalisation was not fired.".toString()
+}
+
+// Edit and replace stop envelope. Skipping finalisation is not a rollback: items before the stop stay written, and
+// actions self-bake, so they can already affect an active rule. The pre-operation backup is the rollback handle.
+private Map _rmBulkStoppedResult(Integer appId, Map backup, String stoppedAfter, stopItem, Map extra) {
+    def out = [
+        success: false,
+        partial: true,
+        appId: appId,
+        backup: backup,
+        bulkStoppedAfter: stoppedAfter,
+        finalisationNotAttempted: true,
+        error: _rmBulkStopError(stoppedAfter, stopItem),
+        health: (extra?.containsKey("health") ? extra.health : _rmCheckRuleHealth(appId)),
+        repairHints: ["Stopped fail-closed after ${stoppedAfter}: later items were not attempted and the trailing updateRule was not fired. Items before it remain written and can already affect the rule (actions self-bake). Inspect with hub_get_app_config(appId=${appId}); repair the failed item and add the notAttempted items, or roll back via hub_restore_backup(backupKey='${backup?.backupKey}'). Fire hub_set_rule(button='updateRule') only once the rule is complete.".toString()],
+        note: "Stopped after ${stoppedAfter} failed or was partial; finalisation not attempted.".toString()
+    ]
+    out.putAll(extra ?: [:])
+    return out
+}
+
+// Time-budget pause envelope for the bulk addTriggers/addActions path -- mirrors the in_progress shape the
+// walkStep-drive step loop and the patches op loop return. A pause is only reachable while every committed item
+// is clean (a failed or partial item stops the batch first), so this hands back a clean prefix plus the
+// unprocessed items (minus the internal __reqT0 clock) for the caller to re-issue. The itemsPartial roll-up is a
+// defensive guard should that ordering ever change. Health is intentionally NOT gated: the trailing updateRule is
+// deferred to the resume call, so subscriptions are legitimately not-yet-live at a pause.
 private Map _bulkPauseResult(Integer appId, Map backup, List triggerResults, List actionResults,
                                   List addTriggersRemaining, List addActionsRemaining) {
     def trigOk = triggerResults.count { it?.success != false }
@@ -13579,11 +13667,11 @@ private Map _bulkPauseResult(Integer appId, Map backup, List triggerResults, Lis
 
 // Time-budget pause envelope for the patches path. Fires at the patch-op boundary AND (for a
 // bulk addTriggers/addActions sub-op) mid-op, so a single patch op carrying a large inner list
-// can no longer exhaust the time budget un-paused. Like the bulk pause, it stops as soon as the
-// budget is exceeded regardless of an earlier op's outcome (an un-budgeted continuation risks a
-// dropped response), and computes outer success/partial from the ops so far. patchesRemaining is
-// the un-processed work the caller re-issues -- for a mid-op pause the caller prepends the current
-// op rewritten to only its un-processed inner items.
+// can no longer exhaust the time budget un-paused. As with the bulk pause, a failed or partial op
+// or inner item stops the batch before any checkpoint, so a pause only ever hands back work after a
+// clean prefix; the success/partial roll-up is a defensive guard. patchesRemaining is the
+// un-processed work the caller re-issues -- for a mid-op pause the caller prepends the current op
+// rewritten to only its un-processed inner items.
 private Map _patchesPauseResult(Integer appId, Map backup, List patchResults, List patchesRemaining) {
     def opPartial = patchResults.any { it instanceof Map && (it.success == false || it.partial == true) }
     return [
@@ -14012,6 +14100,8 @@ def _applyNativeAppEdit(args) {
         // statement below.
         def removed = []
         def addedResults = []
+        String replaceStopAfter = null
+        def replaceStopItem = null
         // moveAction rich return ({beforePosition, afterPosition, indicesAfter}).
         // Hoisted for the same block-scope reason as the others above.
         def moveResult = null
@@ -14130,15 +14220,18 @@ def _applyNativeAppEdit(args) {
             }
             if (replaceActionsList != null) {
                 replaceActionsList.eachWithIndex { spec, i ->
+                    // Fail closed: the first failed or partial item stops every later add and finalisation.
+                    if (replaceStopAfter) { addedResults << _rmBulkNotAttempted(replaceStopAfter); return }
                     if (!(spec instanceof Map)) {
                         addedResults << [success: false, error: "replaceActions[${i}] is not a Map", spec: spec]
-                        return
+                    } else {
+                        try { addedResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, replaceValidRuleIds) }
+                        catch (Exception ae) {
+                            addedResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                            mcpLog("warn", "rm-native", "hub_set_rule: replaceActions[${i}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                        }
                     }
-                    try { addedResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, replaceValidRuleIds) }
-                    catch (Exception ae) {
-                        addedResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                        mcpLog("warn", "rm-native", "hub_set_rule: replaceActions[${i}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                    }
+                    if (_rmBulkItemBlocks(addedResults.last())) { replaceStopAfter = "replaceActions[${i}]".toString(); replaceStopItem = addedResults.last() }
                 }
             }
         } catch (Exception e) {
@@ -14233,6 +14326,9 @@ def _applyNativeAppEdit(args) {
             }
             return result
         }
+        if (replaceStopAfter) {
+            return _rmBulkStoppedResult(appId, backup, replaceStopAfter, replaceStopItem, [removedIndices: removed ?: null, addedActions: addedResults])
+        }
         // Trailing updateRule fires AFTER mutation block completes. Hoisted
         // out of the per-item try so a rejection here doesn't get routed
         // through the generic "mutation errored partway" shape -- the mutation
@@ -14258,14 +14354,6 @@ def _applyNativeAppEdit(args) {
         def repairHints = []
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the action mutation committed. The action rows are baked but the rule will not subscribe to its device events until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
-        }
-        // Inner-only partial (replaceActions list had partial inner items but the
-        // trailing updateRule click landed clean). Without this hint the outer
-        // envelope returned partial:true + success:false + repairHints:[] and the
-        // caller had to drill into addedActions[] to discover why -- the same C2
-        // antipattern this PR has been closing on the *NotLive flags.
-        if (itemsPartial && !updateRuleFailed) {
-            repairHints << "One or more inner replaceActions items reported partial. Drill into addedActions[] for per-item settingsSkipped + repairHints. Wait 5s and retry, or use removeAction/clearActions to clean up and re-add the failing spec."
         }
         // moveAction soft-return: on a slow hub the move-arrow click can commit
         // AFTER the post-click read; _rmMoveAction does one short re-check and,
@@ -14430,8 +14518,7 @@ def _applyNativeAppEdit(args) {
         def trigSkippedSize = (trigMutResult?.settingsSkipped as List)?.size() ?: 0
         def trigInnerPartial = trigSkippedSize > 0 || trigMutResult?.verificationFetchFailed == true
         // Inner-only partial hint (trigger inner skipped/verify-failed BUT the
-        // trailing updateRule landed clean). Mirrors the action-mutation
-        // dispatcher's inner-only repairHint above; without it the caller has to
+        // trailing updateRule landed clean); without it the caller has to
         // drill into settingsSkipped[] to discover why partial flipped true.
         if (trigInnerPartial && !updateRuleFailed) {
             repairHints << "modifyTrigger reported inner partial (settingsSkipped or verificationFetchFailed). Inspect settingsSkipped[] for per-field silent_rejection reasons. Re-attempt the modifyTrigger call, or use removeTrigger + addTrigger to rebuild the trigger atomically."
@@ -14613,20 +14700,30 @@ def _applyNativeAppEdit(args) {
                 (pm.replaceActions instanceof List && _rmSpecListTargetsRule(pm.replaceActions as List))
         }
         def patchValidRuleIds = patchBatchTargetsRule ? _rmValidRuleIds() : null
+        // Fail closed, as the top-level bulk paths do: the first failed or partial op, or inner item of an
+        // addTriggers/addActions/replaceActions op, stops every later op and the batch-end updateRule. Later
+        // ops and inner items are reported notAttempted, and the stop is decided before any budget checkpoint,
+        // so a pause never hands back a skipped tail.
+        String patchStopAfter = null
+        def patchStopItem = null
         try {
             // Indexed for-loop (not eachWithIndex) so the time-budget checkpoint can
             // cleanly break/return between ops -- a Groovy closure can't break out of a loop.
             int pi = -1
             for (def p : patchesList) {
                 pi++
+                if (patchStopAfter) {
+                    def skippedOp = (p instanceof Map && !((Map) p).isEmpty()) ? ((Map) p).keySet().first() : null
+                    patchResults << ([op: skippedOp] + _rmBulkNotAttempted(patchStopAfter))
+                    continue
+                }
+                String innerStopAfter = null
+                def innerStopItem = null
                 // Time-budget checkpoint -- BETWEEN patch ops, never before the first
-                // (pi > 0). Stops as soon as the time budget is exceeded regardless of an earlier
-                // op's outcome: patches don't abort on a per-op failure, but continuing un-budgeted
-                // after the budget is spent risks the transport dropping the whole response (losing
-                // every op's result). _patchesPauseResult surfaces any failed/partial op in the
-                // outer success/partial rather than masking it. Each op is a live POST; handing
-                // back the unprocessed specs lets the caller resume. CRITICAL: return BEFORE the
-                // batch-end trailing updateRule below so it does NOT fire -- the ops so far are
+                // (pi > 0). Continuing un-budgeted after the budget is spent risks the transport
+                // dropping the whole response (losing every op's result). Each op is a live POST;
+                // handing back the unprocessed specs lets the caller resume. CRITICAL: return BEFORE
+                // the batch-end trailing updateRule below so it does NOT fire -- the ops so far are
                 // committed at the settings level but not yet baked; the resume call's own batch-end
                 // updateRule bakes them once the remaining patches complete.
                 if (pi > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
@@ -14635,6 +14732,8 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(p instanceof Map)) {
                     patchResults << [success: false, error: "patches[${pi}] is not a Map", spec: p]
+                    patchStopAfter = "patches[${pi}]".toString()
+                    patchStopItem = patchResults.last()
                     continue
                 }
                 def pm = p as Map
@@ -14661,12 +14760,17 @@ def _applyNativeAppEdit(args) {
                         boolean innerPaused = false
                         for (def tspec : innerList) {
                             ii++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             if (ii > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                                 innerPaused = true
                                 break
                             }
                             try { innerResults << _rmAddTrigger(appId, tspec as Map) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].addTriggers[${ii}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         // Outer success rolls up inner success — mark the
                         // outer entry as failed if ANY inner item failed,
@@ -14674,7 +14778,8 @@ def _applyNativeAppEdit(args) {
                         // accurately reflect partial-batch failures.
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         def trigOpEntry = [success: innerOk, op: "addTriggers", results: innerResults]
-                        if (innerPaused) trigOpEntry.partial = true
+                        // pausedMidOp lets MRTR restate a later stop in the original request's indices.
+                        if (innerPaused) { trigOpEntry.partial = true; trigOpEntry.pausedMidOp = true }
                         patchResults << trigOpEntry
                         if (innerPaused) {
                             // Strip the internal clock from the un-processed inner specs (the
@@ -14694,16 +14799,21 @@ def _applyNativeAppEdit(args) {
                         boolean innerPaused = false
                         for (def aspec : innerList) {
                             ii++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             if (ii > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                                 innerPaused = true
                                 break
                             }
                             try { innerResults << _rmAddAction(appId, _rmWithClock(aspec as Map, args?.__reqT0 as Long), true, patchValidRuleIds) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].addActions[${ii}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         def actOpEntry = [success: innerOk, op: "addActions", results: innerResults]
-                        if (innerPaused) actOpEntry.partial = true
+                        if (innerPaused) { actOpEntry.partial = true; actOpEntry.pausedMidOp = true }
                         patchResults << actOpEntry
                         if (innerPaused) {
                             // Strip the internal clock from the un-processed inner specs (the
@@ -14725,6 +14835,8 @@ def _applyNativeAppEdit(args) {
                         if (seenReplaceRE) {
                             patchResults << [success: false, op: "replaceRequiredExpression",
                                 error: "patches[${pi}]: a rule has a single Required Expression; only one replaceRequiredExpression is valid per patches batch -- the second would replace the first. Remove the duplicate, or issue the second replace as a separate hub_set_rule call."]
+                            patchStopAfter = "patches[${pi}]".toString()
+                            patchStopItem = patchResults.last()
                             continue
                         }
                         seenReplaceRE = true
@@ -14859,9 +14971,16 @@ def _applyNativeAppEdit(args) {
                             throw clearExc
                         }
                         def innerResults = []
-                        (pm.replaceActions as List).each { aspec ->
+                        int ri = -1
+                        for (def aspec : (pm.replaceActions as List)) {
+                            ri++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             try { innerResults << _rmAddAction(appId, _rmWithClock(aspec as Map, args?.__reqT0 as Long), true, patchValidRuleIds) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].replaceActions[${ri}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         patchResults << [success: innerOk, op: "replaceActions", removedIndices: cleared, addedResults: innerResults]
@@ -14902,6 +15021,10 @@ def _applyNativeAppEdit(args) {
                     patchResults << [success: false, op: pm.keySet().first(), error: cleanedPatchErr, spec: p]
                     mcpLog("warn", "rm-native", "patches[${pi}] (${pm.keySet().first()}) failed: ${cleanedPatchErr}")
                 }
+                if (!patchResults.isEmpty() && _rmBulkItemBlocks(patchResults.last())) {
+                    patchStopAfter = innerStopAfter ?: "patches[${pi}]".toString()
+                    patchStopItem = innerStopItem ?: patchResults.last()
+                }
             }
             // Fire updateRule once at the end so the rule's actions[]
             // map and event subscriptions bake from the fully-loaded
@@ -14911,7 +15034,7 @@ def _applyNativeAppEdit(args) {
             // addRequiredExpression slot propagation in the
             // `addRequiredExpressionSpec` dispatcher branch and F1's
             // counterpart in the `addTriggerSpec` dispatcher branch).
-            try { _rmClickAppButton(appId, "updateRule") }
+            if (!patchStopAfter) try { _rmClickAppButton(appId, "updateRule") }
             catch (Exception updateExc) {
                 updateRuleFailed = true
                 // patchesNotLive is the batch-generic not-live slot: a patches batch may
@@ -14971,19 +15094,12 @@ def _applyNativeAppEdit(args) {
             // Recompute the success rollup after any deferred-restore reclassification above.
             if (anyRestored) opsOk = patchResults.count { it?.success != false }
         }
+        if (patchStopAfter && patchErr == null) {
+            return _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+        }
         def repairHints = []
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the patch ops committed. The patch settings are baked but the rule will not re-evaluate / re-subscribe until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
-        }
-        // Inner-only partial hint (one or more patch ops self-reported partial:true BUT
-        // the trailing updateRule click landed clean). Outer partial: already bubbles
-        // the inner-partial signal via `patchResults.any { ... partial == true }` in the
-        // OR-clause below; without this hint the outer repairHints stayed empty and the
-        // caller had to drill into patches[] to discover why partial flipped true.
-        // Sibling pattern from the action-mutation and modifyTrigger dispatchers'
-        // inner-only branches -- closes the same C2 antipattern at this dispatch site.
-        if (patchResults.any { it instanceof Map && it.partial == true } && !updateRuleFailed) {
-            repairHints << "One or more patch ops reported partial. Drill into patches[] for per-op settingsSkipped + repairHints. The patch ops landed but some inner fields didn't; address the per-op partials directly or re-issue the patches batch."
         }
         def out = [
             success: (patchErr == null) && (opsOk == patchResults.size()) && _rmHealthGatePass(health) && !updateRuleFailed,
@@ -15147,25 +15263,28 @@ def _applyNativeAppEdit(args) {
         def updateRuleError = null
         def trigList = (addTriggersList ?: [])
         def actList = (addActionsList ?: [])
+        String bulkStopAfter = null
+        def bulkStopItem = null
         try {
             // Indexed for-loops (not eachWithIndex) so the time-budget checkpoint can
             // break/return cleanly between items -- a Groovy closure can't break out of a loop.
             // The checkpoint fires BETWEEN items only (never before the first committed item) and
-            // stops the batch as soon as the time budget is exceeded, WHETHER OR NOT an earlier
-            // item failed -- continuing un-budgeted after a failure risks the relay dropping the
-            // whole response (a transport timeout the caller can only recover from by re-issuing,
-            // which double-commits the already-applied items). _bulkPauseResult computes the
-            // outer success/partial from the committed items so a failed/degraded item is bubbled,
-            // not masked. On a pause, hand back the unprocessed items and return BEFORE the trailing
-            // updateRule below so it does NOT fire -- the items so far are committed at the settings
-            // level but not yet baked; the resume call's own trailing updateRule bakes them once the
-            // remaining items complete. Sibling pattern: the patches op loop stops the same way
-            // (regardless of a failed op, surfacing it in the pause envelope); only the
-            // walkStep-drive step loop gates on all-clean, because its pause is defined as a clean
-            // partial.
+            // stops the batch as soon as the time budget is exceeded -- continuing un-budgeted risks
+            // the relay dropping the whole response (a transport timeout the caller can only recover
+            // from by re-issuing, which double-commits the already-applied items). A pause is only
+            // reachable while every processed item is clean: a failed or partial item stops the batch
+            // first (see below). On a pause, hand back the unprocessed items and return BEFORE the
+            // trailing updateRule below so it does NOT fire -- the items so far are committed at the
+            // settings level but not yet baked; the resume call's own trailing updateRule bakes them
+            // once the remaining items complete.
+            // Fail closed: after the first failed or partial item nothing further is written and
+            // finalisation is skipped, so a failed IF opener can never leave its body committed as
+            // unconditional actions. The stop is decided before the budget checkpoint, so a pause never
+            // hands back a skipped tail.
             int ti = -1
             for (def spec : trigList) {
                 ti++
+                if (bulkStopAfter) { triggerResults << _rmBulkNotAttempted(bulkStopAfter); continue }
                 if ((triggerResults.size() + actionResults.size()) > 0 &&
                         _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                     return _bulkPauseResult(appId, backup, triggerResults, actionResults,
@@ -15173,20 +15292,22 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(spec instanceof Map)) {
                     triggerResults << [success: false, error: "addTriggers[${ti}] is not a Map", spec: spec]
-                    continue
+                } else {
+                    try { triggerResults << _rmAddTrigger(appId, spec as Map) }
+                    catch (Exception te) {
+                        triggerResults << [success: false, error: te.message, specCapability: spec.capability]
+                        mcpLog("warn", "rm-native", "hub_set_rule: addTriggers[${ti}] (${spec.capability}) failed -- ${te.message}")
+                    }
                 }
-                try { triggerResults << _rmAddTrigger(appId, spec as Map) }
-                catch (Exception te) {
-                    triggerResults << [success: false, error: te.message, specCapability: spec.capability]
-                    mcpLog("warn", "rm-native", "hub_set_rule: addTriggers[${ti}] (${spec.capability}) failed -- ${te.message}")
-                }
+                if (_rmBulkItemBlocks(triggerResults.last())) { bulkStopAfter = "addTriggers[${ti}]".toString(); bulkStopItem = triggerResults.last() }
             }
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
-            def addActionsValidRuleIds = _rmSpecListTargetsRule(actList) ? _rmValidRuleIds() : null
+            def addActionsValidRuleIds = (!bulkStopAfter && _rmSpecListTargetsRule(actList)) ? _rmValidRuleIds() : null
             int ai = -1
             for (def spec : actList) {
                 ai++
+                if (bulkStopAfter) { actionResults << _rmBulkNotAttempted(bulkStopAfter); continue }
                 if ((triggerResults.size() + actionResults.size()) > 0 &&
                         _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                     // Every trigger already processed; only the unprocessed actions remain.
@@ -15195,13 +15316,14 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(spec instanceof Map)) {
                     actionResults << [success: false, error: "addActions[${ai}] is not a Map", spec: spec]
-                    continue
+                } else {
+                    try { actionResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, addActionsValidRuleIds) }
+                    catch (Exception ae) {
+                        actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
+                        mcpLog("warn", "rm-native", "hub_set_rule: addActions[${ai}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
+                    }
                 }
-                try { actionResults << _rmAddAction(appId, _rmWithClock(spec as Map, args?.__reqT0 as Long), true, addActionsValidRuleIds) }
-                catch (Exception ae) {
-                    actionResults << [success: false, error: ae.message, specCapability: spec.capability, specAction: spec.action]
-                    mcpLog("warn", "rm-native", "hub_set_rule: addActions[${ai}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
-                }
+                if (_rmBulkItemBlocks(actionResults.last())) { bulkStopAfter = "addActions[${ai}]".toString(); bulkStopItem = actionResults.last() }
             }
         } catch (Exception e) {
             mcpLogError("rm-native", "addTriggers/addActions bulk failed for app ${appId}", e)
@@ -15209,6 +15331,9 @@ def _applyNativeAppEdit(args) {
             bulkResult.triggerResults = triggerResults
             bulkResult.actionResults = actionResults
             return bulkResult
+        }
+        if (bulkStopAfter) {
+            return _rmBulkStoppedResult(appId, backup, bulkStopAfter, bulkStopItem, [triggers: triggerResults, actions: actionResults])
         }
         // Trailing updateRule fires AFTER per-item adds complete. Hoisted out
         // of the per-item try so a rejection here doesn't get routed through
@@ -15242,15 +15367,6 @@ def _applyNativeAppEdit(args) {
         def itemsPartial = (trigOk != triggerResults.size()) || (actOk != actionResults.size()) ||
             triggerResults.any { it instanceof Map && it.partial == true } ||
             actionResults.any { it instanceof Map && it.partial == true }
-        // Inner-only partial hint (bulk inner items reported partial BUT the trailing
-        // updateRule click landed clean). Without this hint the outer envelope returned
-        // partial:true + repairHints:[] (when updateRuleFailed is false) and the caller
-        // had to drill into triggers[]/actions[] to discover why -- same C2 antipattern
-        // the rest of this PR has been closing on the *NotLive flags. Sibling pattern
-        // from the action-mutation and modifyTrigger dispatchers' inner-only branches.
-        if (itemsPartial && !updateRuleFailed) {
-            repairHints << "One or more bulk trigger/action items reported partial. Drill into triggers[] and actions[] for per-item settingsSkipped + repairHints. Wait 5s and retry the affected items, or use removeAction/removeTrigger to clean up and re-add."
-        }
         return [
             success: trigOk == triggerResults.size() && actOk == actionResults.size() && _rmHealthGatePass(health) && !updateRuleFailed,
             partial: itemsPartial || updateRuleFailed,

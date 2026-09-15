@@ -1069,7 +1069,9 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         enableWrite()
         hubGet.register('/installedapp/configure/json/200') { params -> ruleConfigJson(200, "to-delete") }
         hubGet.register('/installedapp/statusJson/200') { params -> statusJson(200) }
-        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def files = [:]
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> files.put(fn, b) }
+        script.metaClass.downloadHubFile = { String fn -> files.get(fn) }
 
         def rawCalls = []
         script.metaClass.hubInternalGetRaw = { String path, Map q = null, Integer t = 30 ->
@@ -1089,6 +1091,19 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
         and: "the snapshot is registered in the unified item-backup manifest so hub_list_backups picks it up"
         atomicStateMap.itemBackupManifest?.values()?.any { it.type == "rm-rule" && it.ruleId == 200 }
+
+        when: "a client reads the generated handle as a JSON String"
+        def backup = script.toolGetItemBackup([backupKey: result.backup.backupKey.toString()])
+
+        then:
+        backup.error == null
+        backup.type == 'rm-rule'
+        backup.howToRestore.contains('hub_restore_backup')
+        backup.howToRestore.contains(result.backup.backupKey.toString())
+        !backup.howToRestore.contains('Drivers Code')
+        def snapshot = new JsonSlurper().parseText(backup.source)
+        snapshot.appId == 200
+        snapshot.appLabel == 'to-delete'
     }
 
     def "delete_rm_rule soft-delete surfaces hubMessage on refusal"() {
@@ -1144,6 +1159,55 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         uploads.size() == 2
     }
 
+    def "pending native baseline is not reused even when its file remains readable"() {
+        given:
+        hubGet.register('/installedapp/configure/json/503') { params -> ruleConfigJson(503, "pending") }
+        hubGet.register('/installedapp/statusJson/503') { params -> statusJson(503) }
+        Map files = [:]
+        script.metaClass.uploadHubFile = { String name, byte[] bytes -> files[name] = bytes }
+        script.metaClass.downloadHubFile = { String name -> files[name] }
+        script.metaClass.deleteHubFile = { String name -> files.remove(name) }
+        def first = script._rmBackupBeforeEdit(503, "pre-addAction")
+        script._publishItemBackup(first.backupKey.toString(),
+            script._itemBackupManifest()[first.backupKey.toString()] + [deletePending: true])
+
+        when:
+        def next = script._rmBackupBeforeEdit(503, "pre-addAction")
+
+        then:
+        next.baselineReused == false
+        next.backupKey != first.backupKey
+        files[next.fileName] != null
+    }
+
+    def "native baseline reuse repairs an oversized manifest without evicting the baseline"() {
+        given:
+        hubGet.register('/installedapp/configure/json/503') { params -> ruleConfigJson(503, "cap") }
+        hubGet.register('/installedapp/statusJson/503') { params -> statusJson(503) }
+        Map files = [:]
+        script.metaClass.uploadHubFile = { String name, byte[] bytes -> files[name] = bytes }
+        script.metaClass.downloadHubFile = { String name -> files[name] }
+        List deleted = []
+        script.metaClass.deleteHubFile = { String name -> deleted << name; files.remove(name) }
+        def first = script._rmBackupBeforeEdit(503, "pre-addAction")
+        Map oversized = script._itemBackupManifest()
+        (1..22).each {
+            oversized["app_${it}".toString()] = [type: 'app', id: it.toString(), fileName: "mcp-backup-app-${it}.groovy".toString(),
+                                                 timestamp: (long) it, version: 1, sourceLength: 3]
+        }
+        script._commitItemBackupManifest(oversized)
+
+        when:
+        def next = script._rmBackupBeforeEdit(503, "pre-walkStep")
+
+        then:
+        next.baselineReused == true
+        next.backupKey == first.backupKey
+        atomicStateMap.itemBackupManifest.size() == 20
+        atomicStateMap.itemBackupManifest.containsKey(first.backupKey.toString())
+        deleted == (1..3).collect { "mcp-backup-app-${it}.groovy".toString() }
+    }
+
     def "baseline reuse survives a worker execution reading a stale manifest snapshot"() {
         given:
         def clock = [1234567890000L]
@@ -1160,7 +1224,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         clock[0] += 30 * 1000L
         def second = script._rmBackupBeforeEdit(503, "pre-addActions-bulk")
 
-        then: 'the JVM mirror carries the handle across the visibility gap'
+        then: 'the committed backup view carries the handle across the visibility gap'
         second.baselineReused == true
         second.backupKey == first.backupKey
     }
@@ -1406,6 +1470,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                               appLabel: "restored", timestamp: 1000, sourceLength: snapshotBytes.length]
         ]
         script.metaClass.downloadHubFile = { String fn ->
+            assert Thread.holdsLock(scriptStaticField('ITEM_BACKUP_MANIFESTS'))
             fn == "mcp-rm-backup-300-x.json" ? snapshotBytes : null
         }
         hubGet.register('/installedapp/configure/json/300') { params ->
@@ -1416,6 +1481,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
         def posts = []
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            assert !Thread.holdsLock(scriptStaticField('ITEM_BACKUP_MANIFESTS'))
             posts << [path: path, body: body]
             [status: 200, location: null, data: '{"status":"success"}']
         }
@@ -1434,7 +1500,55 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         settingsPost.body["tDev0.multiple"] == "true"
     }
 
-    def "hub_restore_backup recreates the rule with a fresh id when the original was deleted"() {
+    @Unroll
+    def "restore refuses recreation after a failed config read with #inventoryCase inventory"() {
+        given:
+        enableWrite()
+        def snapshot = [schemaVersion: 1, ruleId: 400, appLabel: 'existing rule',
+                        configJson: [settings: [origLabel: 'existing rule']], statusJson: [:]]
+        atomicStateMap.itemBackupManifest = [
+            'rm-rule_400_x': [type: 'rm-rule', id: 400, ruleId: 400, fileName: 'snapshot.json']
+        ]
+        script.metaClass.downloadHubFile = { String name -> JsonOutput.toJson(snapshot).getBytes('UTF-8') }
+        hubGet.register('/installedapp/configure/json/400') { params -> throw new IOException('temporary config failure') }
+        hubGet.register('/hub2/appsList') { params -> inventory }
+        hubGet.register('/installedapp/configure/json/401') { params -> ruleConfigJson(401) }
+        hubGet.register('/installedapp/statusJson/401') { params -> statusJson(401) }
+        def mutations = []
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            mutations << path
+            [status: 302, location: '/installedapp/configure/401', data: '']
+        }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            mutations << path
+            [status: 200, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRestoreItemBackup([backupKey: 'rm-rule_400_x', confirm: true])
+
+        then:
+        result.success == false
+        result.error.contains('400')
+        result.note.contains('No replacement')
+        mutations.isEmpty()
+
+        where:
+        inventoryCase        | inventory
+        'existing target'    | '{"apps":[{"data":{"id":21},"children":[{"data":{"id":400}}]}]}'
+        'nested target'      | '{"apps":[{"children":[{"data":{"id":21},"children":[{"data":{"id":400}}]}]}]}'
+        'empty response'     | ''
+        'invalid JSON'       | 'not JSON'
+        'missing apps'       | '{}'
+        'non-list apps'      | '{"apps":{}}'
+        'malformed node'     | '{"apps":[{"data":{"id":21},"children":[null]}]}'
+        'missing node id'    | '{"apps":[{"data":{"id":21},"children":[{"data":{"name":"unknown"}}]}]}'
+        'invalid node id'    | '{"apps":[{"data":{"id":21},"children":[{"data":{"id":"unknown"}}]}]}'
+        'non-list children'  | '{"apps":[{"data":{"id":21},"children":{}}]}'
+    }
+
+    @Unroll
+    def "hub_restore_backup recreates a deleted rule with a fresh id (structuralContainer=#structuralContainer)"() {
         given:
         enableWrite()
         def snapshot = [
@@ -1458,7 +1572,9 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                               appLabel: "gone-rule", timestamp: 1000, sourceLength: snapshotBytes.length]
         ]
         script.metaClass.downloadHubFile = { String fn -> snapshotBytes }
-        hubGet.register('/hub2/appsList') { params -> appsListJson(21) }
+        hubGet.register('/hub2/appsList') { params ->
+            structuralContainer ? JsonOutput.toJson([apps: [[children: new JsonSlurper().parseText(appsListJson(21)).apps]]]) : appsListJson(21)
+        }
         hubGet.register('/installedapp/configure/json/400') { params ->
             throw new RuntimeException("404 — rule gone")
         }
@@ -1482,6 +1598,9 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.recreated == true
         result.ruleId == 401
         result.originalRuleId == 400
+
+        where:
+        structuralContainer << [false, true]
     }
 
     def "hub_restore_backup uses rule_machine default when snapshot has no appType field (legacy snapshot)"() {
@@ -2220,7 +2339,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                      it.body?.any { k, v -> k?.toString()?.startsWith("settings[actSubType.") && v == "getIfThen" } }
 
         and: "(deferral) the rule is flagged predClearPending so the next addAction runs the clear just-in-time"
-        atomicStateMap.predClearPending?.get("100") == true
+        atomicStateMap.predClearPending?.get("100") instanceof String
+        !atomicStateMap.predClearPending.get("100").isEmpty()
 
         and: "no actionCancel / actionDone here -- the ghost slot is never opened during the RE build"
         !posts.any { it.path == "/installedapp/btn" && it.body?.name in ["actionCancel", "actionDone"] }
@@ -2651,12 +2771,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         atomicStateMap.predClearPending?.get("100") == true
     }
 
-    def "replaceRequiredExpression restore drops the deferred predCapabs-clear flag (null-backup early return)"() {
-        // D. _rmRestoreCommittedREFromBackup rolls back a failed new-RE build, so it drops any
-        // predClearPending the failed build flagged (lib ~10641, at the top before the fileName check):
-        // the restored rule's predCapabs comes from a clean backup, and a leftover flag would fire a
-        // wasted ghost clear on the rule's next addAction. The null-backup early-return path
-        // (fileName == null) reaches the drop and needs no hub stubs.
+    def "replaceRequiredExpression restore preserves the deferred predCapabs-clear flag when no backup exists"() {
+        // A rollback that cannot restore anything must keep its recovery intent.
         given:
         enableWrite()
         atomicStateMap.predClearPending = ["100": true]
@@ -2667,8 +2783,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "the restore reports the RE was NOT restored (no backup to restore from)"
         result.requiredExpressionRestored == false
 
-        and: "the deferred predCapabs-clear flag is dropped -- the rolled-back build's flag is cleared"
-        !atomicStateMap.predClearPending?.get("100")
+        and: "the deferred clear remains available for a later recovery attempt"
+        atomicStateMap.predClearPending?.get("100") == true
     }
 
     def "toolDeleteNativeApp force-delete drops the deferred predCapabs-clear flag"() {
@@ -5773,10 +5889,13 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
         and: "the refusal rides on the addAction patch entry as the tailored steer, NOT the generic picker miss"
         // The distinguishing invariant of the patches path vs the dispatcher path: the reject is
-        // reported on the per-op entry and top-level patchErr stays null. Pinning it here catches a
-        // regression that reroutes the reject through the outer catch (which would set result.error,
-        // drop addPatch.error, and still pass success:false + partial:true -- a false green).
-        result.error == null
+        // reported on the per-op entry, and the fail-closed stop names that entry in the top-level
+        // error. A regression that reroutes the reject through the outer catch would drop
+        // addPatch.error and bulkStoppedAfter and still pass success:false + partial:true.
+        result.bulkStoppedAfter == "patches[0]"
+        result.finalisationNotAttempted == true
+        result.error?.startsWith("Stopped after patches[0] failed: 'Lock codes'")
+        !result.error?.contains("..")
         def addPatch = (result.patches as List).find { it instanceof Map && it.op == "addAction" }
         addPatch != null
         addPatch.success == false
@@ -6428,23 +6547,27 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
 
-        when: "patches contains addTriggers with one valid + one bogus-id spec"
+        when: "patches contains addTriggers with one bogus-id spec followed by one valid spec"
         def result = script.toolSetRule([
             appId: 100,
             patches: [[addTriggers: [
-                [capability: "Switch", deviceIds: [8], state: "on"],
-                [capability: "Switch", deviceIds: [99999], state: "on"]
+                [capability: "Switch", deviceIds: [99999], state: "on"],
+                [capability: "Switch", deviceIds: [8], state: "on"]
             ]]],
             confirm: true
         ])
 
-        then: "outer patches[0].success is FALSE because one inner item failed"
+        then: "outer patches[0].success is FALSE because its first inner item failed"
         result.patches.size() == 1
         result.patches[0].op == "addTriggers"
         result.patches[0].success == false
         result.patches[0].results.size() == 2
-        result.patches[0].results[1].success == false
-        result.patches[0].results[1].error?.contains("99999")
+        result.patches[0].results[0].success == false
+        result.patches[0].results[0].error?.contains("99999")
+
+        and: "the inner stop leaves the valid item unattempted and names the inner position"
+        result.patches[0].results[1].notAttempted == true
+        result.bulkStoppedAfter == "patches[0].addTriggers[0]"
 
         and: "the user-visible result.success is also false"
         result.success == false
@@ -6471,36 +6594,44 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
 
-        when: 'batch with addTrigger, addAction, addRequiredExpression, addLocalVariable, bogusOp'
-        def result = script.toolSetRule([
-            appId: 100,
-            patches: [
-                [addTrigger: [capability: "Switch", deviceIds: [8], state: "on"]],
-                [addAction: [action: "delayedAction", actions: [[action: "deviceControl",
-                    capability: "Switch", deviceIds: [8], command: "on"]],
-                    delay: [value: 1, unit: "Seconds"]]],
-                // 'conditions' (not 'exprs') is the required field name in _rmAddRequiredExpression
-                [addRequiredExpression: [conditions: [
-                    [capability: "Switch", deviceIds: [8], state: "on"]
-                ]]],
-                [addLocalVariable: [name: "myVar", type: "Number", value: "42"]],
-                [bogusOp: "should not be recognized"]
-            ],
-            confirm: true
-        ])
+        when: 'each op kind runs as its own single-op batch (a failed op stops a batch, so later ops would not be dispatched)'
+        def specs = [
+            [addTrigger: [capability: "Switch", deviceIds: [8], state: "on"]],
+            [addAction: [action: "delayedAction", actions: [[action: "deviceControl",
+                capability: "Switch", deviceIds: [8], command: "on"]],
+                delay: [value: 1, unit: "Seconds"]]],
+            // 'conditions' (not 'exprs') is the required field name in _rmAddRequiredExpression
+            [addRequiredExpression: [conditions: [
+                [capability: "Switch", deviceIds: [8], state: "on"]
+            ]]],
+            [addLocalVariable: [name: "myVar", type: "Number", value: "42"]],
+            [bogusOp: "should not be recognized"]
+        ]
+        def results = specs.collect { spec -> script.toolSetRule([appId: 100, patches: [spec], confirm: true]) }
 
         then: 'each op is dispatched to its handler (op key present); bogusOp surfaces the unrecognized-key error'
-        result.patches.size() == 5
-        result.patches[0].op == "addTrigger"
-        result.patches[1].op == "addAction"
+        results.every { it.patches.size() == 1 }
+        results[0].patches[0].op == "addTrigger"
+        results[1].patches[0].op == "addAction"
         // addRequiredExpression reached its handler (not rejected as unrecognized).
         // Handler may fail on hub stubs (complex wizard) but must NOT throw the
         // "conditions is required" IAE that the old wrong field name 'exprs' caused.
-        result.patches[2].op == "addRequiredExpression"
-        !result.patches[2].error?.contains("conditions is required")
-        result.patches[3].op == "addLocalVariable"
-        result.patches[4].success == false
-        result.patches[4].error?.contains("no recognized operation key")
+        results[2].patches[0].op == "addRequiredExpression"
+        !results[2].patches[0].error?.contains("conditions is required")
+        results[3].patches[0].op == "addLocalVariable"
+        results[4].patches[0].success == false
+        results[4].patches[0].error?.contains("no recognized operation key")
+
+        when: 'a failed op precedes the others in one batch'
+        def batch = script.toolSetRule([appId: 100, patches: specs, confirm: true])
+
+        then: 'the ops after the stop keep their op keys and are reported notAttempted, never dispatched'
+        batch.patches.size() == 5
+        batch.patches[0].op == "addTrigger"
+        batch.patches[0].success == false
+        batch.bulkStoppedAfter == "patches[0]"
+        (1..4).every { batch.patches[it].notAttempted == true }
+        batch.patches[1..4]*.op == ["addAction", "addRequiredExpression", "addLocalVariable", "bogusOp"]
     }
 
     // ---------- structured-shortcut coverage (addLocalVariable + related) ----------
@@ -7035,11 +7166,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         } == 0
     }
 
-    // S2-fullform-hub-400-surfaces-as-error: a >=400 from the full-form submit
-    // throws and surfaces as success:false with the status + body preview in the
-    // error, and is NOT promoted to the asyncCommitLikely envelope -- a rejected
-    // submit committed nothing, so it must not read as a delayed/partial success.
-    def "clearActions hub-400 on the full-form submit surfaces success:false (not asyncCommitLikely)"() {
+    @Unroll
+    def "clearActions failed full-form submit preserves uncertainty (status=#rejectionStatus recoveryFails=#recoveryFails)"() {
         given:
         enableWrite()
         def selectActionsSchema = [
@@ -7061,11 +7189,14 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             statusJson(100, [[name: "actType.1", value: "switchActs"]])
         }
         script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def cancelAttempts = 0
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
-            // The trashActs full-form submit is rejected by the hub (e.g. stale
-            // version token). Other POSTs (the cancelTrash hard-fail backout) succeed.
             if (path == "/installedapp/update/json" && body?.containsKey("settings[trashActs]")) {
-                return [status: 400, location: null, data: '{"error":"stale version token"}']
+                return [status: rejectionStatus, location: null, data: '{"error":"stale version token"}']
+            }
+            if (path == "/installedapp/btn" && body?.name == "cancelTrash") {
+                cancelAttempts++
+                if (recoveryFails) throw new IOException('cancelTrash unavailable')
             }
             [status: 200, location: null, data: '']
         }
@@ -7079,11 +7210,25 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.stage == null
 
         and: "the error surfaces the rejecting status and the truncated body preview"
-        result.error?.contains("status=400")
+        result.error?.contains("status=${rejectionStatus}")
         result.error?.contains("stale version token")
+        result.error?.contains("outcome has not been verified")
+        result.error?.contains("best-effort")
+        result.error?.contains("hub_get_app_config(appId=100)")
+        !result.error?.contains("nothing was committed")
+        !result.error?.contains("automatically via cancelTrash")
+        !result.error?.contains("Do NOT treat this as a partial delete")
+        cancelAttempts >= 1
 
         and: "the internal marker is not leaked into the error"
         !result.error?.contains("[asyncCommitLikely]")
+
+        where:
+        rejectionStatus | recoveryFails
+        400             | false
+        400             | true
+        500             | false
+        500             | true
     }
 
     // S2-fullform-version-token-absent: when the selectActions configPage carries
@@ -8050,7 +8195,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
     }
 
-    def "replaceActions atomically clears then bulk-adds, rolling per-item failures into addedResults"() {
+    def "replaceActions atomically clears then bulk-adds, stopping at the first failed item"() {
         given:
         enableWrite()
         def selectActionsSchema = [
@@ -8076,6 +8221,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
         hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
         hubGet.register('/device/fullJson/99999') { params -> "" }
+        def updateRuleClicks = 0
         script.metaClass.uploadHubFile = { String fn, byte[] b -> }
         script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
             // The trashActs write is what semantically clears the actions.
@@ -8084,6 +8230,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             if (path == "/installedapp/update/json" && body?.containsKey("settings[trashActs]")) {
                 cleared = true
             }
+            if (path == "/installedapp/btn" && (body?.name == "updateRule" || body?.get("settings[updateRule]") == "clicked")) updateRuleClicks++
             [status: 200, location: null, data: '']
         }
 
@@ -8091,8 +8238,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def result = script.toolSetRule([
             appId: 100,
             replaceActions: [
-                [capability: "switch", action: "off", deviceIds: [8]],
-                [capability: "switch", action: "off", deviceIds: [99999]]
+                [capability: "switch", action: "off", deviceIds: [99999]],
+                [capability: "switch", action: "off", deviceIds: [8]]
             ],
             confirm: true
         ])
@@ -8102,9 +8249,17 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.removedIndices?.size() == 1
         result.addedActions?.size() == 2
 
-        and: "the bogus-id sub-spec fails inline rather than aborting the batch"
-        def failedItem = result.addedActions.find { it.success == false && it.error?.toString()?.contains("99999") }
-        failedItem != null
+        and: "the bogus-id sub-spec fails inline and the batch stops there (fail-closed): later items are notAttempted"
+        result.addedActions[0].success == false
+        result.addedActions[0].error?.toString()?.contains("99999")
+        result.addedActions[1].notAttempted == true
+
+        and: "finalisation is not attempted after the failure"
+        updateRuleClicks == 0
+        result.success == false
+        result.partial == true
+        result.finalisationNotAttempted == true
+        result.bulkStoppedAfter == "replaceActions[0]"
     }
 
     // ---------- addActions bulk shortcut ----------
@@ -8133,6 +8288,10 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             posts << [path: path, body: body]
             [status: 200, location: null, data: '']
         }
+        def addCalls = []
+        // Clean items keep this spec on the trailing-click contract; partial propagation is owned by
+        // "bulk addActions: inner-only partial stops before finalisation and emits the fail-closed repairHint".
+        script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null -> addCalls << spec; [success: true] }
 
         when:
         def result = script.toolSetRule([
@@ -8147,13 +8306,14 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
         then: "result carries actions list with 3 items and overall success"
         result.actions?.size() == 3
+        addCalls.size() == 3
 
         and: "updateRule fires exactly once (not once per action)"
         def updateRuleClicks = posts.count { it.path == "/installedapp/btn" && it.body?.name == "updateRule" }
         updateRuleClicks == 1
     }
 
-    def "addActions partial failure: bogus deviceId fails inline, other specs succeed"() {
+    def "addActions partial failure: bogus deviceId fails inline and later specs are notAttempted"() {
         given:
         enableWrite()
         hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
@@ -8173,8 +8333,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def result = script.toolSetRule([
             appId: 100,
             addActions: [
-                [capability: "switch", action: "on", deviceIds: [8]],
-                [capability: "switch", action: "on", deviceIds: [99999]]
+                [capability: "switch", action: "on", deviceIds: [99999]],
+                [capability: "switch", action: "on", deviceIds: [8]]
             ],
             confirm: true
         ])
@@ -8182,10 +8342,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "overall success is false because one sub-spec failed"
         result.success == false
 
-        and: "actions list has 2 items: first succeeds, second carries the error"
+        and: "actions list has 2 items: the first carries the error, the second is never attempted (fail-closed)"
         result.actions?.size() == 2
-        result.actions[1].success == false
-        result.actions[1].error?.contains("99999")
+        result.actions[0].success == false
+        result.actions[0].error?.contains("99999")
+        result.actions[1].notAttempted == true
+        result.actions[1].error?.contains("addActions[0]")
     }
 
     def "addActions mixed-type path: switch and log specs in one call"() {
@@ -10739,8 +10901,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def result = script.toolSetRule([
             appId: 100,
             addTriggers: [
-                [capability: "Switch", deviceIds: [8], state: "on"],
-                [capability: "Switch", deviceIds: [99999], state: "on"]
+                [capability: "Switch", deviceIds: [99999], state: "on"],
+                [capability: "Switch", deviceIds: [8], state: "on"]
             ],
             confirm: true
         ])
@@ -10753,6 +10915,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         def bogusEntry = triggers.find { it?.error?.toString()?.contains("99999") }
         bogusEntry != null
         bogusEntry.success == false
+        triggers[1].notAttempted == true
 
         and: "the user-visible success rolls down to false because one inner item failed"
         result.success == false || result.partial == true
@@ -13090,6 +13253,113 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "full success -- API wrote at least one setting AND trigger row exists"
         result.success == true
         result.partial == false
+    }
+
+    // The clean trigger-loop continuation: a successful first trigger followed by a spent budget hands back
+    // exactly the unrun triggers and every action, with no stop markers. Hub fixtures stand in for
+    // _rmAddTrigger, which is private and cannot be stubbed.
+    def "bulk addTriggers: a clean first trigger then a spent budget hands back the remaining triggers and all actions"() {
+        given:
+        enableWrite()
+        def fetchSeq = 0
+        def clicks = []
+        def actionCalls = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/btn" && body["settings[updateRule]"] == "clicked") clicks << "updateRule"
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            fetchSeq++
+            selectTriggersSchemaJson(100, fetchSeq)
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> mainPageJson(100, "r", true) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validRuleIds = null ->
+            actionCalls << spec; [success: true]
+        }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+        def triggers = [
+            [capability: "Switch", deviceIds: [8], state: "on"],
+            [capability: "Switch", deviceIds: [8], state: "off"],
+            [capability: "Motion", deviceIds: [8], state: "active"]
+        ]
+        def actions = [
+            [capability: "switch", action: "on", deviceIds: [8]],
+            [capability: "switch", action: "off", deviceIds: [8]]
+        ]
+
+        when:
+        def result = script.toolSetRule([appId: 100, confirm: true, __reqT0: 2000L,
+            addTriggers: triggers, addActions: actions])
+
+        then: "one clean trigger committed and the request paused"
+        result.status == "in_progress"
+        result.success == true
+        result.triggers.size() == 1
+        result.triggers[0].success == true
+        result.triggersCommitted == 1
+        actionCalls.isEmpty()
+
+        and: "the remainder is exactly the unrun triggers and every action"
+        result.addTriggersRemaining == triggers.subList(1, 3)
+        result.addActionsRemaining == actions
+
+        and: "a clean pause carries no stop markers and defers updateRule"
+        !result.containsKey("bulkStoppedAfter")
+        !result.containsKey("finalisationNotAttempted")
+        !clicks.contains("updateRule")
+        !JsonOutput.toJson(result).contains("__reqT0")
+    }
+
+    def "patches addTriggers: a clean first inner trigger then a spent budget rewrites the op into patchesRemaining"() {
+        given:
+        enableWrite()
+        def fetchSeq = 0
+        def clicks = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/btn" && body["settings[updateRule]"] == "clicked") clicks << "updateRule"
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectTriggers') { params ->
+            fetchSeq++
+            selectTriggersSchemaJson(100, fetchSeq)
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> mainPageJson(100, "r", true) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+
+        when:
+        def result = script.toolSetRule([appId: 100, confirm: true, __reqT0: 2000L, patches: [
+            [addTriggers: [
+                [capability: "Switch", deviceIds: [8], state: "on"],
+                [capability: "Switch", deviceIds: [8], state: "off"],
+                [capability: "Motion", deviceIds: [8], state: "active"]
+            ]],
+            [addLocalVariable: [name: "later", type: "Number", value: "1"]]
+        ]])
+
+        then: "the first inner trigger committed and the op paused mid-list"
+        result.status == "in_progress"
+        def op = result.patchResults.find { it.op == "addTriggers" }
+        op.results.size() == 1
+        op.results[0].success == true
+        op.partial == true
+
+        and: "patchesRemaining leads with the same op cut to its unrun triggers, then the later op"
+        result.patchesRemaining.size() == 2
+        result.patchesRemaining[0].addTriggers*.state == ["off", "active"]
+        result.patchesRemaining[1].addLocalVariable.name == "later"
+
+        and: "no stop markers, and updateRule is deferred"
+        !result.containsKey("bulkStoppedAfter")
+        !clicks.contains("updateRule")
+        !JsonOutput.toJson(result).contains("__reqT0")
     }
 
     def "addTrigger returns success=true partial=true when trigger does not bake (triggerNotBaked)"() {
@@ -24742,7 +25012,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule create via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -24813,7 +25083,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     // ---------- hub_set_rule dispatch ----------
 
     @spock.lang.Unroll
-    def "hub_set_rule via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
+    def "hub_set_rule update via dispatch returns isError validation result envelope when confirm is missing (useGateways=#useGateways)"() {
         given:
         settingsMap.useGateways = useGateways
         enableWrite()
@@ -29243,7 +29513,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         ])
     }
 
-    def "addAction setLocalVariable constant form validates against locals and writes getSetVariable fields"() {
+    @spock.lang.Unroll
+    def "addAction setLocalVariable #localName writes constant #constantValue through getSetVariable"() {
         given:
         enableWrite()
         def fetchSeq = 0
@@ -29256,7 +29527,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
         // A hub global named "counter" exists too -- proving setLocalVariable does NOT
-        // consult getAllGlobalVars: the local "loopCount" is the only valid target here.
+        // consult getAllGlobalVars: only the local name is a valid target here.
         script.metaClass.getAllGlobalVars = { -> ["counter": [name: "counter", type: "integer", value: 0]] }
 
         hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
@@ -29266,28 +29537,36 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
         hubGet.register('/installedapp/configure/json/100/doActPage') { params ->
             modeActsDoActPageJson(100, [
-                [name: "xVarV.1", type: "enum", options: ["loopCount": "loopCount"]],
+                [name: "xVarV.1", type: "enum", options: [(localName): localName]],
                 [name: "numOp.1", type: "enum", options: ["number": "Number"]],
                 [name: "valNumber.1", type: "number"]
             ], { ++fetchSeq })
         }
         hubGet.register('/installedapp/configure/json/100/mainPage') { params -> ruleConfigJson(100, "r", []) }
-        hubGet.register('/installedapp/statusJson/100') { params -> statusJsonWithLocals(100, [loopCount: [type: "integer", value: 0]]) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJsonWithLocals(100, [(localName): [type: "integer", value: 0]]) }
 
         when:
         def result = script.toolSetRule([
             appId: 100,
-            addAction: [capability: "setLocalVariable", variable: "loopCount", value: 42],
+            addAction: [capability: "setLocalVariable", variable: localName, value: constantValue],
             confirm: true
         ])
 
         then: "routes to the same getSetVariable subtype + writes the variable-path fields"
         writtenFields["actType.1"] == "modeActs"
         writtenFields["actSubType.1"] == "getSetVariable"
-        writtenFields["xVarV.1"] == "loopCount"
+        writtenFields["xVarV.1"] == localName
         writtenFields["numOp.1"] == "number"
-        writtenFields["valNumber.1"].toString() == "42"
+        writtenFields["valNumber.1"].toString() == constantValue.toString()
         result.success == true
+
+        where:
+        localName    | constantValue
+        'loopCount'  | 42
+        'fields'     | 0
+        'class'      | 0
+        'metaClass'  | 0
+        'properties' | 0
     }
 
     def "addAction setLocalVariable rejects a target that is not a local variable (and names locals, not globals)"() {
@@ -34786,6 +35065,153 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         none == null
     }
 
+    // ---- Fail-closed bulk mutation: once an item fails, nothing further is written, so a failed block
+    // opener can never leave its body committed as unconditional actions.
+
+    private List stubCreateShell(Integer newId) {
+        hubGet.register('/hub2/appsList') { params -> appsListJson(21) }
+        hubGet.register("/installedapp/configure/json/${newId}".toString()) { params -> ruleConfigJson(newId, "", [[name: "origLabel", type: "text"]]) }
+        hubGet.register("/installedapp/statusJson/${newId}".toString()) { params -> statusJson(newId) }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, Integer t = 30 ->
+            [status: 302, location: "/installedapp/configure/${newId}".toString(), data: ""]
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        return posts
+    }
+
+    def "create fail-closed: a failed trigger stops later triggers, the Required Expression, actions and finalisation"() {
+        given:
+        enableWrite()
+        def posts = stubCreateShell(974)
+
+        when:
+        def result = script.toolSetRule([name: "fail-closed-create",
+            addTriggers: ["not a map", [capability: "Switch", deviceIds: [8], state: "on"]],
+            addRequiredExpression: [conditions: [[capability: "Switch", deviceIds: [8], state: "on"]]],
+            addActions: [[capability: "switch", action: "on", deviceIds: [8]]],
+            confirm: true])
+
+        then: "every later piece is reported notAttempted"
+        result.success == false
+        result.partial == true
+        result.triggers[0].success == false
+        result.triggers[1].notAttempted == true
+        result.requiredExpression?.notAttempted == true
+        result.actions[0].notAttempted == true
+        result.bulkStoppedAfter == "triggers[0]"
+        result.finalisationNotAttempted == true
+
+        and: "after the label commit nothing further is posted: no wizard writes, no updateRule, no mainPage Done"
+        def labelCommit = posts.findIndexOf { it.path == "/installedapp/btn" && it.body?.name == "updateRule" }
+        labelCommit >= 0
+        labelCommit == posts.size() - 1
+    }
+
+    def "create fail-closed: a genuinely partial action stops later actions and finalisation"() {
+        given:
+        enableWrite()
+        def posts = stubCreateShell(974)
+        def addCalls = []
+        script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null ->
+            addCalls << spec
+            [success: true, partial: true, settingsSkipped: [[key: "switch.1", reason: "silent_rejection"]]]
+        }
+
+        when:
+        def result = script.toolSetRule([name: "partial-create",
+            addActions: [[capability: "switch", action: "on", deviceIds: [8]], [capability: "switch", action: "off", deviceIds: [8]]],
+            confirm: true])
+
+        then:
+        addCalls.size() == 1
+        result.success == false
+        result.partial == true
+        result.actions[1].notAttempted == true
+        result.bulkStoppedAfter == "actions[0]"
+        result.finalisationNotAttempted == true
+
+        and: "no trailing updateRule or mainPage Done after the label commit"
+        posts.count { it.path == "/installedapp/btn" && it.body?.name == "updateRule" } == 1
+        posts.findIndexOf { it.path == "/installedapp/btn" && it.body?.name == "updateRule" } == posts.size() - 1
+    }
+
+    def "addActions fail-closed: an invalid item shape stops the batch the same way"() {
+        given:
+        enableWrite()
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addActions: ["not a map", [capability: "switch", action: "on", deviceIds: [8]]],
+            confirm: true])
+
+        then:
+        result.success == false
+        result.actions[0].success == false
+        result.actions[1].notAttempted == true
+        !posts.any { it.path == "/installedapp/btn" && it.body?.name == "actionDone" }
+    }
+
+    def "addTriggers fail-closed: a failed trigger stops the remaining triggers and every action"() {
+        given:
+        enableWrite()
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+
+        when: "the first trigger is not a map, then a trigger and an action follow"
+        def result = script.toolSetRule([appId: 100,
+            addTriggers: ["not a map", [capability: "Switch", deviceIds: [8], state: "on"]],
+            addActions: [[capability: "switch", action: "on", deviceIds: [8]]],
+            confirm: true])
+
+        then:
+        result.success == false
+        result.triggers[0].success == false
+        result.triggers[1].notAttempted == true
+        result.actions[0].notAttempted == true
+        !posts.any { it.path == "/installedapp/btn" && (it.body?.name == "hasAll" || it.body?.name == "actionDone") }
+    }
+
+    def "addActions fail-closed: a time-budget pause can never resume a deliberately skipped tail"() {
+        given: "the budget is reported exhausted after the first item"
+        enableWrite()
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> [status: 200, location: null, data: ''] }
+        script.metaClass._resumableBudgetExceeded = { Long t0 -> true }
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addActions: ["not a map", [capability: "switch", action: "on", deviceIds: [8]], [capability: "switch", action: "off", deviceIds: [8]]],
+            confirm: true])
+
+        then: "no in_progress envelope offers the skipped items for resumption"
+        result.status != "in_progress"
+        !result.containsKey("addActionsRemaining")
+        result.actions[1].notAttempted == true
+        result.actions[2].notAttempted == true
+    }
+
     def "addAction ifThen: Between two times reveals start/end chain"() {
         // Between two times on doActPage: rCapab reveal chain uses firmware field names
         // starting<N> (type enum), startingA<N> (ISO datetime with hub-local TZ offset),
@@ -39621,9 +40047,14 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.triggers.size() == 1
         result.triggers[0].error.contains("addTriggers[0]")
         result.actions.size() == 1
-        result.actions[0].error.contains("addActions[0]")
-        clicks == ["updateRule"]
-        result.note.contains("Bulk update committed")
+        result.actions[0].notAttempted == true
+        result.actions[0].error.contains("addTriggers[0]")
+
+        and: "the failed trigger blocks finalisation"
+        clicks == []
+        result.finalisationNotAttempted == true
+        result.bulkStoppedAfter == "addTriggers[0]"
+        result.note.contains("finalisation not attempted")
     }
 
     // ---------- bulk addTriggers/addActions trailing-updateRule failure surfaces dedicated slots ----------
@@ -39806,17 +40237,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     }
 
     @spock.lang.Unroll
-    def "hub_set_rule bulk #shape per-item partial with updateRule SUCCESS still flips partial:true (W7/W11)"() {
-        // W7: pins the partial OR-branch (`itemsPartial || updateRuleFailed`) on the
-        // SUCCESS path of the trailing updateRule. Sibling-coverage gap: the failure
-        // @Unroll above always flips partial:true via updateRuleFailed; the success
-        // @Unroll above never has per-item partial. This spec exercises the cross
-        // case: a per-item add returns success=false (one bogus deviceId) while the
-        // trailing updateRule fires successfully. The OR-branch must still flip
-        // result.partial=true so callers see the per-item failure was not papered
-        // over by the otherwise-clean trailing click. A regression that flips the
-        // OR to AND (`itemsPartial && updateRuleFailed`) would silently report
-        // partial=false here.
+    def "hub_set_rule bulk #shape per-item failure blocks the trailing updateRule and flips partial:true (W7/W11)"() {
+        // W7: a per-item add returns success=false (one bogus deviceId). Fail-closed
+        // processing stops the batch there, so the trailing updateRule is never
+        // attempted: result.partial must be true, finalisationNotAttempted set, and
+        // updateRuleFailed stays falsy because no click was made.
         //
         // W11: the original W7 spec covered addTriggers ONLY. Convert to @Unroll
         // matching the failure-pin's 3 shapes (triggers-only, actions-only, both)
@@ -39862,15 +40287,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         when:
         def result = script.toolSetRule(args + [appId: 100, confirm: true])
 
-        then: "trailing updateRule click succeeded -- precondition"
-        // Without this, an earlier-throw regression would silently make the rest
-        // vacuous. Pins the trailing click reached and committed cleanly.
-        updateRuleClicked == true
+        then: "fail-closed: the trailing updateRule is never fired after a failed or partial item"
+        updateRuleClicked == false
+        result.finalisationNotAttempted == true
+        result.bulkStoppedAfter?.startsWith("add")
 
-        and: "updateRuleFailed is falsy on the success path"
-        // Load-bearing discriminator: the trailing-updateRule branch is SUCCESS;
-        // a regression initializing updateRuleFailed=true at default would mask
-        // the OR-branch contract being asserted below.
+        and: "updateRuleFailed is falsy because no click was attempted"
         result.updateRuleFailed != true
         result.subscriptionsNotLive != true
 
@@ -41109,17 +41531,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.patches[0]?.op == "addRequiredExpression" || result.patches[0]?.success != false
     }
 
-    def "hub_set_rule patches with inner addRequiredExpression returning partial:true -- outer envelope partial:true even when trailing updateRule succeeds (B1 inner-op detection)"() {
-        // B1 inner-op-partial detection pin (C-W3). The B1 fix adds the clause
-        // `patchResults.any { it instanceof Map && (it.partial == true) }` to the
-        // outer patches envelope's partial formula. Existing patches specs cover
-        // OUTER failure modes (trailing-updateRule rejection, op-level error,
-        // op-count mismatch) but not the inner-op-partial case where every op
-        // landed AND trailing updateRule succeeded BUT one inner op self-reported
-        // partial:true (e.g. addRequiredExpression with compareToDevice fallback).
-        // A regression that drops the new clause from the OR would leave
-        // result.partial == false even with the inner partial set, so callers
-        // would silently treat the response as fully baked.
+    def "hub_set_rule patches with inner addRequiredExpression returning partial:true stops fail-closed before the trailing updateRule"() {
+        // An op that self-reports partial:true (here addRequiredExpression with a degraded
+        // compareToDevice offset) stops the batch like a failed one: the trailing updateRule
+        // does not fire, and the outer envelope must still report partial rather than a clean
+        // success.
         //
         // Fixture drives the inner partial via the compareToDevice
         // offset_field_not_revealed path: STPage reveals relDevice_1 after isDev_1
@@ -41212,38 +41628,19 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "trailing updateRule click happened -- precondition (this isn't an outer-failure case)"
-        // Without this, an early throw OR a regression short-circuiting before the
-        // trailing click would make the rest vacuous. Pins that we are testing the
-        // inner-partial-with-trailing-success matrix cell.
-        updateRuleClicked == true
+        then: "the partial op stopped the batch before finalisation"
+        updateRuleClicked == false
+        result.bulkStoppedAfter == "patches[0]"
+        result.finalisationNotAttempted == true
+        result.error?.startsWith("Stopped after patches[0] reported partial")
 
-        and: "overall success not false (every patch op landed)"
-        // Load-bearing discriminator: B1's clause is specifically about partial
-        // (orthogonal to success). The outer success path here is the happy one --
-        // the inner addRE returned `success: true, partial: true` (a dropped offset is
-        // a partial-but-success contract).
-        result.success != false
-
-        and: "outer updateRuleFailed is falsy (this isn't an outer-failure case)"
-        // Negative discriminator paired with the precondition: pins that partial=true
-        // below is coming from the B1 inner-op clause, NOT from the updateRuleFailed
-        // OR-clause.
+        and: "the outer envelope reports the stop, not a baked success"
+        result.success == false
+        result.partial == true
         result.updateRuleFailed != true
         result.patchesNotLive != true
 
-        and: "outer partial is true (B1 inner-op clause: patchResults.any { ... partial == true })"
-        // Load-bearing discriminator (the C-W3 contract pin): with no outer failure
-        // and trailing updateRule success, the only way partial flips true is via the
-        // new B1 clause that surfaces the inner partial. A regression that drops the
-        // `patchResults.any { it instanceof Map && (it.partial == true) }` clause
-        // from the outer OR would leave result.partial == false here.
-        result.partial == true
-
-        and: "inner patches[0] also reports partial:true (sanity-check: inner DID report partial)"
-        // Sanity discriminator: without this, an inner regression that stops emitting
-        // partial=true would make the outer partial-pin above vacuously satisfied via
-        // some other source. Pins the inner is the source of truth.
+        and: "inner patches[0] is the partial source (sanity-check the fixture)"
         result.patches?.size() == 1
         result.patches[0]?.partial == true
     }
@@ -41743,6 +42140,13 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             wireModifyAddLeg(maCtl, [], 3)
         }
 
+        // A partial inner add now blocks finalisation, so the replaceActions row uses a clean inner add to
+        // reach the trailing click this spec pins. Partial propagation is owned by
+        // "action-mutation replaceActions: inner-only partial stops before finalisation and emits the fail-closed repairHint".
+        if (shape == "replaceActions") {
+            script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null -> [success: true] }
+        }
+
         when:
         def result = script.toolSetRule(args + [appId: 100, confirm: true])
 
@@ -41889,6 +42293,13 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
                     }
                 })
             wireModifyAddLeg(maCtl, [], 3)
+        }
+
+        // A partial inner add now blocks finalisation, so the replaceActions row uses a clean inner add to
+        // reach the trailing click this spec pins. Partial propagation is owned by
+        // "action-mutation replaceActions: inner-only partial stops before finalisation and emits the fail-closed repairHint".
+        if (shape == "replaceActions") {
+            script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null -> [success: true] }
         }
 
         when:
@@ -42065,7 +42476,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
 
     // ---------- replaceActions inner-partial OR-clause (sibling of the addedOk!=addedTotal arm) ----------
 
-    def "replaceActions: success:true + partial:true inner item still flips outer partial via OR-clause"() {
+    def "replaceActions: a success:true + partial:true inner item blocks finalisation (fail-closed)"() {
         // Pin the inner-partial OR-clause: `itemsPartial = ... addedOk != addedTotal
         // || addedResults.any { it.partial == true }`. The pre-existing
         // replaceActions partial spec covers the `addedOk != addedTotal` arm
@@ -42161,8 +42572,10 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "trailing updateRule click happened -- precondition (rules out earlier-throw vacuity)"
-        updateRuleClicked == true
+        then: "a genuine partial blocks the trailing updateRule"
+        updateRuleClicked == false
+        result.finalisationNotAttempted == true
+        result.bulkStoppedAfter == "replaceActions[0]"
 
         and: "inner row IS success-true + partial-true (the OR-clause's discriminating arm)"
         // Load-bearing precondition: this assertion fails if the fixture
@@ -42182,35 +42595,18 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         // (inner success:true => addedOk == addedTotal).
         result.partial == true
 
-        and: "outer success stays true (action structurally committed, partial+success co-exist)"
-        // The current contract is `success: (addedOk == addedTotal) && health.ok
-        // && !updateRuleFailed` -- inner partial alone does NOT flip success
-        // because the row IS committed (actType/actSubType written). partial is
-        // the orthogonal "needs repair" flag. A regression that ALSO flips
-        // success=false on inner-partial would change the contract and break
-        // existing callers that rely on success=true as "row exists, walk it
-        // back via repairHints". Pin the current behavior.
-        result.success == true
+        and: "outer success is false: the replacement is incomplete and was not finalised"
+        result.success == false
     }
 
-    // ---------- TN3 contract: inner-only partial fires a repairHint on the outer envelope ----------
+    // ---------- Partial added item: fail-closed stop and repairHint on the outer envelope ----------
 
-    def "action-mutation replaceActions: inner-only partial (updateRule clean) emits inner-partial repairHint"() {
-        // Pin the inner-only repairHints contract added in this round. Pre-fix:
-        // when itemsPartial flipped true but updateRuleFailed stayed false, the
-        // outer envelope returned partial:true + success:false + repairHints:[]
-        // -- the caller had to drill into addedActions[] to discover why. This
-        // is the same C2 antipattern the rest of this PR has been closing on
-        // the *NotLive flags.
-        //
-        // Contract: `itemsPartial && !updateRuleFailed` MUST append a
-        // discoverable repairHint naming addedActions[] as the next inspection
-        // point. The OR-clause spec above pins partial:true; this spec pins
-        // the repairHint that makes partial:true actionable.
+    def "action-mutation replaceActions: inner-only partial stops before finalisation and emits the fail-closed repairHint"() {
+        // A partial added item stops the replacement before the trailing updateRule, and the
+        // outer envelope must carry actionable repairHints rather than a bare partial:true.
         //
         // Drives partial via the same verification-fetch-failed path the
         // OR-clause spec uses (post-commit mainPage fetch throws).
-        // Both-ways pending (orchestrator).
         given:
         enableWrite()
         def updateRuleClicked = false
@@ -42277,21 +42673,18 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "preconditions: trailing updateRule click landed clean AND inner partial fired"
-        updateRuleClicked == true
+        then: "the inner partial blocks the trailing updateRule"
+        updateRuleClicked == false
         result.partial == true
         result.updateRuleFailed != true
+        result.finalisationNotAttempted == true
 
-        and: "outer repairHints includes the new inner-only hint (load-bearing discriminator)"
-        // Load-bearing: a regression that drops the inner-only branch would
-        // return repairHints:[] here even though partial:true and
-        // updateRuleFailed:false both hold. The hint substring is the
-        // distinguishing characteristic.
+        and: "outer repairHints names the fail-closed stop"
         def hints = (result.repairHints as List) ?: []
-        hints.any { it?.toString()?.contains("inner replaceActions items reported partial") }
+        hints.any { it?.toString()?.contains("Stopped fail-closed after replaceActions[0]") }
 
         and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        // The trailing updateRule click succeeded so the rejection hint MUST
+        // No trailing updateRule click was attempted, so the rejection hint MUST
         // stay absent. Without this assertion a regression that always-appends
         // the rejection hint (the pre-R4 C1 shape) would silently lint-green.
         !hints.any { it?.toString()?.contains("updateRule click was rejected") }
@@ -43111,23 +43504,16 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         silentRejectionCount >= 1
     }
 
-    // ---------- Bulk addTriggers/addActions inner-partial detection + inner-only repairHint ----------
+    // ---------- Bulk addTriggers/addActions inner-partial detection + fail-closed repairHint ----------
 
-    def "bulk addActions: inner-only partial (updateRule clean) emits inner-partial repairHint"() {
-        // Sibling of the action-mutation replaceActions inner-only spec. The bulk
-        // addTriggers/addActions dispatcher previously computed itemsPartial as a
-        // count-only comparison (trigOk/actOk vs size) -- an inner item returning
-        // {success:true, partial:true} inflated trigOk/actOk and the size-equality
-        // missed the inner-partial signal. Outer partial dropped to updateRuleFailed
-        // only, hiding the inner partial. Two-part fix:
-        //   1. itemsPartial OR-clauses `any { ... partial == true }` on both result lists
-        //   2. inner-only branch appends a discoverable repairHint (matches the C2
-        //      antipattern this PR has been closing on the *NotLive flags)
+    def "bulk addActions: inner-only partial stops before finalisation and emits the fail-closed repairHint"() {
+        // An item returning {success:true, partial:true} must count as partial, not as a clean
+        // success (a count-only success comparison would miss it), and it stops the batch
+        // before the trailing updateRule with an actionable repairHint.
         //
         // Drives partial via verificationFetchFailed: throw on the post-commit
         // mainPage fetch (after the inner _rmAddAction's actionDone click) so
-        // _rmAddAction returns {success:true, partial:true}. Trailing updateRule
-        // click then lands clean. Both-ways pending (orchestrator).
+        // _rmAddAction returns {success:true, partial:true}.
         given:
         enableWrite()
         def updateRuleClicked = false
@@ -43185,21 +43571,19 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             confirm: true
         ])
 
-        then: "preconditions: trailing updateRule click landed clean AND inner partial fired"
-        updateRuleClicked == true
+        then: "the inner partial blocks the trailing updateRule"
+        updateRuleClicked == false
         result.partial == true
+        result.success == false
         result.updateRuleFailed != true
+        result.finalisationNotAttempted == true
 
-        and: "outer repairHints includes the bulk inner-only hint (load-bearing discriminator)"
-        // Load-bearing: a regression that drops the inner-only branch OR drops the
-        // `any { ... partial == true }` clauses from itemsPartial would surface here:
-        // either repairHints stays [] (branch dropped) or partial silently goes false
-        // (itemsPartial clause dropped). The hint substring is the distinguisher.
+        and: "outer repairHints names the fail-closed stop"
         def hints = (result.repairHints as List) ?: []
-        hints.any { it?.toString()?.contains("One or more bulk trigger/action items reported partial") }
+        hints.any { it?.toString()?.contains("Stopped fail-closed after addActions[0]") }
 
         and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        // The trailing updateRule click succeeded so the rejection hint MUST stay
+        // No trailing updateRule click was attempted, so the rejection hint MUST stay
         // absent. Without this assertion a regression that always-appends the
         // rejection hint (pre-R4 C1 shape) would silently lint-green.
         !hints.any { it?.toString()?.contains("updateRule click was rejected") }
@@ -43212,17 +43596,12 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.actions[0]?.partial == true
     }
 
-    // ---------- Patches dispatcher inner-only repairHint (sibling of bulk + action-mutation) ----------
+    // ---------- Patches dispatcher: partial op stops the batch (sibling of bulk + action-mutation) ----------
 
-    def "patches[addRequiredExpression]: inner-only partial (updateRule clean) emits inner-partial repairHint"() {
-        // Sibling of the action-mutation and bulk inner-only repairHint specs.
-        // The patches dispatcher already bubbles inner-partial via the
-        // `patchResults.any { ... partial == true }` clause (B1/C-W3 contract);
-        // this spec pins the new inner-only repairHint branch that makes the
-        // outer partial:true actionable. Pre-fix the outer envelope returned
-        // partial:true + repairHints:[] when an inner op self-reported partial
-        // but the trailing updateRule click landed clean -- caller had to drill
-        // into patches[] to discover why.
+    def "patches[addRequiredExpression]: a partial op marks later ops notAttempted and emits the fail-closed repairHint"() {
+        // A partial op followed by another op: the later op is never dispatched, and the
+        // outer repairHints carry the fail-closed recovery guidance rather than the old
+        // inner-only partial hint.
         //
         // Drives partial via the compareToDevice offset_field_not_revealed path:
         // STPage reveals relDevice_1 after isDev_1 (device-relative RHS lands) but never
@@ -43303,38 +43682,35 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         when: "patches bundle with addRequiredExpression in compareToDevice offset-degraded path"
         def result = script.toolSetRule([
             appId: 100,
-            patches: [[addRequiredExpression: [conditions: [[
-                capability: "Temperature",
-                deviceIds: [8],
-                comparator: ">",
-                compareToDevice: [deviceId: 99, attribute: "temperature", offset: -2]
-            ]]]]],
+            patches: [
+                [addRequiredExpression: [conditions: [[
+                    capability: "Temperature",
+                    deviceIds: [8],
+                    comparator: ">",
+                    compareToDevice: [deviceId: 99, attribute: "temperature", offset: -2]
+                ]]]],
+                [addLocalVariable: [name: "neverAdded", type: "Number", value: "1"]]
+            ],
             confirm: true
         ])
 
-        then: "preconditions: trailing updateRule click landed clean AND inner partial fired"
-        updateRuleClicked == true
+        then: "preconditions: the partial op stopped the batch"
+        updateRuleClicked == false
         result.partial == true
         result.updateRuleFailed != true
-        result.patchesNotLive != true
+        result.bulkStoppedAfter == "patches[0]"
 
-        and: "outer repairHints includes the patches inner-only hint (load-bearing discriminator)"
-        // Load-bearing: a regression that drops the inner-only branch from the
-        // patches dispatcher would return repairHints:[] here even though
-        // partial:true and updateRuleFailed:false both hold. The hint substring
-        // is the distinguishing characteristic.
-        def hints = (result.repairHints as List) ?: []
-        hints.any { it?.toString()?.contains("One or more patch ops reported partial") }
-
-        and: "outer repairHints does NOT include the updateRule-rejected hint (cross-contract pin)"
-        !hints.any { it?.toString()?.contains("updateRule click was rejected") }
-
-        and: "inner patches[0] is the partial source (sanity-check the fixture)"
-        // Sanity discriminator: pins the inner is the source of truth -- a regression
-        // that stops emitting partial=true from the inner addRE would make the outer
-        // partial-pin above vacuously satisfied via some other source.
-        result.patches?.size() == 1
+        and: "the later op keeps its op key and is reported notAttempted"
+        result.patches?.size() == 2
         result.patches[0]?.partial == true
+        result.patches[1]?.op == "addLocalVariable"
+        result.patches[1]?.notAttempted == true
+
+        and: "outer repairHints carry the fail-closed guidance, not the updateRule-rejected hint"
+        def hints = (result.repairHints as List) ?: []
+        hints.any { it?.toString()?.contains("Stopped fail-closed after patches[0]") }
+        !hints.any { it?.toString()?.contains("updateRule click was rejected") }
+        !hints.any { it?.toString()?.contains("One or more patch ops reported partial") }
     }
 
     // ========================================================================
@@ -44126,6 +44502,95 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.requiredExpression?.expressionNotLive == true
         result.requiredExpression?.partial == true
         result.success == false
+    }
+
+    def "create fail-closed: a rejected Required Expression re-init blocks the actions and finalisation"() {
+        given:
+        enableWrite()
+        def fetchSeq = 0
+        def reWalkDone = false
+        def rejected = false
+        def postsAfterReject = []
+        def addCalls = []
+        script.metaClass._rmAddAction = { Integer id, Map spec, boolean batch = false, Set validIds = null -> addCalls << spec; [success: true] }
+        // _discoverParentAppId reads /hub2/appsList to find the RM parent (id 21).
+        hubGet.register('/hub2/appsList') { params -> appsListJson(21) }
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, Integer t = 30 ->
+            [status: 302, location: "/installedapp/configure/975", data: ""]
+        }
+        hubGet.register('/installedapp/configure/json/975') { params ->
+            ruleConfigJson(975, "", [[name: "origLabel", type: "text"]])
+        }
+        hubGet.register('/installedapp/statusJson/975') { params -> statusJson(975) }
+        hubGet.register('/installedapp/configure/json/975/mainPage') { params ->
+            JsonOutput.toJson([
+                app: [id: 975, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true,
+                      appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "mainPage", title: "Edit Rule", install: true, error: null,
+                             sections: [[title: "", input: [[name: "useST", type: "bool"]],
+                                         body: [[element: "paragraph", description: "IF S1 is on"]]]]],
+                settings: [:], childApps: []
+            ])
+        }
+        hubGet.register('/installedapp/configure/json/975/STPage') { params ->
+            fetchSeq++
+            stPageCondSchemaJson(975, fetchSeq)
+        }
+        hubGet.register('/installedapp/configure/json/975/selectActions') { params ->
+            ruleConfigJson(975, "r", [[name: "N", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/975/doActPage') { params ->
+            ruleConfigJson(975, "r", [
+                [name: "actType.1", type: "enum", options: ["condActs": "Conditional Actions"]],
+                [name: "actSubType.1", type: "enum", options: ["getIfThen": "IF Expression THEN"]],
+                [name: "actionCancel", type: "button"]
+            ])
+        }
+        hubGet.register('/device/fullJson/8') { params -> '{"id":"8","name":"S1"}' }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+
+        // The RE walk ends with the STPage Done back-nav (Step 4, _action_previous=Done); once that
+        // lands, the next updateRule btn click is the RE-block trailing one -- fail exactly it. (The
+        // ghost-ifThen clear is now DEFERRED to addAction, so its doActPage->selectActions nav no longer
+        // runs here to mark the boundary; the Done back-nav is the new last-nav-before-trailing-updateRule.)
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/update/json" && body?.currentPage == "STPage" &&
+                body?._action_previous == "Done") {
+                reWalkDone = true
+            }
+            if (rejected) postsAfterReject << [path: path, body: body]
+            if (reWalkDone && !rejected && path == "/installedapp/btn" && body?.name == "updateRule") {
+                rejected = true
+                throw new RuntimeException("hub rejected updateRule")
+            }
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script._createNativeAppShell([
+            appType: "rule_machine",
+            name: "BAT-create-RE-reject-then-actions",
+            requiredExpression: [conditions: [[capability: "Switch", deviceIds: [8], state: "on"]]],
+            actions: [[capability: "switch", action: "on", deviceIds: [8]]],
+            confirm: true
+        ])
+
+        then: "the rejected re-init was reached and the expression is reported not live"
+        rejected
+        result.expressionNotLive == true
+        result.requiredExpression?.expressionNotLive == true
+        result.partial == true
+        result.success == false
+
+        and: "the action is never attempted and finalisation is skipped"
+        addCalls.isEmpty()
+        result.actions[0].notAttempted == true
+        result.bulkStoppedAfter == "requiredExpression"
+        result.finalisationNotAttempted == true
+
+        and: "no selectActions Done, later updateRule, or mainPage Done follows the rejection"
+        !postsAfterReject.any { it.path == "/installedapp/btn" && it.body?.name == "updateRule" }
+        !postsAfterReject.any { it.body?._action_previous == "Done" }
     }
 
     def "hub_set_rule CREATE (no appId) loudly REJECTS every edit-only shortcut -- no silent-success on a dropped op"() {

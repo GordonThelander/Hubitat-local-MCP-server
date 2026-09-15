@@ -949,8 +949,10 @@ class HubitatMcpClient:
                 # a client-side hot loop while preserving one logical call.
                 time.sleep(state_only_delay)
                 state_only_delay = min(state_only_delay * 2, 0.25)
-        except BaseException:
+        except BaseException as exc:
             _op_ok = False
+            # Cleanup can make more calls before the runner sees this exception.
+            exc._mcp_failed_op = (op_key, time.monotonic() - _t0, False)
             raise
         finally:
             _dur = time.monotonic() - _t0
@@ -1800,10 +1802,9 @@ class TestRunner:
             "duration": duration,
         })
 
-    def _last_op_str(self) -> str:
-        """The most recent MCP call + its elapsed, for the FULL-FAILURE line -- so a 504 names the
-        exact op that hit the ~10s ceiling in one log read, even when the exception text doesn't."""
-        lo = getattr(self.client, "_last_op", None)
+    def _last_op_str(self, error: BaseException | None = None) -> str:
+        """Prefer the failing call's identity over any subsequent cleanup call."""
+        lo = getattr(error, "_mcp_failed_op", None) or getattr(self.client, "_last_op", None)
         if not lo:
             return "unknown"
         op_key, dur, ok = lo
@@ -1872,9 +1873,9 @@ class TestRunner:
                     continue
                 if "504" in str(exc):
                     print(f"    FULL-FAILURE {name}: persistent relay 504 across retry "
-                          f"(last op {self._last_op_str()}): {exc}")
+                          f"(failure op {self._last_op_str(exc)}): {exc}")
                     self._record(name, group, "fail",
-                                 message=f"persistent relay 504 [{self._last_op_str()}]: {exc}"[:200],
+                                 message=f"persistent relay 504 [{self._last_op_str(exc)}]: {exc}"[:200],
                                  duration=elapsed)
                 else:
                     self._record(name, group, "skip", message=str(exc), duration=elapsed)
@@ -1901,9 +1902,9 @@ class TestRunner:
                 # failure goes to the run log here -- a truncated structured response
                 # (error/repairHints/settingsSkipped all cut off) has repeatedly forced an
                 # extra run just to learn why a test failed.
-                print(f"    FULL-FAILURE {name} (last op {self._last_op_str()}): {exc}")
+                print(f"    FULL-FAILURE {name} (failure op {self._last_op_str(exc)}): {exc}")
                 self._record(name, group, "fail",
-                             message=f"[{self._last_op_str()}] {exc}"[:200], duration=elapsed)
+                             message=f"[{self._last_op_str(exc)}] {exc}"[:200], duration=elapsed)
                 return
         # Inter-test breathing room for the hub's per-app load limiter. The limiter has
         # tripped MID-RUN on a freshly-booted hub, and the suite's recent speedups all
@@ -2444,6 +2445,8 @@ class TestRunner:
             "maxResults": 500,
         })
         assert isinstance(result, dict), f"hub_search_tools returned non-dict: {type(result)}"
+        assert all("listed below" not in row.get("description", "") for row in result.get("results", [])), \
+            "a search result promises an operation list that is not part of the result"
         total = result.get("totalToolsSearched")
         names = [r.get("tool") for r in result.get("results", [])]
         assert isinstance(total, int) and total > 0, f"totalToolsSearched not a positive int: {total!r}"
@@ -3569,6 +3572,10 @@ class TestRunner:
             enabled = next(row for row in configuration()["editableFields"] if row["name"] == "enabled")
             assert enabled.get("value") is False, f"Configuration read lost the disabled value: {enabled}"
         finally:
+            primary_error = sys.exc_info()[1]
+            if primary_error is not None:
+                print(f"    CONFIGURATION_PRIMARY_FAILURE {profile['path']} "
+                      f"(failure op {self._last_op_str(primary_error)}): {primary_error}")
             errors = []
             if enabled_dirty:
                 try:
@@ -3622,6 +3629,34 @@ class TestRunner:
         print(f"    DEVICE_CONFIGURATION {profile['path']}: grouped edits and independent restoration verified; "
               "unavailable prerequisite rows are negative coverage only.")
 
+    def _wait_configuration_fixture_identity(self, device_id: str, nonce: str) -> dict:
+        # SDK command acceptance can precede the driver's observer event.
+        deadline = time.monotonic() + 10.0
+        native = {}
+        while True:
+            observed = self.client.call_tool("hub_get_device_attribute", {
+                "deviceId": device_id, "attribute": "nativeDeviceInfo",
+            })
+            if observed.get("value") is not None:
+                native = json.loads(observed["value"])
+                if native.get("nonce") == nonce and str(native.get("deviceId")) == device_id:
+                    return native
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                identity = {key: native.get(key) for key in ("nonce", "deviceId", "fixtureVersion", "enabled")}
+                failure = AssertionError(
+                    f"LAN fixture observer did not complete for device {device_id}, nonce {nonce}: {identity}")
+                failure._mcp_failed_op = getattr(self.client, "_last_op", None)
+                try:
+                    logs = self.client.call_tool("hub_get_logs", {
+                        "deviceId": device_id, "level": "error", "limit": 10,
+                    })
+                    print(f"    CONFIGURATION_OBSERVER_LOGS device {device_id}: {json.dumps(logs)[:12000]}")
+                except Exception as log_error:
+                    print(f"    CONFIGURATION_OBSERVER_LOGS device {device_id}: unavailable: {log_error}")
+                raise failure
+            time.sleep(min(0.25, remaining))
+
     @test("devices")
     def test_configuration_fixture_lan_dispatch(self) -> None:
         """Prove explicit asynchronous HubAction callbacks separately for each provisioned dispatch path."""
@@ -3639,11 +3674,7 @@ class TestRunner:
                 "deviceId": device_id, "command": "captureConfiguration", "parameters": [nonce], "includeState": False,
             }, "independent LAN fixture ownership observation")
             assert captured.get("success") is True, f"LAN fixture identity observer failed: {captured}"
-            summary = self.client.call_tool("hub_get_device", {"deviceId": device_id})
-            native = json.loads(next(row["value"] for row in summary["attributes"] if row["name"] == "nativeDeviceInfo"))
-            assert native.get("nonce") == nonce and str(native.get("deviceId")) == device_id, (
-                f"Wrong/stale LAN fixture observer: {native}"
-            )
+            native = self._wait_configuration_fixture_identity(device_id, nonce)
             assert native.get("fixtureVersion") == manifest["version"] == 2, "Provision the current LAN fixture driver"
             self._assert_configuration_fixture_parent(profile, native)
             try:
@@ -5539,7 +5570,11 @@ class TestRunner:
                 ({"addRequiredExpression": {"conditions": [{"capability": "Last Event Device"}]}},
                  ("not usable as a condition", "in actions")),
             ]
-            refusal_entries = self._patch_rule(app_id, [spec for spec, _ in refusal_specs], expected_refusals=len(refusal_specs))
+            # One batch per refusal: the first refused op stops a patches batch, so a combined batch
+            # would only ever validate its first spec.
+            refusal_entries = []
+            for spec, _ in refusal_specs:
+                refusal_entries += self._patch_rule(app_id, [spec], expected_refusals=1)
             assert len(refusal_entries) == len(refusal_specs), \
                 f"batched refusal results were incomplete: {refusal_entries}"
             for entry, (_, needles) in zip(refusal_entries, refusal_specs, strict=True):
@@ -6505,7 +6540,9 @@ class TestRunner:
             print(f"    create '{label}' response lost to relay 504 -- verifying by label lookup")
             app_id = None
             for lookup_attempt in range(4):
-                listed = self.client.call_tool("hub_manage_native_rules_and_apps", {
+                # The read gateway permits the client's bounded transport retries;
+                # a mixed write gateway would abort on the first dropped lookup.
+                listed = self.client.call_tool("hub_read_rules", {
                     "tool": "hub_list_rules", "args": {},
                 })
                 exact_matches = [r for r in (listed.get("rules") or [])
@@ -6658,19 +6695,69 @@ class TestRunner:
         assert result.get("updateRuleFailed") is not True \
             and result.get("patchesNotLive") is not True, \
             f"patch terminal activation failed; mutations are not safely live: {result}"
-        refused = [entry for entry in entries if entry.get("success") is False]
-        assert result.get("error") is None, \
-            f"patch batch had an outer application error unrelated to per-op results: {result}"
+        # The first refused op stops the batch, so later ops come back notAttempted rather than refused.
+        refused = [entry for entry in entries
+                   if entry.get("success") is False and entry.get("notAttempted") is not True]
         assert len(refused) == expected_refusals, \
             f"patch refusal count mismatch (expected {expected_refusals}): entries={entries}; outer={result}"
         if expected_refusals:
-            assert result.get("success") is False and result.get("partial") is True \
-                and all(entry.get("error") for entry in refused), \
+            assert expected_refusals == 1, "a patches batch stops at its first refusal; issue one refusal per batch"
+            assert all(entry.get("error") for entry in refused), \
                 f"outer patch failure was not attributable to explicit refused entries: {result}"
+            stop_at = entries.index(refused[0])
+            self._assert_bulk_stop(result, f"patches[{stop_at}]", entries[stop_at + 1:])
         else:
+            assert result.get("error") is None, \
+                f"patch batch had an outer application error unrelated to per-op results: {result}"
             assert result.get("success") is True and not result.get("partial"), \
                 f"patch batch did not fully activate: {result}"
         return entries
+
+    @staticmethod
+    def _assert_bulk_stop(result: Any, stopped_after: str, not_attempted: list,
+                          *, partial_item: bool = False) -> None:
+        """Assert the fail-closed bulk contract on one envelope.
+
+        The stopping item is named in bulkStoppedAfter and the top-level error, finalisation is
+        skipped, every later row is notAttempted, and no skipped tail is handed back for resumption.
+        """
+        assert isinstance(result, dict), f"a stopped batch returned no envelope: {result!r}"
+        assert result.get("success") is False and result.get("partial") is True, \
+            f"a stopped batch must report success:false + partial:true: {result}"
+        assert result.get("bulkStoppedAfter") == stopped_after, \
+            f"expected bulkStoppedAfter={stopped_after!r}, got {result.get('bulkStoppedAfter')!r}: {result}"
+        assert result.get("finalisationNotAttempted") is True, \
+            f"a stopped batch must report finalisationNotAttempted:true: {result}"
+        reason = "reported partial" if partial_item else "failed"
+        assert str(result.get("error", "")).startswith(f"Stopped after {stopped_after} {reason}"), \
+            f"the top-level error must name the stopping item and why it stopped: {result.get('error')!r}"
+        assert all(isinstance(row, dict) and row.get("notAttempted") is True for row in not_attempted), \
+            f"every item after the stop must be reported notAttempted: {not_attempted}"
+        assert result.get("status") != "in_progress" and not any(
+                key in result for key in ("addTriggersRemaining", "addActionsRemaining", "patchesRemaining")), \
+            f"a stopped batch must not hand back its skipped tail: {result}"
+
+    def _rm_stop_call(self, app_id: Any, extra: dict) -> dict:
+        """Issue an edit expected to stop fail-closed; its envelope is the assertion subject."""
+        args = {"appId": app_id, "confirm": True}
+        args.update(extra)
+        try:
+            result = self.client.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": args})
+        except (McpError, McpToolError, requests.HTTPError) as exc:
+            if "504" not in str(exc):
+                raise
+            raise RelayLostResponseError(
+                f"504 relay response loss erased the fail-closed stop envelope for {list(extra)}; "
+                "retry this test with its run-unique fixture"
+            ) from exc
+        # A stopped batch skipped the trailing updateRule, so its health is not a finished rule's.
+        self._last_write_health = None
+        return result
+
+    def _rule_page_text(self, app_id: Any) -> str:
+        """The rule's rendered page, for landed/never-landed markers. The render, not the settings map,
+        because a removed action's settings are not guaranteed to be purged."""
+        return json.dumps(self._get_persisted_rule_config(app_id).get("page") or {})
 
     def _rm_call_soft(self, args: dict, strict: bool = False, recover_504: bool = False) -> Any:
         """Direct hub_set_rule call preserving its full response contract."""
@@ -7196,6 +7283,8 @@ class TestRunner:
                 "args": {"scope": "source", "backupKey": backup_key, "confirm": True}})
             assert restored.get("success") is True, \
                 f"in-place restore of a rule with a device picker failed: {restored}"
+            assert restored.get("recreated") is False and str(restored.get("ruleId")) == str(app_id), \
+                f"in-place restore unexpectedly created a replacement rule: {restored}"
             assert restored.get("failedStep") is None, restored
             applied = restored.get("settingsApplied") or []
             assert any(str(k).startswith("onOffSwitch.") for k in applied), \
@@ -7414,6 +7503,38 @@ class TestRunner:
                 f"modifyTrigger state-change token should refuse pre-write: {rejected}"
             self._set_rule(app_id, {"removeTrigger": {"index": tidx}}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            # Fail-closed bulk triggers: a clean Switch-off trigger lands, the refused state-change
+            # token stops the batch, and the later trigger and the action are never written.
+            def _switch_trigger_states() -> list[str]:
+                settings = self._get_persisted_rule_config(app_id).get("settings") or {}
+                return [str(settings.get(f"tstate{str(key)[4:]}")).lower()
+                        for key, value in settings.items()
+                        if str(key).startswith("tDev") and self._setting_holds_exact(value, sw)]
+            states_before = _switch_trigger_states()
+            skipped_msg = "E2E trigger stop skipped action"
+            stopped = self._rm_stop_call(app_id, {
+                "addTriggers": [
+                    {"capability": "Switch", "deviceIds": [sw], "state": "off"},
+                    {"capability": "Temperature", "value": "increased"},
+                    {"capability": "Switch", "deviceIds": [sw], "state": "on"},
+                ],
+                "addActions": [{"capability": "log", "message": skipped_msg}],
+            })
+            triggers = stopped.get("triggers") or []
+            actions = stopped.get("actions") or []
+            assert len(triggers) == 3 and len(actions) == 1 \
+                and triggers[0].get("success") is not False and not triggers[0].get("partial") \
+                and triggers[1].get("success") is False, \
+                f"expected a clean trigger, then the refusal, then the skipped tail: {stopped}"
+            self._assert_bulk_stop(stopped, "addTriggers[1]", triggers[2:] + actions)
+            states_after = _switch_trigger_states()
+            assert states_after.count("off") == states_before.count("off") + 1 \
+                and states_after.count("on") == states_before.count("on"), \
+                f"the clean prefix trigger must remain and the skipped trigger must never land: " \
+                f"before={states_before} after={states_after}"
+            assert skipped_msg not in self._rule_page_text(app_id), \
+                "the action after a stopped trigger batch was written"
         finally:
             self._delete_native(app_id)
 
@@ -7553,8 +7674,8 @@ class TestRunner:
         app_id = self._create_native_rule("ReqExpr")
         try:
             built = self._patch_rule(app_id, [
-                {"addLocalVariable": {"name": "batCounter", "type": "Number", "value": 0}},
-                {"addAction": {"capability": "setLocalVariable", "variable": "batCounter", "value": 5}},
+                {"addLocalVariable": {"name": "fields", "type": "Number", "value": 0}},
+                {"addAction": {"capability": "setLocalVariable", "variable": "fields", "value": 0}},
                 {"addRequiredExpression": {"conditions": [
                     {"capability": "Switch", "deviceIds": [sw], "state": "on"}]}},
             ])
@@ -7565,8 +7686,8 @@ class TestRunner:
                 f"patch addAction setLocalVariable did not return an actionIndex: {built[1]}"
 
             persisted = self._get_persisted_rule_config(app_id).get("settings") or {}
-            assert persisted.get(f"xVarV.{set_local_idx}") == "batCounter" \
-                and str(persisted.get(f"valNumber.{set_local_idx}")) == "5", \
+            assert persisted.get(f"xVarV.{set_local_idx}") == "fields" \
+                and str(persisted.get(f"valNumber.{set_local_idx}")) == "0", \
                 f"setLocalVariable target/value did not persist: {persisted}"
             re_slots = [str(key).split("_", 1)[1] for key, value in persisted.items()
                         if str(key).startswith("rCapab_")
@@ -7581,7 +7702,7 @@ class TestRunner:
             listed = self.client.call_tool("hub_read_rules", {
                 "tool": "hub_list_rule_local_variables", "args": {"appId": app_id}})
             names = [lv.get("name") for lv in (listed.get("localVariables") or [])]
-            assert "batCounter" in names, f"hub_list_rule_local_variables missing batCounter: {listed}"
+            assert "fields" in names, f"hub_list_rule_local_variables missing fields: {listed}"
 
             self._assert_rule_healthy(app_id)
 
@@ -7593,17 +7714,17 @@ class TestRunner:
             # broken-after-delete behaviour is covered by its own scenario).
             removed = self._patch_rule(app_id, [
                 {"removeAction": {"index": set_local_idx}},
-                {"removeLocalVariable": {"name": "batCounter"}},
+                {"removeLocalVariable": {"name": "fields"}},
             ])
             assert len(removed) == 2 and all(entry.get("success") is not False for entry in removed), \
                 f"ordered reference/local removal patches did not both commit: {removed}"
             assert removed[1].get("deleted") is True \
-                and removed[1].get("name") == "batCounter", \
+                and removed[1].get("name") == "fields", \
                 f"removeLocalVariable did not confirm deletion: {removed[1]}"
             relisted = self.client.call_tool("hub_read_rules", {
                 "tool": "hub_list_rule_local_variables", "args": {"appId": app_id}})
-            assert "batCounter" not in [lv.get("name") for lv in (relisted.get("localVariables") or [])], \
-                f"batCounter still present after removeLocalVariable: {relisted}"
+            assert "fields" not in [lv.get("name") for lv in (relisted.get("localVariables") or [])], \
+                f"fields still present after removeLocalVariable: {relisted}"
         finally:
             self._delete_native(app_id)
 
@@ -7922,6 +8043,12 @@ class TestRunner:
             )
             replay_text = next(item["text"] for item in replay.get("content", []) if item.get("type") == "text")
             assert json.loads(replay_text) == result, "terminal replay changed the public mutation result"
+            info = self.client.call_tool("hub_get_info", {})
+            recent = [row for row in info.get("recentWrites", [])
+                      if row.get("tool") == "hub_set_rule" and str(row.get("appId")) == str(app_id)]
+            assert recent and recent[0].get("status") == "finished" and recent[0].get("success") is True, (
+                f"completed MRTR rule edit missing from recentWrites: {info.get('recentWrites')}"
+            )
             # Independent persisted-state proof, deliberately after the measured
             # logical call and through the ordinary repository client's read gateway.
             config = self.client.call_tool("hub_read_apps_code", {
@@ -8437,14 +8564,13 @@ class TestRunner:
                         f"relay-adopted unary create did not persist one absolute action: {unary_settings}"
                     mu_idx = unary_indices[0]
 
-                c_entries = self._patch_rule(app_c, [
-                    {"addAction": {"capability": "setVariable", "variable": str_var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                    {"addAction": {"capability": "setVariable", "variable": bool_var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                    {"addAction": {"capability": "setVariable", "variable": var_name,
-                                   "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
-                ], expected_refusals=3)
+                # One batch per refusal: the first refused op stops a patches batch.
+                c_entries = []
+                for target in (str_var_name, bool_var_name, var_name):
+                    c_entries += self._patch_rule(app_c, [
+                        {"addAction": {"capability": "setVariable", "variable": target,
+                                       "fromDevice": {"deviceId": switch_id, "attribute": "switch"}}},
+                    ], expected_refusals=1)
                 assert len(c_entries) == 3, f"rejection patches were incomplete: {c_entries}"
                 str_reject, bool_reject, neg = c_entries
                 assert mu_idx is not None, f"math unary action index was not returned or persisted: {unary_settings}"
@@ -8841,6 +8967,43 @@ class TestRunner:
             self._set_rule(app_id, {"clearActions": True}, strict=True)
             self._set_rule(app_id, {"replaceActions": [{"capability": "log", "message": "final"}]}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            # Fail-closed bulk actions: the clean first action lands, the switch state: steer refuses
+            # the second, and the third is never written. The refusal is decided per item inside the
+            # add, so it stops the batch rather than refusing the call up front.
+            refused_spec = {"capability": "switch", "state": "on", "deviceIds": [int(self.get_test_switch_id())]}
+            bulk_kept, bulk_skipped = "E2E bulk stop kept", "E2E bulk stop skipped"
+            bulk_stop = self._rm_stop_call(app_id, {"addActions": [
+                {"capability": "log", "message": bulk_kept},
+                refused_spec,
+                {"capability": "log", "message": bulk_skipped},
+            ]})
+            bulk_rows = bulk_stop.get("actions") or []
+            assert len(bulk_rows) == 3 and bulk_rows[0].get("success") is not False \
+                and not bulk_rows[0].get("partial") and bulk_rows[1].get("success") is False \
+                and "action:" in str(bulk_rows[1].get("error", "")), \
+                f"expected a clean action, then the state: refusal, then the skipped tail: {bulk_stop}"
+            self._assert_bulk_stop(bulk_stop, "addActions[1]", bulk_rows[2:])
+            page = self._rule_page_text(app_id)
+            assert bulk_kept in page and bulk_skipped not in page, \
+                f"addActions stop must keep the clean prefix and never write the tail: {page}"
+
+            # Fail-closed replacement: the old list is cleared before the adds, so only the clean first
+            # replacement item remains; skipping finalisation is not a rollback.
+            repl_kept, repl_skipped = "E2E replace stop kept", "E2E replace stop skipped"
+            repl_stop = self._rm_stop_call(app_id, {"replaceActions": [
+                {"capability": "log", "message": repl_kept},
+                refused_spec,
+                {"capability": "log", "message": repl_skipped},
+            ]})
+            added = repl_stop.get("addedActions") or []
+            assert len(added) == 3 and added[0].get("success") is not False \
+                and not added[0].get("partial") and added[1].get("success") is False, \
+                f"expected a clean replacement item, then the refusal, then the skipped tail: {repl_stop}"
+            self._assert_bulk_stop(repl_stop, "replaceActions[1]", added[2:])
+            page = self._rule_page_text(app_id)
+            assert repl_kept in page and repl_skipped not in page and bulk_kept not in page, \
+                f"a stopped replaceActions must leave only its clean prefix (old list cleared, tail skipped): {page}"
         finally:
             self._delete_native(app_id)
 
@@ -8918,6 +9081,53 @@ class TestRunner:
                 {"addAction": {"capability": "log", "message": "p2"}},
             ]}, strict=True)
             self._assert_rule_healthy(app_id)
+
+            sw = int(self.get_test_switch_id())
+            # A success:true + partial:true op stops the batch too. The enum Custom Attribute
+            # '*changed*' Required Expression is the live-proven partial (see
+            # test_set_rule_re_custom_attribute_enum_changed_not_representable).
+            op_kept, op_skipped = "E2E patch stop kept", "E2E patch stop skipped"
+            partial_stop = self._rm_stop_call(app_id, {"patches": [
+                {"addAction": {"capability": "log", "message": op_kept}},
+                {"addRequiredExpression": {"conditions": [
+                    {"capability": "Custom Attribute", "deviceIds": [sw],
+                     "attribute": "switch", "comparator": "*changed*"}]}},
+                {"addAction": {"capability": "log", "message": op_skipped}},
+            ]})
+            op_rows = partial_stop.get("patchResults") or partial_stop.get("patches") or []
+            assert len(op_rows) == 3 and op_rows[0].get("success") is not False \
+                and op_rows[1].get("op") == "addRequiredExpression" \
+                and op_rows[1].get("success") is not False and op_rows[1].get("partial") is True \
+                and op_rows[2].get("op") == "addAction", \
+                f"expected a clean op, then the partial Required Expression, then the skipped op: {partial_stop}"
+            self._assert_bulk_stop(partial_stop, "patches[1]", op_rows[2:], partial_item=True)
+
+            # An op's inner list stops at its own failed item and names the inner position; the later
+            # inner item and the later op are both skipped.
+            inner_kept, inner_skipped, later_skipped = \
+                "E2E inner stop kept", "E2E inner stop skipped", "E2E later op skipped"
+            inner_stop = self._rm_stop_call(app_id, {"patches": [
+                {"addActions": [
+                    {"capability": "log", "message": inner_kept},
+                    {"capability": "switch", "state": "on", "deviceIds": [sw]},
+                    {"capability": "log", "message": inner_skipped},
+                ]},
+                {"addAction": {"capability": "log", "message": later_skipped}},
+            ]})
+            inner_rows = inner_stop.get("patchResults") or inner_stop.get("patches") or []
+            # A checkpoint inside the inner list splits that op across rows; read its items in order.
+            inner_items = [item for row in inner_rows if row.get("op") == "addActions"
+                           for item in (row.get("results") or [])]
+            later_rows = [row for row in inner_rows if row.get("op") == "addAction"]
+            assert len(inner_items) == 3 and len(later_rows) == 1 \
+                and inner_items[0].get("success") is not False and inner_items[1].get("success") is False, \
+                f"expected a clean inner item, then the refusal, then the skipped tail: {inner_stop}"
+            self._assert_bulk_stop(inner_stop, "patches[0].addActions[1]", inner_items[2:] + later_rows)
+
+            page = self._rule_page_text(app_id)
+            assert op_kept in page and inner_kept in page \
+                and not any(marker in page for marker in (op_skipped, inner_skipped, later_skipped)), \
+                f"stopped patches must keep their clean prefixes and never write the skipped items: {page}"
         finally:
             self._delete_native(app_id)
 
@@ -9052,6 +9262,62 @@ class TestRunner:
                 self._assert_rule_healthy(app_id)
         finally:
             self._delete_native(app_id)
+
+        # Fail-closed create across sections: the clean trigger lands, the refused trigger stops the
+        # create, and the Required Expression and action sections are never written. A new rule has
+        # no pre-operation backup, so this fixture is deleted rather than restored.
+        self._native_rule_fixture_seq = getattr(self, "_native_rule_fixture_seq", 0) + 1
+        stop_label = f"{PREFIX}CreateStop_{_run_artifact_suffix()}_{self._native_rule_fixture_seq}"
+        skipped_msg = "E2E create stop skipped action"
+        sw_stop = self._soft_write(
+            lambda: self.client.call_tool("hub_manage_rule_machine", {
+                "tool": "hub_set_rule",
+                "args": {
+                    "name": stop_label,
+                    "addTriggers": [
+                        {"capability": "Switch", "deviceIds": [sw], "state": "on"},
+                        {"capability": "Temperature", "value": "increased"},
+                    ],
+                    "addRequiredExpression": {"conditions": [
+                        {"capability": "Switch", "deviceIds": [sw], "state": "on"}]},
+                    "addActions": [{"capability": "log", "message": skipped_msg}],
+                    "confirm": True,
+                }}),
+            lambda: self._find_app_id_by_label(stop_label),
+            "fail-closed create",
+        )
+        if sw_stop["relayDropped"]:
+            assert sw_stop["committed"], f"fail-closed create lost to relay 504 and never committed ({stop_label})"
+            stop_app_id = sw_stop["evidence"]
+            stopped = None
+        else:
+            stopped = sw_stop["response"]
+            stop_app_id = stopped.get("appId")
+            assert stop_app_id, f"fail-closed create did not return appId: {stopped}"
+        self.created_native_app_ids.append(str(stop_app_id))
+        try:
+            if stopped is None:
+                print("    fail-closed create: stop-envelope assertions skipped (relay 504); "
+                      "verifying the skipped sections by readback instead")
+            else:
+                triggers = stopped.get("triggers") or []
+                actions = stopped.get("actions") or []
+                assert len(triggers) == 2 and len(actions) == 1 \
+                    and triggers[0].get("success") is not False and not triggers[0].get("partial") \
+                    and triggers[1].get("success") is False, \
+                    f"expected a clean trigger, then the refusal, on the stopped create: {stopped}"
+                self._assert_bulk_stop(stopped, "triggers[1]", [stopped.get("requiredExpression"), *actions])
+            stop_settings = self._get_persisted_rule_config(stop_app_id).get("settings") or {}
+            assert any(str(key).startswith("tDev") and self._setting_holds_exact(value, sw)
+                       and str(stop_settings.get(f"tstate{str(key)[4:]}")).lower() == "on"
+                       for key, value in stop_settings.items()), \
+                f"the clean trigger before the stop must remain on the created rule: {stop_settings}"
+            assert not any(str(key).startswith("rCapab_") for key in stop_settings), \
+                f"the Required Expression after the stop was written: {stop_settings}"
+            assert not any(skipped_msg in str(value) for value in stop_settings.values()), \
+                f"the action after the stop was written: {stop_settings}"
+        finally:
+            self._delete_native(stop_app_id)
 
     @test("native_apps")
     def test_set_rule_discover_meta(self) -> None:
@@ -10092,17 +10358,18 @@ class TestRunner:
                     print(f"  [WARN] deadman cleanup: delete code class {code_app_id} failed: {exc}")
 
     # -----------------------------------------------------------------------
-    # GROUP 4d: app_code_update (2 tests) -- the hub_update_app code-deploy path
-    # (POST /app/saveOrUpdateJson).
+    # GROUP 4d: app_code_update -- app lifecycle and library source updates.
     #
-    # test_update_app_code_lifecycle: one throwaway code class, five legs before its delete:
+    # test_update_app_code_lifecycle: one throwaway code class for update/error/conflict/OAuth:
     # a real round-trip edit (success + version advance + source landed), the
     # hub's verbatim compile error on broken Groovy (not our generic fallback),
     # the client-side expectedVersion optimistic lock (refused, no write), a
-    # hub_restore_backup of the pre-update auto-backup (V1 back, undo key returned), and the
     # OAuth fold (asserted as a hard success -- it covers /app/updateOAuth reached with a
     # query MAP, which only a live hub can prove: the old embedded-querystring form 404s
     # that exact route).
+    #
+    # Restore/retry/undo/redo use their own disposable class, so a dropped restore response
+    # does not spend the update assertions' single fresh-fixture retry.
     #
     # test_update_app_code_trigger_updated: the triggerUpdated lifecycle refresh, which needs
     # a running INSTANCE and so creates + cleans up one. Pins that the Done submit lands on
@@ -10118,6 +10385,7 @@ class TestRunner:
         # Layer 5 startswith sweep reclaims a stranded copy if a crash skips the finally below.
         source_v1 = (Path(__file__).resolve().parent / "fixtures"
                      / "app-code-update.groovy").read_text(encoding="utf-8")
+        source_v1 = source_v1.replace("Deadman Test Target Update", f"Deadman Test Target Update-{time.time_ns()}")
         code_app_id = None
         try:
             created = self.client.call_tool("hub_manage_code", {
@@ -10136,6 +10404,7 @@ class TestRunner:
                 f"could not read back the created code class: {before}"
             version_before = int(before["version"])
 
+            print("    [PHASE] APP_CODE_UPDATE round-trip")
             # Leg 1: round-trip edit -- valid modified source must save, advance the hub's
             # version counter, and be readable back via hub_get_source.
             source_v2 = source_v1.replace("UPDATE-LEG-MARKER-V1", "UPDATE-LEG-MARKER-V2")
@@ -10156,6 +10425,7 @@ class TestRunner:
             assert version_after > version_before, \
                 f"version did not advance after update ({version_before} -> {version_after})"
 
+            print("    [PHASE] APP_CODE_UPDATE compiler rejection")
             # Leg 2: compile error -- the hub's verbatim compiler text must ride back in
             # `error`, not our generic fallback string.
             source_broken = source_v2.replace(
@@ -10173,6 +10443,7 @@ class TestRunner:
             assert "unable to resolve" in err.lower() or "ClassThatDoesNotExistBatE2e" in err, \
                 f"error text is not the hub's compiler output: {err!r}"
 
+            print("    [PHASE] APP_CODE_UPDATE version conflict")
             # Leg 3: optimistic lock -- a stale expectedVersion must be refused client-side
             # with conflict:true, before anything is written.
             source_v3 = source_v2.replace("UPDATE-LEG-MARKER-V2", "UPDATE-LEG-MARKER-V3")
@@ -10198,29 +10469,8 @@ class TestRunner:
             assert int(final["version"]) == version_after, \
                 f"a refused update advanced the version ({version_after} -> {final.get('version')})"
 
-            # Leg 4: restore -- the auto-backup snapped before the FIRST update still
-            # holds the V1 source (backupItemSource keeps the pre-edit original for an
-            # hour rather than re-snapshotting on the later legs), so hub_restore_backup
-            # must bring V1 back and hand back a pre-restore backup key as the undo path.
-            restored = self.client.call_tool("hub_manage_backup", {
-                "tool": "hub_restore_backup",
-                "args": {"backupKey": f"app_{code_app_id}", "confirm": True},
-            })
-            assert restored.get("success") is True, f"hub_restore_backup failed: {restored}"
-            pre_restore_key = restored.get("preRestoreBackup")
-            assert pre_restore_key == f"prerestore_app_{code_app_id}", \
-                f"restore did not return the pre-restore backup key: {restored}"
-            after_restore = self.client.call_tool("hub_read_apps_code", {
-                "tool": "hub_get_source",
-                "args": {"type": "app", "id": code_app_id},
-            })
-            restored_src = after_restore.get("source") or ""
-            assert "UPDATE-LEG-MARKER-V1" in restored_src and "UPDATE-LEG-MARKER-V2" not in restored_src, \
-                f"restore did not bring back the pre-update source: {after_restore}"
-            assert int(after_restore["version"]) > version_after, \
-                f"restore reported success but the version did not advance ({version_after} -> {after_restore.get('version')})"
-
-            # Leg 5 (#259): enable OAuth on the (oauth:true-declaring) code class via the
+            print("    [PHASE] APP_CODE_UPDATE OAuth")
+            # Leg 4 (#259): enable OAuth on the (oauth:true-declaring) code class via the
             # hub_update_app oauth fold -- the programmatic "Enable OAuth in App".
             # (Throwaway app, never the MCP server -- the self-OAuth guard protects that.)
             #
@@ -10246,7 +10496,7 @@ class TestRunner:
             assert ob.get("enabled") is True, "OAuth reported success but not enabled"
             assert ob.get("clientId"), "OAuth enabled but no clientId returned"
 
-            print(f"    APP_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error + lock conflict both refused with no write; restore brought V1 back (undo key {pre_restore_key}); OAuth leg checked")
+            print(f"    APP_CODE_UPDATE ok -- v{version_before}->v{version_after}; compile error + lock conflict both refused with no write; OAuth leg checked")
         finally:
             if code_app_id:
                 try:
@@ -10256,6 +10506,134 @@ class TestRunner:
                     })
                 except Exception as exc:
                     print(f"  [WARN] app-code update cleanup: delete code class {code_app_id} failed: {exc}")
+
+    @test("app_code_update")
+    def test_app_code_backup_restore_lifecycle(self) -> None:
+        # Throwaway Apps Code class (code only, never installed as an instance). The name
+        # deliberately starts with "Deadman Test Target" (namespace mcptest) so the cleanup
+        # Layer 5 startswith sweep reclaims a stranded copy if a crash skips the finally below.
+        source_v1 = (Path(__file__).resolve().parent / "fixtures"
+                     / "app-code-update.groovy").read_text(encoding="utf-8")
+        source_v1 = source_v1.replace("Deadman Test Target Update", f"Deadman Test Target Restore-{time.time_ns()}")
+        code_app_id = None
+        try:
+            created = self.client.call_tool("hub_manage_code", {
+                "tool": "hub_create_app",
+                "args": {"source": source_v1, "confirm": True},
+            })
+            code_app_id = created.get("appId")
+            assert code_app_id, f"hub_create_app(source) did not return an appId (code class): {created}"
+
+            before = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_source",
+                "args": {"type": "app", "id": code_app_id},
+            })
+            assert before.get("success") is True and before.get("version") is not None \
+                and "UPDATE-LEG-MARKER-V1" in (before.get("source") or ""), \
+                f"could not read back the created code class: {before}"
+            version_before = int(before["version"])
+
+            print("    [PHASE] APP_CODE_RESTORE prepare V1 backup and V2 source")
+            # Establish the exact V1 backup and V2 source used by every restore assertion.
+            source_v2 = source_v1.replace("UPDATE-LEG-MARKER-V1", "UPDATE-LEG-MARKER-V2")
+            updated = self.client.call_tool("hub_manage_code", {
+                "tool": "hub_update_app",
+                "args": {"appId": code_app_id, "source": source_v2, "confirm": True},
+            })
+            assert updated.get("success") is True, f"hub_update_app round-trip failed: {updated}"
+            assert updated.get("previousVersion") is not None, \
+                f"hub_update_app success carries no previousVersion: {updated}"
+            after = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_source",
+                "args": {"type": "app", "id": code_app_id},
+            })
+            assert "UPDATE-LEG-MARKER-V2" in (after.get("source") or ""), \
+                f"updated source did not land on the hub: {after}"
+            version_after = int(after["version"])
+            assert version_after > version_before, \
+                f"version did not advance after update ({version_before} -> {version_after})"
+
+            final_src = after["source"]
+
+            print("    [PHASE] APP_CODE_RESTORE restore V1")
+            # Restore the pre-update V1 backup and retain the current V2 source as undo.
+            restored = self.client.call_tool("hub_manage_backup", {
+                "tool": "hub_restore_backup",
+                "args": {"backupKey": f"app_{code_app_id}", "confirm": True},
+            })
+            assert restored.get("success") is True, f"hub_restore_backup failed: {restored}"
+            assert restored.get("undoAvailable") is True, f"restore did not verify its undo backup: {restored}"
+            pre_restore_key = restored.get("preRestoreBackup")
+            assert pre_restore_key == f"prerestore_app_{code_app_id}", \
+                f"restore did not return the pre-restore backup key: {restored}"
+            after_restore = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_source",
+                "args": {"type": "app", "id": code_app_id},
+            })
+            restored_src = after_restore.get("source") or ""
+            assert restored_src == before["source"], \
+                "restore did not apply the exact selected pre-update source snapshot"
+            assert "UPDATE-LEG-MARKER-V1" in restored_src and "UPDATE-LEG-MARKER-V2" not in restored_src, \
+                f"restore did not bring back the pre-update source: {after_restore}"
+            assert int(after_restore["version"]) > version_after, \
+                f"restore reported success but the version did not advance ({version_after} -> {after_restore.get('version')})"
+
+            undo = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_backup", "args": {"backupKey": pre_restore_key},
+            })
+            assert undo.get("source") == final_src, f"undo did not retain the exact pre-restore source: {undo}"
+            print("    [PHASE] APP_CODE_RESTORE repeat restore and preserve undo")
+            retried = self.client.call_tool("hub_manage_backup", {
+                "tool": "hub_restore_backup",
+                "args": {"backupKey": f"app_{code_app_id}", "confirm": True},
+            })
+            assert retried.get("success") is True and retried.get("undoAvailable") is True \
+                and retried.get("preRestoreBackup") == pre_restore_key, \
+                f"restore retry lost the verified undo handle: {retried}"
+            undo_after_retry = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_backup", "args": {"backupKey": pre_restore_key},
+            })
+            assert undo_after_retry.get("source") == final_src, \
+                f"restore retry replaced the original undo source: {undo_after_retry}"
+
+            # Exercise the returned undo handle and its redo on the same throwaway app.
+            print("    [PHASE] APP_CODE_RESTORE apply undo")
+            undone = self.client.call_tool("hub_manage_backup", {
+                "tool": "hub_restore_backup",
+                "args": {"backupKey": pre_restore_key, "confirm": True},
+            })
+            assert undone.get("success") is True and undone.get("undoAvailable") is True, \
+                f"restoring the undo backup failed: {undone}"
+            selected_undo = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_backup", "args": {"backupKey": pre_restore_key},
+            })
+            assert selected_undo.get("source") == final_src, f"undo lost its selected backup: {selected_undo}"
+            redo_key = undone.get("preRestoreBackup")
+            assert redo_key and redo_key != pre_restore_key, f"undo overwrote its selected backup: {undone}"
+            after_undo = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_source", "args": {"type": "app", "id": code_app_id},
+            })
+            assert after_undo.get("source") == final_src, f"undo restored different source: {after_undo}"
+            print("    [PHASE] APP_CODE_RESTORE apply redo")
+            redone = self.client.call_tool("hub_manage_backup", {
+                "tool": "hub_restore_backup", "args": {"backupKey": redo_key, "confirm": True},
+            })
+            assert redone.get("success") is True, f"redo failed: {redone}"
+            after_redo = self.client.call_tool("hub_read_apps_code", {
+                "tool": "hub_get_source", "args": {"type": "app", "id": code_app_id},
+            })
+            assert after_redo.get("source") == before["source"], f"redo restored different source: {after_redo}"
+
+            print(f"    APP_CODE_RESTORE ok -- restore + retry preserved undo {pre_restore_key}; undo + redo matched exact source")
+        finally:
+            if code_app_id:
+                try:
+                    self.client.call_tool("hub_manage_code", {
+                        "tool": "hub_delete_item",
+                        "args": {"type": "app", "item_id": code_app_id, "confirm": True},
+                    })
+                except Exception as exc:
+                    print(f"  [WARN] app-code restore cleanup: delete code class {code_app_id} failed: {exc}")
 
     @test("app_code_update")
     def test_update_app_code_trigger_updated(self) -> None:
@@ -11027,6 +11405,11 @@ class TestRunner:
         src = self.client.call_tool("hub_manage_backup", {"tool": "hub_list_backups", "args": {}})
         assert isinstance(src, dict) and "backups" in src, \
             f"default scope=source missing 'backups': {sorted(src.keys()) if isinstance(src, dict) else type(src).__name__}"
+        # One 20-entry retention cap is shared by every backup type.
+        total = src.get("total")
+        assert isinstance(total, int) and total == len(src["backups"]), \
+            f"shared source-backup count contract failed: {src}"
+        assert total <= 20, f"shared source-backup retention contract failed: {src}"
 
     @test("system_tools")
     def test_backup_gate_list_fallback(self) -> None:
@@ -11473,9 +11856,21 @@ class TestRunner:
         # just that the app compiled).
         lib_names = [lib.get("name") for lib in libs]
         # McpRoomsLib is the first REAL extracted module (hub_*_room impls) -- permanent.
-        assert any(
-            lib.get("name") == "McpRoomsLib" and lib.get("namespace") == "mcp" for lib in libs
-        ), f"McpRoomsLib not found in hub libraries (got {lib_names})"
+        rooms_lib = next((lib for lib in libs
+                          if lib.get("name") == "McpRoomsLib" and lib.get("namespace") == "mcp"), None)
+        assert rooms_lib, f"McpRoomsLib not found in hub libraries (got {lib_names})"
+        expected = (Path(__file__).resolve().parent.parent / "libraries" / "mcp-rooms-lib.groovy").read_text(
+            encoding="utf-8")
+        # Stay below the source reader's automatic File Manager save threshold.
+        assert len(expected) <= 64000, "Choose a smaller installed library for the read-only source check"
+        readback = self.client.call_tool("hub_get_source", {
+            "type": "library", "id": str(rooms_lib["id"]), "length": len(expected),
+        })
+        assert readback.get("success") is True, f"installed library source read failed: {readback}"
+        assert readback.get("source", "").replace("\r\n", "\n") == expected, \
+            "installed McpRoomsLib source does not match the deployed branch"
+        assert readback.get("version") is not None and readback.get("version") == rooms_lib.get("version"), \
+            f"library source/list versions differ: source={readback.get('version')}, list={rooms_lib.get('version')}"
 
     def _get_hub_info_optin(self) -> dict:
         """hub_get_info with BOTH additive opt-in blocks in ONE call, shared by the two opt-in tests
@@ -12177,9 +12572,11 @@ class TestRunner:
 
     @test("system_tools")
     def test_delete_bundle(self) -> None:
-        """hub_delete_bundle removes a bundle, verified by re-list. Uses a self-contained throwaway
-        bundle (mcptest namespace, fetched from the PR head) so it NEVER touches the live mcp
-        libraries bundle. Skipped on local runs where the PR raw URL env isn't set."""
+        """Delete a bundle containing unused app code, verified by re-list.
+
+        The fixture creates no running app instance or library. Skipped on local runs
+        where the PR raw URL env isn't set.
+        """
         raw_base = os.environ.get("PR_RAW_BASE")
         sha = os.environ.get("PR_HEAD_SHA_RESOLVED")
         if not (raw_base and sha):
@@ -12228,12 +12625,8 @@ class TestRunner:
                         "throwaway bundle cleanup")
                 except Exception as exc:
                     print(f"  [WARN] throwaway bundle cleanup: delete {bid} failed: {exc}")
-            # Deleting the bundle removes only the container, not the library it delivered
-            # (mcptest.E2eThrowawayLib) -- but the run-end cleanup's Layer 7b mcptest-namespace
-            # sweep reaps it with the ONE hub_list_libraries scan it already pays for the whole
-            # run. The per-test scan that used to live here cost 14-40s per attempt: the hub's
-            # /hub2/userLibraries endpoint returns EVERY library WITH full source (~2MB), so it
-            # was the single most expensive read in the suite -- and doubled on a 504 retry.
+            # Bundle deletion leaves its unused app code behind. The run-end Layer 5
+            # sweep removes its mcptest/Deadman Test Target code alongside the other app fixtures.
 
     def _set_write_cap(self, limit: int) -> None:
         """Set maxConcurrentWrites. Never call this while a write holds a slot: the settings
@@ -13668,59 +14061,37 @@ class TestRunner:
     @test("poll_until_attribute")
     def test_poll_immediate_match(self) -> None:
         """Happy path: device already in expected state -> polledCount=1, success=true."""
-        # Use the shared virtual switch; get_or_create ensures it exists in 'off' state.
         dev_id = self.get_test_switch_id()
-
-        def _drive_off_and_poll() -> Any:
-            # Drive it to 'off' first so we know its state.
-            self._native_device_command({"deviceId": dev_id, "command": "off"})
-            time.sleep(0.3)
-            return self.client.call_tool("hub_get_device_attribute", {
-                "deviceId": dev_id,
-                "attribute": "switch",
-                "expectedValue": "off",
-                "timeoutMs": 5000,
-            })
-
-        result = _drive_off_and_poll()
-        # An 'off' that produces NO state change while the poll keeps reading the old
-        # value is the load-limiter block signature (the command false-succeeds and
-        # the device never dispatches). Bounce the app via the watchdog and retry once.
-        if result.get("success") is not True and self._clear_load_throttle(
-                f"'off' on device {dev_id} never landed: {result}"):
-            result = _drive_off_and_poll()
+        # Poll the observed state; command delivery is a separate contract and can be throttled.
+        current = self.client.call_tool("hub_get_device_attribute", {
+            "deviceId": dev_id, "attribute": "switch",
+        }).get("value")
+        assert current in ("on", "off"), f"Switch baseline is unavailable: {current!r}"
+        result = self.client.call_tool("hub_get_device_attribute", {
+            "deviceId": dev_id, "attribute": "switch", "expectedValue": current, "timeoutMs": 5000,
+        })
         assert result.get("success") is True, f"Expected success=true, got: {result}"
         assert result.get("timedOut") is False, f"Expected timedOut=false, got: {result}"
-        assert result.get("polledCount", 0) >= 1, f"Expected polledCount>=1, got: {result}"
+        assert result.get("polledCount") == 1, f"Expected an immediate match on the first poll, got: {result}"
+        assert result.get("finalValue") == current, f"Poll returned a different value from the baseline: {result}"
 
     @test("poll_until_attribute")
     def test_poll_timeout(self) -> None:
         """Timeout path: value won't match -> timedOut=true, elapsedMs approx timeoutMs."""
         dev_id = self.get_test_switch_id()
-        import time as _time
-
-        def _drive_off_and_poll_for_on() -> tuple[Any, float]:
-            # Ensure switch is 'off' so 'on' won't match.
-            self._native_device_command({"deviceId": dev_id, "command": "off",
-                                         "waitFor": {"attribute": "switch", "expectedValue": "off", "timeoutMs": 5000}})
-            time.sleep(0.3)
-            t0 = _time.monotonic()
-            res = self.client.call_tool("hub_get_device_attribute", {
-                "deviceId": dev_id,
-                "attribute": "switch",
-                "expectedValue": "on",
-                "timeoutMs": 2000,
-            })
-            return res, (_time.monotonic() - t0) * 1000
-
-        result, elapsed_wall = _drive_off_and_poll_for_on()
-        # success=true here means the switch read 'on' AFTER an 'off' was sent -- the
-        # 'off' never dispatched (load-limiter block leaves it stuck in the old state).
-        if result.get("success") is True and self._clear_load_throttle(
-                f"'off' on device {dev_id} never landed (poll matched 'on'): {result}"):
-            result, elapsed_wall = _drive_off_and_poll_for_on()
+        current = self.client.call_tool("hub_get_device_attribute", {
+            "deviceId": dev_id, "attribute": "switch",
+        }).get("value")
+        assert current in ("on", "off"), f"Switch baseline is unavailable: {current!r}"
+        expected = "off" if current == "on" else "on"
+        t0 = time.monotonic()
+        result = self.client.call_tool("hub_get_device_attribute", {
+            "deviceId": dev_id, "attribute": "switch", "expectedValue": expected, "timeoutMs": 2000,
+        })
+        elapsed_wall = (time.monotonic() - t0) * 1000
         assert result.get("success") is False, f"Expected success=false, got: {result}"
         assert result.get("timedOut") is True, f"Expected timedOut=true, got: {result}"
+        assert result.get("finalValue") == current, f"Switch changed during the timeout probe: {result}"
         # Wall clock should reflect roughly the timeout (within 1 second of variance)
         assert elapsed_wall >= 1800, f"Wall clock too short ({elapsed_wall:.0f}ms); poll may not have blocked"
 
@@ -14182,9 +14553,10 @@ class TestRunner:
     # through HubitatMcpClient, which asserts modern headers on every call by design.
     #
     # So this group drives the same live hub through LegacyEraClient instead. It is
-    # deliberately small (three tests): the point is that the legacy wire still works
-    # end to end -- handshake, catalog, read, write -- not to re-prove tool behaviour the
-    # modern groups already cover on the same code.
+    # deliberately small (four tests): the point is that the legacy wire still works
+    # end to end -- handshake, catalog, read, write, and a fail-closed bulk stop that has no
+    # MRTR aggregation to lean on -- not to re-prove tool behaviour the modern groups already
+    # cover on the same code.
     # -----------------------------------------------------------------------
 
     @test("legacy_protocol")
@@ -14275,6 +14647,63 @@ class TestRunner:
         info = json.loads(text)
         assert isinstance(info, dict) and "platformUpdate" in info and "safeMode" in info, \
             f"legacy hub_get_info payload is not the hub-info shape: {sorted(info) if isinstance(info, dict) else type(info)}"
+
+    @test("legacy_protocol")
+    def test_legacy_bulk_stop_is_terminal(self) -> None:
+        """A legacy client receives a fail-closed bulk stop as a terminal envelope with no tail to re-issue.
+
+        A legacy client has no requestState: a budget checkpoint hands it the unprocessed items and it
+        re-issues them itself. That checkpoint is only reachable on a clean prefix, so the loop below
+        follows one the way a shipping client would, and the batch must still end at the failed item
+        with nothing handed back. The rule is tiny, so the call normally finishes in one round.
+        """
+        legacy = LegacyEraClient(self.client, verbose=self.verbose)
+        legacy.initialize(LEGACY_PROTOCOL_VERSION)
+        app_id = self._create_native_rule("LegacyStop")
+        kept, skipped = "E2E legacy stop kept", "E2E legacy stop skipped"
+        specs = [
+            {"capability": "log", "message": kept},
+            {"capability": "switch", "state": "on", "deviceIds": [int(self.get_test_switch_id())]},
+            {"capability": "log", "message": skipped},
+        ]
+
+        def _legacy_add(actions: list) -> dict:
+            try:
+                return legacy.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": {
+                    "appId": app_id, "confirm": True, "addActions": actions}})
+            except (McpError, McpToolError, requests.HTTPError) as exc:
+                if "504" not in str(exc):
+                    raise
+                raise RelayLostResponseError(
+                    "504 relay response loss erased the legacy fail-closed stop envelope; "
+                    "retry this test with its run-unique fixture"
+                ) from exc
+
+        try:
+            result = _legacy_add(specs)
+            rows: list = []
+            for _ in range(len(specs)):
+                if result.get("status") != "in_progress":
+                    break
+                remaining = result.get("addActionsRemaining") or []
+                slice_rows = result.get("actions") or []
+                assert result.get("success") is True and not result.get("partial") and remaining \
+                    and len(rows) + len(slice_rows) + len(remaining) == len(specs), \
+                    f"a legacy checkpoint must hand back a clean prefix and exactly the unrun items: {result}"
+                rows += slice_rows
+                result = _legacy_add(remaining)
+            offset = len(rows)
+            rows += result.get("actions") or []
+            assert len(rows) == 3 and rows[0].get("success") is not False \
+                and rows[1].get("success") is False, \
+                f"expected a clean action, then the refusal, then the skipped tail: rows={rows} final={result}"
+            # Without aggregation the stop is numbered within the round that ran it.
+            self._assert_bulk_stop(result, f"addActions[{1 - offset}]", rows[2:])
+            page = self._rule_page_text(app_id)
+            assert kept in page and skipped not in page, \
+                f"the legacy stop must keep the clean prefix and never write the tail: {page}"
+        finally:
+            self._delete_native(app_id)
 
     @test("legacy_protocol")
     def test_legacy_write_round_trip(self) -> None:
@@ -14381,7 +14810,7 @@ class TestRunner:
         4. Native RM apps + Visual Rules (tracked + prefix sweeps)
         5. mcptest throwaway app + driver code classes (namespace+name)
         6. Rooms (prefix sweep)
-        7. Throwaway bundle + library (mcptest namespace)
+        7. Throwaway bundle (mcptest namespace)
         8. Easy Dashboards (tracked + prefix sweep)
         9. File Manager files (prefix sweep, originals then their _backup_ spawn)
 
@@ -14664,24 +15093,6 @@ class TestRunner:
                         print(f"  [WARN] throwaway bundle sweep delete failed for '{b.get('name')}': {exc}")
         except Exception as exc:
             print(f"  [WARN] throwaway bundle sweep failed: {exc}")
-
-        # Layer 7b: the throwaway LIBRARY (mcptest namespace) the bundle delivered. Bundle delete does
-        # not cascade it, and the disarm no-stale gate only sweeps the 'mcp' namespace, so a crashed run
-        # can strand it in Libraries Code. Reclaim it here.
-        try:
-            lres = self.client.call_tool("hub_read_apps_code", {"tool": "hub_list_libraries"})
-            for lib in (lres.get("libraries", []) if isinstance(lres, dict) else []):
-                if lib.get("namespace") == "mcptest" and lib.get("id"):
-                    try:
-                        print(f"  Sweep: deleting throwaway library '{lib.get('name')}' (id={lib.get('id')})")
-                        self.client.call_tool("hub_manage_code", {
-                            "tool": "hub_delete_item",
-                            "args": {"type": "library", "item_id": str(lib.get("id")), "confirm": True},
-                        })
-                    except Exception as exc:
-                        print(f"  [WARN] throwaway library sweep delete failed for '{lib.get('name')}': {exc}")
-        except Exception as exc:
-            print(f"  [WARN] throwaway library sweep failed: {exc}")
 
         # Layer 8: Easy Dashboards with the BAT_E2E_ prefix (issue #259; dashboards impls in McpDashboardsLib).
         # The create/clone/delete test deletes the original inline; this reclaims the clone

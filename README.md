@@ -134,7 +134,7 @@ Alternatively, some people have had luck just simply giving Claude access to its
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Claude Desktop only launches **stdio** MCP servers from its config file — it does **not** accept a plain `"url"`/`"type": "url"` entry (those are silently ignored). Because this server speaks HTTP, you bridge it to stdio with a small proxy. Use the one that matches your OS: **`mcp-proxy` on Windows** (via [`uv`](https://docs.astral.sh/uv/getting-started/installation/)'s `uvx`), **`mcp-remote` on macOS** (via [Node.js](https://nodejs.org)'s `npx`). Install the matching runtime first.
+Claude Desktop only launches **stdio** MCP servers from its config file — it does **not** accept a plain `"url"`/`"type": "url"` entry (those are silently ignored). Because this server speaks HTTP, you bridge it to stdio with [`mcp-remote`](https://github.com/punkpeye/mcp-remote), run through [Node.js](https://nodejs.org)'s `npx` on both Windows and macOS. Install Node.js first.
 
 > **Easiest option:** skip the config file entirely and add the server in **Claude.ai** instead (see the *Claude.ai* section below). Connectors you add there automatically show up in Claude Desktop when signed in to the same account — no JSON editing, and it works from any chat.
 
@@ -146,30 +146,8 @@ To edit the config file manually, open Claude Desktop > **Settings** > **Develop
 > ```
 > The regular installer (`.exe`) build does use `%APPDATA%\Claude\…`. ([tracking bug](https://github.com/anthropics/claude-code/issues/26073))
 
-Add the block for your OS — use your **local** URL (`http://YOUR_HUB_IP/apps/api/123/mcp?access_token=YOUR_TOKEN`) or your **cloud** URL (`https://cloud.hubitat.com/api/YOUR_HUB_ID/apps/123/mcp?access_token=YOUR_TOKEN`) where shown. If you already have other MCP servers configured, merge the `hubitat` block into your existing `mcpServers` object instead of pasting over the whole file.
+Add this block, using your **local** URL (`http://YOUR_HUB_IP/apps/api/123/mcp?access_token=YOUR_TOKEN`) or your **cloud** URL (`https://cloud.hubitat.com/api/YOUR_HUB_ID/apps/123/mcp?access_token=YOUR_TOKEN`). If you already have other MCP servers configured, merge the `hubitat` block into your existing `mcpServers` object instead of pasting over the whole file.
 
-**Windows — [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) (via `uvx`).** Same block for the local or cloud URL:
-```json
-{
-  "mcpServers": {
-    "hubitat": {
-      "command": "uvx",
-      "args": [
-        "--with",
-        "mcp<2.0.0",
-        "mcp-proxy",
-        "--transport",
-        "streamablehttp",
-        "http://YOUR_HUB_IP/apps/api/123/mcp?access_token=YOUR_TOKEN"
-      ]
-    }
-  }
-}
-```
-
-> **The `--with "mcp<2.0.0"` lines are required** (and must come *before* `mcp-proxy` — `--with` is a `uv` option, not an `mcp-proxy` one): the `mcp` Python SDK 2.0.0 release (28 July 2026) removed an API that `mcp-proxy` 0.12.0 imports, and `mcp-proxy` sets no upper bound on the dependency, so an unpinned `uvx mcp-proxy` crashes on startup (`ImportError: cannot import name 'request_ctx'`) and the server never connects. Tracked upstream at [sparfenyuk/mcp-proxy#235](https://github.com/sparfenyuk/mcp-proxy/issues/235); once a fixed `mcp-proxy` release ships, the pin becomes unnecessary but is harmless to leave in place. If your previously working config broke around that date, this is why — add the two lines and fully restart Claude Desktop.
-
-**macOS — [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) (via `npx`).** Add `--allow-http` for a **local** (plain-HTTP) URL; omit it for the **cloud** (HTTPS) URL:
 ```json
 {
   "mcpServers": {
@@ -177,16 +155,24 @@ Add the block for your OS — use your **local** URL (`http://YOUR_HUB_IP/apps/a
       "command": "npx",
       "args": [
         "-y",
-        "mcp-remote",
+        "mcp-remote@latest",
         "http://YOUR_HUB_IP/apps/api/123/mcp?access_token=YOUR_TOKEN",
         "--transport",
         "http-only",
+        "--protocol",
+        "auto",
         "--allow-http"
       ]
     }
   }
 }
 ```
+
+- `--allow-http` is required for the **local** (plain-HTTP) URL. Remove it when using the **cloud** (HTTPS) URL. Plain HTTP sends your access token unencrypted, so use the local URL only on a trusted network.
+- `--protocol auto` lets `mcp-remote` use MCP 2026-07-28 with the hub, so slow writes (rules, native apps, drivers, device changes) that need more than one request complete instead of showing a generic error.
+- To troubleshoot, add `"--debug"` to `args`; `mcp-remote` then writes a verbose log under `~/.mcp-auth/` (`%USERPROFILE%\.mcp-auth\` on Windows). That log includes your full connect URL and access token, so redact it before sharing.
+
+> **Previously used `mcp-proxy` (`uvx`)?** Replace that block with the one above. `mcp-proxy` 0.12.0 (its latest release, May 2026) crashes on startup without a `--with "mcp<2.0.0"` pin since the `mcp` Python SDK 2.0.0 release (28 July 2026), and it can't complete the hub's multi-request slow writes. See [#373](https://github.com/kingpanther13/Hubitat-local-MCP-server/issues/373).
 
 Save the file, then fully restart Claude Desktop (Quit from the system tray / menu bar — closing the window is not enough). The Hubitat tools appear under the tools (🔨) icon.
 
@@ -423,7 +409,7 @@ Monitoring tools are gated by the Read master (ON by default).
 |------|-------------|
 | `hub_list_variables` | List all hub connector and rule engine variables |
 | `hub_get_variable` | Get a variable value and metadata |
-| `hub_list_variable_changes` | Recent hub-variable changes since the MCP app last started |
+| `hub_list_variable_changes` | Latest 200 subscribed hub-variable changes, retained across restarts |
 
 </details>
 
@@ -484,7 +470,7 @@ Monitoring tools are gated by the Read master (ON by default).
 | `hub_delete_variable` | Permanently delete a hub variable (DESTRUCTIVE) |
 | `hub_create_connector` | Create a virtual-device connector for a hub variable |
 | `hub_delete_connector` | Remove the connector device for a hub variable |
-| `hub_list_variable_changes` | Recent hub-variable changes since the MCP app last started (also in `hub_read_variables`) |
+| `hub_list_variable_changes` | Latest 200 subscribed hub-variable changes, retained across restarts (also in `hub_read_variables`) |
 
 </details>
 
@@ -860,13 +846,13 @@ Each picker entry shows the bare tool name, its friendly name, a `[read]`/`[writ
 <details>
 <summary><b>Item Backup & Restore</b></summary>
 
-When you use `hub_update_app`, `hub_update_driver`, or `hub_delete_item` (type: app|driver), the server automatically saves the **original source code** before making changes.
+When you use `hub_update_app`, `hub_update_driver`, `hub_update_library`, or `hub_delete_item` (type: app|driver|library), the server automatically saves the **original source code** before making changes.
 
 - Backups stored as `.groovy` files in the hub's local **File Manager**
-- Named `mcp-backup-app-<id>.groovy` or `mcp-backup-driver-<id>.groovy`
+- Named `mcp-backup-app-<id>.groovy`, `mcp-backup-driver-<id>.groovy` or `mcp-backup-library-<id>.groovy`; a replacement taken while the previous one is still indexed carries a `-<uuid>` suffix before `.groovy`
 - Persist even if the MCP app is uninstalled
 - Downloadable at `http://<your-hub-ip>/local/<filename>`
-- Max 20 kept; oldest pruned automatically
+- Max 20 kept in total across source, rule-snapshot and pre-restore backups; oldest pruned automatically
 - 1-hour protection window: multiple edits preserve the pre-edit original
 
 **Restore via MCP:**
@@ -875,7 +861,7 @@ When you use `hub_update_app`, `hub_update_driver`, or `hub_delete_item` (type: 
 
 **Restore manually (without MCP):**
 1. Go to Hubitat web UI > **Settings** > **File Manager**
-2. Download the backup file (e.g., `mcp-backup-app-123.groovy`)
+2. Download the exact file reported by `hub_list_backups` for `app_123`. Without MCP, identify `mcp-backup-app-123.groovy` or its `mcp-backup-app-123-<uuid>.groovy` replacement and inspect its source before restoring; an unindexed leftover file may be newer.
 3. Go to **Apps Code** (or **Drivers Code**) > select the app > paste source > **Save**
 
 </details>
@@ -930,6 +916,15 @@ Native API authentication uses HTTP over loopback (`127.0.0.1`) inside the hub. 
 Make sure the device is selected in the app's "Select Devices for MCP Access" setting.
 
 Alternatively, the app's Device Access section has a **Bypass Device Allowlist** toggle (default OFF). When ON, all native device operations can reach **any** device on the hub by id, including inventory, state, commands, updates, history, dependents, health, and both swap/replace endpoints. Virtual inventory and virtual deletion remain scoped to MCP-owned children. Administrative force-delete uses its separate confirmation/backup gate and is not allowlist gated. It is settable from that checkbox or via `hub_update_mcp_settings`, and its effect is independent of Developer Mode. ⚠ This removes the device-selection security boundary — enable it only if you intend to expose the whole hub.
+
+</details>
+
+<details>
+<summary><b>Claude Desktop won't connect, or slow writes show a generic error</b></summary>
+
+- **An `mcp-proxy` (`uvx`) config stopped connecting** (often `ImportError: cannot import name 'request_ctx'`): switch to the `mcp-remote` setup in the *Claude Desktop* section above.
+- **A write returns "Error occurred during tool execution" with no result:** the client didn't continue a slow write. In Claude Desktop, use `mcp-remote` with `--protocol auto`. Claude.ai connectors don't continue these writes yet. The write still finishes on the hub, so check `hub_get_info` → `recentWrites` and read the target before repeating it.
+- After editing the config, fully quit Claude Desktop (system tray / menu bar), not just the window.
 
 </details>
 
@@ -1660,6 +1655,9 @@ For easier bug reporting:
 
 ## Version History
 
+- **v4.3.4** - fix: stop bulk rule edits at the first failed or partial item. PRs: [#425](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/425)
+- **v4.3.3** - docs: recommend mcp-remote for Claude Desktop on all platforms; fix: coordinate retained backups and recovery state. PRs: [#430](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/430), [#419](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/419)
+- **v4.3.2** - fix: complete sandbox Map validation and enforce blocking lint. PRs: [#418](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/418)
 - **v4.3.1** - fix: run MRTR writes in the first request instead of a mutation-free preflight. PRs: [#422](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/422)
 - **v4.3.0** - fix: expire retained request state reliably; fix: use native device operations while honoring the allowlist. PRs: [#417](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/417), [#420](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/420)
 - **v4.2.7** - fix: preserve sandbox Map keys across tool boundaries; feat: expose device preferences and repair device diagnostics. PRs: [#416](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/416), [#411](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/411)

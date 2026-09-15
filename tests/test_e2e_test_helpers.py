@@ -8,7 +8,9 @@ actually runs there.
 import json
 import os
 import sys
+import zipfile
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 
 # tests/ is already on sys.path conceptually, but be explicit for safety.
@@ -1375,6 +1377,31 @@ def test_call_tool_retains_physical_leg_telemetry_when_a_continuation_504s():
     ]
 
 
+def test_failure_diagnostic_retains_transport_operation_after_successful_cleanup():
+    client = et.HubitatMcpClient("http://hub.invalid", "1", "unused")
+    failure = et.RelayLostResponseError("504 Gateway Timeout on tools/call")
+
+    def send(method, params=None, **_kwargs):
+        if params["name"] == "hub_get_source":
+            raise failure
+        assert params["name"] == "hub_delete_file"
+        return _raw_tool_body({"success": True})
+
+    client._send = send
+    with pytest.raises(et.RelayLostResponseError) as caught:
+        try:
+            client.call_tool("hub_get_source", {"type": "library", "id": "42"}, flat=True)
+        finally:
+            client.call_tool("hub_delete_file", {"fileName": "owned-backup", "confirm": True}, flat=True)
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = client
+    assert caught.value is failure
+    assert client._last_op[0] == "hub_delete_file"
+    assert runner._last_op_str(caught.value).startswith("hub_get_source ")
+    assert runner._last_op_str(caught.value).endswith(" [err]")
+
+
 def test_call_tool_paces_ten_same_state_contention_rounds_and_still_completes(monkeypatch):
     client = object.__new__(et.HubitatMcpClient)
     client.op_timings = []
@@ -1490,8 +1517,13 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
             return {
                 "success": False,
                 "partial": True,
+                "bulkStoppedAfter": "patches[1]",
+                "finalisationNotAttempted": True,
+                "error": "Stopped after patches[1] failed: refused. Later items were not attempted and finalisation was not fired.",
                 "patchResults": [{"op": "addAction", "success": True, "actionIndex": 3}],
-                "patches": [{"op": "addAction", "success": False, "error": "refused"}],
+                "patches": [{"op": "addAction", "success": False, "error": "refused"},
+                            {"op": "addAction", "success": False, "notAttempted": True,
+                             "error": "not attempted: bulk stopped after patches[1] failed or was partial"}],
                 "health": {"ok": True},
             }
 
@@ -1499,6 +1531,7 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
     patches = [
         {"addAction": {"capability": "log", "message": "land"}},
         {"addAction": {"capability": "switch", "state": "on"}},
+        {"addAction": {"capability": "log", "message": "skipped"}},
     ]
 
     entries = runner._patch_rule(42, patches, expected_refusals=1)
@@ -1506,6 +1539,8 @@ def test_patch_rule_returns_all_checkpointed_entries_from_one_logical_call():
     assert entries == [
         {"op": "addAction", "success": True, "actionIndex": 3},
         {"op": "addAction", "success": False, "error": "refused"},
+        {"op": "addAction", "success": False, "notAttempted": True,
+         "error": "not attempted: bulk stopped after patches[1] failed or was partial"},
     ]
     assert calls == [("hub_manage_rule_machine", {
         "tool": "hub_set_rule",
@@ -1531,6 +1566,58 @@ def test_patch_rule_rejects_terminal_activation_failure():
         runner._patch_rule(42, [{"addAction": {"capability": "log", "message": "x"}}])
 
 
+def _stop_envelope(**overrides):
+    envelope = {
+        "success": False,
+        "partial": True,
+        "bulkStoppedAfter": "addActions[1]",
+        "finalisationNotAttempted": True,
+        "error": "Stopped after addActions[1] failed: refused. Later items were not attempted and finalisation was not fired.",
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def test_assert_bulk_stop_accepts_the_fail_closed_contract():
+    tail = [{"success": False, "notAttempted": True}]
+    et.TestRunner._assert_bulk_stop(_stop_envelope(), "addActions[1]", tail)
+    et.TestRunner._assert_bulk_stop(
+        _stop_envelope(error="Stopped after addActions[1] reported partial. Later items were not attempted."),
+        "addActions[1]", tail, partial_item=True)
+
+
+@pytest.mark.parametrize("override, tail, message", [
+    ({"bulkStoppedAfter": "addActions[0]"}, [], "bulkStoppedAfter"),
+    ({"finalisationNotAttempted": None}, [], "finalisationNotAttempted"),
+    ({"error": "One or more items failed"}, [], "name the stopping item"),
+    ({}, [{"success": False}], "notAttempted"),
+    ({"addActionsRemaining": [{"capability": "log"}]}, [], "skipped tail"),
+    ({"success": True}, [], "success:false"),
+])
+def test_assert_bulk_stop_rejects_a_broken_stop(override, tail, message):
+    with pytest.raises(AssertionError, match=message):
+        et.TestRunner._assert_bulk_stop(_stop_envelope(**override), "addActions[1]", tail)
+
+
+def test_patch_rule_rejects_a_refusal_without_the_stop_contract():
+    class FakeClient:
+        def call_tool(self, _name, _arguments):
+            return {
+                "success": False,
+                "partial": True,
+                "patches": [{"op": "addAction", "success": False, "error": "refused"},
+                            {"op": "addAction", "success": True}],
+                "health": {"ok": True},
+            }
+
+    runner = _native_rule_runner(FakeClient())
+
+    with pytest.raises(AssertionError, match="bulkStoppedAfter"):
+        runner._patch_rule(42, [{"addAction": {"capability": "switch", "state": "on"}},
+                                {"addAction": {"capability": "log", "message": "x"}}],
+                           expected_refusals=1)
+
+
 def test_create_native_rule_relay_lost_adoption_marks_bundled_fixture_for_readback(
     monkeypatch,
 ):
@@ -1545,7 +1632,7 @@ def test_create_native_rule_relay_lost_adoption_marks_bundled_fixture_for_readba
             if len(calls) == 1:
                 raise et.RelayLostResponseError("504 Gateway Timeout")
             if len(calls) == 2:
-                assert name == "hub_manage_native_rules_and_apps"
+                assert name == "hub_read_rules"
                 return {"rules": [{"id": 43, "label": "BAT_E2E_AdoptedCreate_run_1_1"}]}
             assert name == "hub_read_apps_code"
             return {
@@ -1606,7 +1693,7 @@ def test_create_native_rule_relay_lost_waits_for_delayed_exact_match(monkeypatch
                 raise et.RelayLostResponseError("504 Gateway Timeout")
             if len(calls) == 2:
                 return {"rules": [{"id": 99, "label": "some other rule"}]}
-            assert name == "hub_manage_native_rules_and_apps"
+            assert name == "hub_read_rules"
             return {"rules": [{"id": 43, "label": "BAT_E2E_Delayed_run_1_1"}]}
 
     runner = _native_rule_runner(FakeClient())
@@ -1618,9 +1705,50 @@ def test_create_native_rule_relay_lost_waits_for_delayed_exact_match(monkeypatch
     assert result == (43, None)
     assert [name for name, _arguments in calls] == [
         "hub_manage_rule_machine",
-        "hub_manage_native_rules_and_apps",
-        "hub_manage_native_rules_and_apps",
+        "hub_read_rules",
+        "hub_read_rules",
     ]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_create_native_rule_recovers_lookup_transport_without_replaying_create(monkeypatch, persistent):
+    posts = []
+    client = et.HubitatMcpClient("http://hub.invalid", "1", "unused")
+    client._gateway_members = {
+        "hub_manage_rule_machine": {"hub_set_rule"},
+        "hub_manage_native_rules_and_apps": {"hub_list_rules"},
+        "hub_read_rules": {"hub_list_rules"},
+    }
+    client._gateway_route = {}
+    client._read_only_catalog_tools = {"hub_read_rules"}
+
+    def post(*args, **kwargs):
+        params = kwargs["json"]["params"]
+        posts.append(params)
+        if params["arguments"]["tool"] == "hub_set_rule" or len(posts) == 2 or persistent:
+            return SimpleNamespace(status_code=504, reason="Gateway Timeout")
+        result = _raw_tool_body({"rules": [{"id": 43, "label": "BAT_E2E_ReadRecovery_run_1_1"}]})
+        return SimpleNamespace(
+            status_code=200, reason="OK", raise_for_status=lambda: None,
+            json=lambda: {"jsonrpc": "2.0", "id": 1, "result": result},
+        )
+
+    client.session = SimpleNamespace(post=post)
+    runner = _native_rule_runner(client)
+    monkeypatch.setattr(et.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(et, "_run_artifact_suffix", lambda: "run_1")
+
+    if persistent:
+        with pytest.raises(requests.HTTPError, match="504"):
+            runner._create_native_rule("ReadRecovery", return_result=True)
+        assert runner.created_native_app_ids == []
+        assert len(posts) == 4  # one uncertain create, three bounded read attempts
+    else:
+        assert runner._create_native_rule("ReadRecovery", return_result=True) == (43, None)
+        assert runner.created_native_app_ids == ["43"]
+        assert len(posts) == 3
+    assert [p["arguments"]["tool"] for p in posts].count("hub_set_rule") == 1
+    assert all(p["name"] == "hub_read_rules" for p in posts[1:])
 
 
 def test_create_native_rule_never_reissues_after_bounded_absence(monkeypatch):
@@ -1636,7 +1764,7 @@ def test_create_native_rule_never_reissues_after_bounded_absence(monkeypatch):
                 if create_calls == 1:
                     raise et.RelayLostResponseError("504 Gateway Timeout")
                 return {"success": True, "appId": 44, "ruleId": 44}
-            assert name == "hub_manage_native_rules_and_apps"
+            assert name == "hub_read_rules"
             return {"rules": []}
 
     runner = _native_rule_runner(FakeClient())
@@ -2266,6 +2394,21 @@ def test_export_bundle_uses_logical_writes_filtered_verification_and_exact_backu
     ]
 
 
+def test_bundle_fixture_contains_only_unused_app_code():
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    source_name = "mcptest.E2eThrowawayApp.groovy"
+    with zipfile.ZipFile(fixtures / "mcp-e2e-throwaway-bundle.zip") as bundle:
+        assert bundle.namelist() == [source_name, "install.txt", "update.txt"]
+        for manifest_name in ("install.txt", "update.txt"):
+            assert bundle.read(manifest_name).decode("utf-8").splitlines() == [
+                "mcptest", "mcptest_e2e_throwaway", f"app {source_name}",
+            ]
+        source = bundle.read(source_name).decode("utf-8")
+        assert source == (fixtures / "e2e-throwaway-app.groovy").read_text(encoding="utf-8")
+        assert 'name: "Deadman Test Target Bundle"' in source
+        assert 'namespace: "mcptest"' in source
+
+
 def test_delete_bundle_uses_logical_write_helper(monkeypatch):
     monkeypatch.setenv("PR_RAW_BASE", "https://raw.invalid/repo")
     monkeypatch.setenv("PR_HEAD_SHA_RESOLVED", "abc123")
@@ -2329,3 +2472,77 @@ def test_build_capacity_recovery_is_the_conformance_bounce_seam(monkeypatch):
     assert bounce.__func__ is et.TestRunner._clear_load_throttle
     assert sch.CAPACITY_RECOVERY_CONFIG_KEY == "clear_load_throttle"
     assert bounce("interface pin") is False
+
+
+@pytest.mark.parametrize("initial", ["on", "off"])
+@pytest.mark.parametrize("matches", [True, False])
+def test_poll_wall_clock_scenarios_use_observed_state_without_device_commands(monkeypatch, initial, matches):
+    clock = [0.0]
+    monkeypatch.setattr(et.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def call_tool(name, arguments):
+        assert name == "hub_get_device_attribute", "poll scenarios must not depend on command delivery"
+        calls.append(arguments.copy())
+        if "expectedValue" not in arguments:
+            return {"value": initial}
+        expected = initial if matches else ("off" if initial == "on" else "on")
+        assert arguments["expectedValue"] == expected
+        if not matches:
+            clock[0] += 2.0
+        return {"success": matches, "timedOut": not matches, "polledCount": 1 if matches else 11,
+                "finalValue": initial}
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = SimpleNamespace(call_tool=call_tool)
+    runner.get_test_switch_id = lambda: "owned-switch"
+    if matches:
+        runner.test_poll_immediate_match()
+    else:
+        runner.test_poll_timeout()
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stays_stale,logs_fail", [(False, False), (True, False), (True, True)])
+def test_lan_fixture_identity_waits_for_its_nonce_and_never_accepts_stale_observations(
+    monkeypatch, capsys, stays_stale, logs_fail,
+):
+    clock = [0.0]
+    monkeypatch.setattr(et.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(et.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    reads = []
+    log_reads = []
+
+    def call_tool(name, arguments):
+        if name == "hub_get_logs":
+            assert arguments == {"deviceId": "10", "level": "error", "limit": 10}
+            log_reads.append(arguments.copy())
+            runner.client._last_op = ("hub_get_logs", 0.2, not logs_fail)
+            if logs_fail:
+                raise et.McpToolError("hub_get_logs", "diagnostic unavailable")
+            return {"logs": [{"message": "fixture command rejected"}]}
+        assert name == "hub_get_device_attribute", "identity wait must not repeat the observer command"
+        runner.client._last_op = ("hub_get_device_attribute", 0.1, True)
+        assert arguments == {"deviceId": "10", "attribute": "nativeDeviceInfo"}
+        reads.append(arguments.copy())
+        native = {"nonce": "old", "deviceId": "other-fixture", "fixtureVersion": 2}
+        if not stays_stale and len(reads) > 1:
+            native.update(nonce="123", deviceId="10")
+        return {"value": json.dumps(native)}
+
+    runner = object.__new__(et.TestRunner)
+    runner.client = SimpleNamespace(call_tool=call_tool)
+    if stays_stale:
+        with pytest.raises(AssertionError, match="observer did not complete for device 10, nonce 123") as failure:
+            runner._wait_configuration_fixture_identity("10", "123")
+        assert failure.value._mcp_failed_op == ("hub_get_device_attribute", 0.1, True)
+        assert clock[0] == 10.0
+        assert len(log_reads) == 1
+        output = capsys.readouterr().out
+        assert "CONFIGURATION_OBSERVER_LOGS device 10" in output
+        assert ("diagnostic unavailable" if logs_fail else "fixture command rejected") in output
+    else:
+        result = runner._wait_configuration_fixture_identity("10", "123")
+        assert result["nonce"] == "123" and result["deviceId"] == "10"
+        assert len(reads) == 2
+        assert not log_reads

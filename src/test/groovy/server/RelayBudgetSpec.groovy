@@ -18,10 +18,9 @@ import support.ToolSpecBase
  *     on a pause; it fires when the remaining patches complete)
  *   - _applyNativeAppEdit -- between plain bulk addTriggers[]/addActions[] items (same
  *     deferred-updateRule contract; the trigger-loop pause hands back the unrun triggers
- *     AND every action). The bulk and patches pauses stop as soon as the budget is spent
- *     REGARDLESS of whether an earlier item failed -- continuing un-budgeted risks the
- *     relay dropping the whole response -- and surface any failed/degraded item in the
- *     pause envelope's success/partial rather than masking it as a clean success.
+ *     AND every action). Bulk items and patch ops fail closed: a failed or partial item or
+ *     op stops the batch before the checkpoint, so a resumable tail exists only while
+ *     every processed item is clean.
  *
  * The generic machinery (_isCloudRequest / _relayBudgetMs / _lanBudgetMs /
  * _timeBudgetExceeded) lives in the main file. The loop tests stub
@@ -321,33 +320,44 @@ class RelayBudgetSpec extends ToolSpecBase {
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    def "a patch op with a large inner addTriggers list pauses MID-op, rewriting the op into patchesRemaining"() {
+    // A failed inner trigger stops the batch before the mid-op checkpoint, so no remainder is offered.
+    // The clean mid-op trigger pause is pinned with hub fixtures in ToolRmNativeCrudSpec, because
+    // _rmAddTrigger is private and cannot be stubbed here.
+    def "a failed inner addTriggers item stops the patch batch before any mid-op pause"() {
         given:
         def addActionCalls = []
         def clicks = []
         installPatchStubs(addActionCalls, clicks, true)
 
-        when: 'ONE patch op carrying three inner addTriggers (first is a non-Map, recorded inline -- _rmAddTrigger is private/unstubbable); budget already blown'
+        when: 'ONE patch op whose first inner trigger is a non-Map, then an addAction op; budget already blown'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L, patches: [
             [addTriggers: [
                 'not-a-map',
                 [capability: 'Switch', state: 'off', deviceIds: [9]],
                 [capability: 'Motion', state: 'active', deviceIds: [10]],
             ]],
+            [addAction: [a: 1]],
         ]])
 
-        then: 'the budget paused after the first inner trigger, before the second'
-        result.status == 'in_progress'
+        then: 'no pause and no resumable remainder'
+        result.status != 'in_progress'
+        !result.containsKey('patchesRemaining')
+        addActionCalls.isEmpty()
 
-        and: 'patchesRemaining leads with the SAME op rewritten to its two unprocessed inner triggers'
-        result.patchesRemaining instanceof List
-        result.patchesRemaining.size() == 1
-        result.patchesRemaining[0].addTriggers instanceof List
-        result.patchesRemaining[0].addTriggers.size() == 2
-        result.patchesRemaining[0].addTriggers[0].state == 'off'
+        and: 'the later inner triggers and the later op are notAttempted'
+        def op = result.patches.find { it.op == 'addTriggers' }
+        op.results[0].success == false
+        op.results[1].notAttempted == true
+        op.results[2].notAttempted == true
+        result.patches[1].op == 'addAction'
+        result.patches[1].notAttempted == true
 
-        and: 'the op is recorded partial in patchResults and no updateRule fired'
-        result.patchResults.find { it.op == 'addTriggers' }?.partial == true
+        and: 'the stop is named and finalisation is skipped'
+        result.success == false
+        result.partial == true
+        result.bulkStoppedAfter == 'patches[0].addTriggers[0]'
+        result.finalisationNotAttempted == true
+        result.error?.startsWith('Stopped after patches[0].addTriggers[0] failed')
         !clicks.contains('updateRule')
         !JsonOutput.toJson(result).contains('__reqT0')
     }
@@ -425,23 +435,17 @@ class RelayBudgetSpec extends ToolSpecBase {
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    // A RUNNING trigger-loop pause: the trigger-loop checkpoint hands back a DISTINCT shape
-    // from the action-loop pause -- the unrun triggers PLUS every action (the action loop has
-    // not started). A SUCCEEDING-trigger running pause cannot be stubbed here: _rmAddTrigger is
-    // a PRIVATE method, so the intra-script call resolves invokespecial and a per-instance
-    // metaClass stub does not intercept it (unlike the non-private _rmAddAction). So exercise
-    // the real running loop via a non-Map trigger[0]: the loop records that failure INLINE (no
-    // _rmAddTrigger call needed) and the budget then pauses before trigger[1], driving the real
-    // checkpoint + trigList.subList(ti, ...) + actList carry-forward. The clean-partial return
-    // shape is pinned separately on _bulkPauseResult below.
-    def "the trigger-loop checkpoint hands back the unrun triggers AND all actions on a pause"() {
+    // Fail-closed bulk semantics: a non-Map trigger[0] is recorded inline as a failure and stops the
+    // batch before the budget checkpoint, so no trigger-loop pause occurs and the skipped tail is never
+    // offered for resumption. The clean-pause return shape is pinned separately on _bulkPauseResult below.
+    def "the trigger-loop checkpoint never offers a fail-closed tail for resumption"() {
         given:
         def triggerCalls = []
         def actionCalls = []
         def clicks = []
         installBulkStubs(triggerCalls, actionCalls, clicks, true)
 
-        when: 'trigger[0] is a non-Map (recorded inline, no _rmAddTrigger call); the budget then pauses before trigger[1]'
+        when: 'trigger[0] is a non-Map (recorded inline, no _rmAddTrigger call) while the budget reports exhausted'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L,
             addTriggers: [
                 'not-a-map',
@@ -453,30 +457,36 @@ class RelayBudgetSpec extends ToolSpecBase {
                 [capability: 'switch', action: 'off', deviceIds: [12]],
             ]])
 
-        then: 'the loop paused after item 0 (never before the first item); the action loop never started'
+        then: 'no action ran and no in_progress envelope hands back the skipped items'
         actionCalls.size() == 0
-        result.status == 'in_progress'
+        result.status != 'in_progress'
+        !result.containsKey('addTriggersRemaining')
+        !result.containsKey('addActionsRemaining')
 
-        and: 'the trigger-loop pause hands back the two unrun triggers AND every action'
-        result.addTriggersRemaining instanceof List
-        result.addTriggersRemaining.size() == 2
-        result.addTriggersRemaining[0].state == 'off'
-        result.addActionsRemaining instanceof List
-        result.addActionsRemaining.size() == 2
+        and: 'every later trigger and every action is reported notAttempted'
+        result.triggers.size() == 3
+        result.triggers[1].notAttempted == true
+        result.triggers[2].notAttempted == true
+        result.actions.size() == 2
+        result.actions.every { it.notAttempted == true }
 
-        and: 'item 0 failed, so the pause surfaces success:false + partial rather than masking it'
+        and: 'item 0 failed, so the result surfaces success:false + partial rather than masking it'
         result.success == false
         result.partial == true
 
-        and: 'the deferred trailing updateRule did NOT fire on the pause'
+        and: 'the stop is named and the trailing updateRule is not fired'
+        result.bulkStoppedAfter == 'addTriggers[0]'
+        result.finalisationNotAttempted == true
+        result.error?.startsWith('Stopped after addTriggers[0] failed: addTriggers[0] is not a Map')
         !clicks.contains('updateRule')
+
+        and: 'no internal budget marker is echoed back'
         !JsonOutput.toJson(result).contains('__reqT0')
     }
 
-    // A pause fired AFTER a committed item failed: the batch still stops on the budget (to
-    // protect the response from a relay drop) but the failure is surfaced in the outer
-    // success/partial, not masked as a clean in_progress success.
-    def "a bulk pause after a failed item surfaces success:false + partial, not a clean success"() {
+    // A failed item stops the batch (fail-closed) before the budget checkpoint can pause, so no further
+    // hub work runs and no resumable tail is offered; the failure is surfaced, not masked.
+    def "a failed item ends the batch before any budget pause and surfaces success:false + partial"() {
         given:
         def actionCalls = []
         def clicks = []
@@ -492,24 +502,50 @@ class RelayBudgetSpec extends ToolSpecBase {
                                                String pageName = null, Map cache = null -> clicks << name }
         script.metaClass._timeBudgetExceeded = { Long t0 -> true }
 
-        when: 'the first action fails, then the budget pauses before the second'
+        when: 'the first action fails while the budget reports exhausted'
         def result = script._applyNativeAppEdit([appId: 1, confirm: true, __reqT0: 2000L, addActions: [
             [capability: 'switch', action: 'on', deviceIds: [8]],
             [capability: 'switch', action: 'off', deviceIds: [9]],
         ]])
 
-        then: 'the batch STILL paused (protecting the relay) even though item 0 failed'
+        then: 'the batch stopped at item 0: no pause, no resumable remainder'
         actionCalls.size() == 1
-        result.status == 'in_progress'
-        result.addActionsRemaining.size() == 1
+        result.status != 'in_progress'
+        !result.containsKey('addActionsRemaining')
+        result.actions[1].notAttempted == true
 
         and: 'the failure is bubbled up, NOT masked as a clean success'
         result.success == false
         result.partial == true
         result.repairHints instanceof List && !result.repairHints.isEmpty()
 
-        and: 'the deferred updateRule did not fire'
+        and: 'the stop is named and the trailing updateRule is not fired'
+        result.bulkStoppedAfter == 'addActions[0]'
+        result.finalisationNotAttempted == true
+        result.error == 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.'
         !clicks.contains('updateRule')
+    }
+
+    def "_rmBulkStopError carries a partial item's most specific reason when the item has no error"() {
+        expect:
+        script._rmBulkStopError('addActions[1]', item) == expected
+
+        where:
+        item << [
+            [success: true, partial: true, error: 'kept first', updateRuleError: 'ignored'],
+            [success: true, partial: true, updateRuleError: 'updateRule rejected'],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop'], [key: 'tstate1', reason: 'silent_rejection']],
+             repairHints: ['later hint']],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']], repairHints: ['', 'Re-add the comparator.']],
+            [success: true, partial: true, settingsSkipped: [[key: 'useST', reason: 'useST_idempotent_noop']]]
+        ]
+        expected << [
+            'Stopped after addActions[1] reported partial: kept first. Later items were not attempted and finalisation was not fired.',
+            'Stopped after addActions[1] reported partial: updateRule rejected. Later items were not attempted and finalisation was not fired.',
+            "Stopped after addActions[1] reported partial: field 'tstate1' was not applied (silent_rejection). Later items were not attempted and finalisation was not fired.",
+            'Stopped after addActions[1] reported partial: Re-add the comparator. Later items were not attempted and finalisation was not fired.',
+            'Stopped after addActions[1] reported partial. Later items were not attempted and finalisation was not fired.'
+        ]
     }
 
     // Pin the trigger-pause return shape directly on _bulkPauseResult too -- a
