@@ -104,7 +104,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     addTriggers: [
                         type: "array",
-                        description: "Bulk-add triggers (each item the same shape as addTrigger); updateRule fires ONCE at the end. Pairs with addActions to build a whole rule in one call.",
+                        description: "Bulk-add triggers (each item the same shape as addTrigger); updateRule fires ONCE at the end. The first failed or partial item stops the batch: later items are notAttempted and updateRule is not fired. Pairs with addActions to build a whole rule in one call.",
                         items: [type: "object"]
                     ],
                     addRequiredExpression: [
@@ -118,7 +118,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
 
                     addActions: [
                         type: "array",
-                        description: "Bulk-add actions (each item the same shape as addAction; actions self-bake via doActPage); updateRule fires once at the end. Pairs with addTriggers.",
+                        description: "Bulk-add actions (each item the same shape as addAction; actions self-bake via doActPage); updateRule fires once at the end. The first failed or partial item stops the batch: later items are notAttempted and updateRule is not fired. Pairs with addTriggers.",
                         items: [type: "object"]
                     ],
                     addLocalVariable: [
@@ -131,7 +131,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     patches: [
                         type: "array",
-                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i] (one op failing doesn't abort the rest).",
+                        description: "Atomic multi-mutation: each item is a sub-spec with ONE operation key (settings, button, addTrigger(s), addAction(s), addRequiredExpression, replaceRequiredExpression, addLocalVariable, removeLocalVariable, removeAction, clearActions, replaceActions, moveAction). Operations run sequentially; updateRule fires once at the end; per-op outcome in patches[i]. The first failed or partial op or inner item stops the batch: later ops are notAttempted and updateRule is not fired.",
                         items: [type: "object"]
                     ],
                     removeAction: [
@@ -144,7 +144,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     replaceActions: [
                         type: "array",
-                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
+                        description: "Atomically replace the entire action list: clears all actions, bulk-adds every spec here (same shape as addAction items), then updateRule once. The first failed or partial added item stops the rest (notAttempted, no updateRule); the old list is already cleared. Pass [] to clear all (= clearActions). On asyncCommitLikely:true verify before retrying; do NOT call cancelTrash.",
                         items: [type: "object"]
                     ],
                     moveAction: [
@@ -9995,8 +9995,9 @@ def _createNativeAppShell(args) {
         // populate from a fully-loaded rule (avoids N redundant inits).
         def triggerSpecs = args?.triggers instanceof List ? (args.triggers as List) : []
         def triggerResults = []
-        // Fork patch C: the first failed or partial item stops every later mutation and finalisation.
+        // Fail closed: the first failed or partial item stops every later mutation and finalisation.
         String createStopAfter = null
+        def createStopItem = null
         if (triggerSpecs) {
             triggerSpecs.eachWithIndex { spec, i ->
                 if (createStopAfter) { triggerResults << _rmBulkNotAttempted(createStopAfter); return }
@@ -10010,7 +10011,7 @@ def _createNativeAppShell(args) {
                         mcpLog("warn", "rm-native", "hub_set_rule: trigger ${i} (capability=${spec.capability}) failed -- ${te.message}")
                     }
                 }
-                if (_rmBulkItemBlocks(triggerResults.last())) createStopAfter = "triggers[${i}]".toString()
+                if (_rmBulkItemBlocks(triggerResults.last())) { createStopAfter = "triggers[${i}]".toString(); createStopItem = triggerResults.last() }
             }
             // Re-init once after all triggers are committed.
             if (!createStopAfter) _rmClickAppButton(newId, "updateRule")
@@ -10045,7 +10046,7 @@ def _createNativeAppShell(args) {
             // harmless (triggers->updateRule->actions->updateRule already fires
             // multiple per session). On failure, degrade reResult honestly so a
             // dormant RE is not reported as live.
-            if (_rmBulkItemBlocks(reResult)) createStopAfter = "requiredExpression"
+            if (_rmBulkItemBlocks(reResult)) { createStopAfter = "requiredExpression"; createStopItem = reResult }
             if (reResult instanceof Map && !createStopAfter) {
                 try {
                     _rmClickAppButton(newId, "updateRule")
@@ -10056,7 +10057,7 @@ def _createNativeAppShell(args) {
                     reResult.partial = true
                     mcpLog("warn", "rm-native", "hub_set_rule: requiredExpression trailing updateRule click failed for app ${newId} -- expression may not be live: ${reUpdExc.message}")
                 }
-                if (_rmBulkItemBlocks(reResult)) createStopAfter = "requiredExpression"
+                if (_rmBulkItemBlocks(reResult)) { createStopAfter = "requiredExpression"; createStopItem = reResult }
             }
         }
 
@@ -10083,7 +10084,7 @@ def _createNativeAppShell(args) {
                         mcpLog("warn", "rm-native", "hub_set_rule: action ${i} (${spec.capability}/${spec.action}) failed -- ${ae.message}")
                     }
                 }
-                if (_rmBulkItemBlocks(actionResults.last())) createStopAfter = "actions[${i}]".toString()
+                if (_rmBulkItemBlocks(actionResults.last())) { createStopAfter = "actions[${i}]".toString(); createStopItem = actionResults.last() }
             }
             // After bulk-add, navigate selectActions → mainPage via
             // _action_previous=Done — mirrors the live UI's "Done with
@@ -10199,8 +10200,9 @@ def _createNativeAppShell(args) {
             result.partial = true
             result.bulkStoppedAfter = createStopAfter
             result.finalisationNotAttempted = true
-            result.note = "Created ${appType} app (id=${newId}) but stopped after ${createStopAfter} failed or was partial: later triggers, Required Expression and actions were not attempted, and the trailing updateRule and mainPage Done were not fired.".toString()
-            result.repairHints = (result.repairHints ?: []) + ["Creation stopped fail-closed after ${createStopAfter}. Inspect with hub_get_app_config(appId=${newId}); delete the incomplete rule and re-create it, or repair the failed item and add the notAttempted items, then fire hub_set_rule(button='updateRule') and re-run hub_get_rule_health.".toString()]
+            result.error = _rmBulkStopError(createStopAfter, createStopItem)
+            result.note = "Created ${appType} app (id=${newId}) but stopped after ${createStopAfter} failed or was partial: items after the stopping item were not attempted, and the remaining updateRule and mainPage Done were not fired. Sections before the stop may already have been finalised.".toString()
+            result.repairHints = (result.repairHints ?: []) + ["Creation stopped fail-closed after ${createStopAfter}. A new rule has no pre-operation backup: inspect with hub_get_app_config(appId=${newId}), then either delete the incomplete rule and re-create it, or repair the failed item and add the notAttempted items, fire hub_set_rule(button='updateRule') and re-run hub_get_rule_health.".toString()]
         }
         if (triggerSpecs) result.triggers = triggerResults
         if (actionSpecs) result.actions = actionResults
@@ -13364,17 +13366,6 @@ private _stripInternalClock(rem) {
     return (rem instanceof Map) ? ((Map) rem).findAll { k, v -> k?.toString() != "__reqT0" } : rem
 }
 
-// Time-budget pause envelope for the bulk addTriggers/addActions path -- mirrors the
-// in_progress shape the walkStep-drive step loop and the patches op loop return. The
-// checkpoint stops the batch as soon as the time budget is exceeded (protecting the
-// response from a transport drop) REGARDLESS of whether an earlier item failed; the outer
-// success/partial here are computed from the committed items exactly like the
-// normal-completion return, so a committed-but-degraded or failed item is bubbled up (not
-// masked as clean) across the resume boundary. Health is intentionally NOT gated: the
-// trailing updateRule is deferred to the resume call, so subscriptions are legitimately
-// not-yet-live at a pause and gating success on health would falsely fail every pause. The
-// unprocessed items are handed back (minus the internal __reqT0 clock) for the caller to
-// re-issue.
 // Fail-closed bulk contract: a failed or partial item stops every later mutation and finalisation.
 private boolean _rmBulkItemBlocks(r) {
     return r instanceof Map && (r.success == false || r.partial == true)
@@ -13384,7 +13375,20 @@ private Map _rmBulkNotAttempted(String stoppedAfter) {
     return [success: false, notAttempted: true, error: "not attempted: bulk stopped after ${stoppedAfter} failed or was partial".toString()]
 }
 
-private Map _rmBulkStoppedResult(Integer appId, Map backup, String stoppedAfter, Map extra) {
+// Top-level error for a stopped batch, naming the stopping item and why. The MRTR recentWrites record keeps
+// only success, ids and error from a terminal result, so this is all a client that never saw the response gets.
+private String _rmBulkStopError(String stoppedAfter, stopItem) {
+    def item = (stopItem instanceof Map) ? (Map) stopItem : [:]
+    String why = item.success == false ? "failed" : "reported partial"
+    String itemError = item.error?.toString()?.trim()
+    while (itemError?.endsWith(".")) itemError = itemError.substring(0, itemError.length() - 1)
+    String detail = itemError ? ": ${itemError}" : ""
+    return "Stopped after ${stoppedAfter} ${why}${detail}. Later items were not attempted and finalisation was not fired.".toString()
+}
+
+// Edit and replace stop envelope. Skipping finalisation is not a rollback: items before the stop stay written, and
+// actions self-bake, so they can already affect an active rule. The pre-operation backup is the rollback handle.
+private Map _rmBulkStoppedResult(Integer appId, Map backup, String stoppedAfter, stopItem, Map extra) {
     def out = [
         success: false,
         partial: true,
@@ -13392,14 +13396,21 @@ private Map _rmBulkStoppedResult(Integer appId, Map backup, String stoppedAfter,
         backup: backup,
         bulkStoppedAfter: stoppedAfter,
         finalisationNotAttempted: true,
-        health: _rmCheckRuleHealth(appId),
-        repairHints: ["Stopped fail-closed after ${stoppedAfter}: later items were not attempted and the trailing updateRule was not fired. Inspect with hub_get_app_config(appId=${appId}); repair the failed item and add the notAttempted items, or roll back via hub_restore_backup(backupKey='${backup?.backupKey}'). Fire hub_set_rule(button='updateRule') only once the rule is complete.".toString()],
+        error: _rmBulkStopError(stoppedAfter, stopItem),
+        health: (extra?.containsKey("health") ? extra.health : _rmCheckRuleHealth(appId)),
+        repairHints: ["Stopped fail-closed after ${stoppedAfter}: later items were not attempted and the trailing updateRule was not fired. Items before it remain written and can already affect the rule (actions self-bake). Inspect with hub_get_app_config(appId=${appId}); repair the failed item and add the notAttempted items, or roll back via hub_restore_backup(backupKey='${backup?.backupKey}'). Fire hub_set_rule(button='updateRule') only once the rule is complete.".toString()],
         note: "Stopped after ${stoppedAfter} failed or was partial; finalisation not attempted.".toString()
     ]
     out.putAll(extra ?: [:])
     return out
 }
 
+// Time-budget pause envelope for the bulk addTriggers/addActions path -- mirrors the in_progress shape the
+// walkStep-drive step loop and the patches op loop return. A pause is only reachable while every committed item
+// is clean (a failed or partial item stops the batch first), so this hands back a clean prefix plus the
+// unprocessed items (minus the internal __reqT0 clock) for the caller to re-issue. The itemsPartial roll-up is a
+// defensive guard should that ordering ever change. Health is intentionally NOT gated: the trailing updateRule is
+// deferred to the resume call, so subscriptions are legitimately not-yet-live at a pause.
 private Map _bulkPauseResult(Integer appId, Map backup, List triggerResults, List actionResults,
                                   List addTriggersRemaining, List addActionsRemaining) {
     def trigOk = triggerResults.count { it?.success != false }
@@ -13432,11 +13443,11 @@ private Map _bulkPauseResult(Integer appId, Map backup, List triggerResults, Lis
 
 // Time-budget pause envelope for the patches path. Fires at the patch-op boundary AND (for a
 // bulk addTriggers/addActions sub-op) mid-op, so a single patch op carrying a large inner list
-// can no longer exhaust the time budget un-paused. Like the bulk pause, it stops as soon as the
-// budget is exceeded regardless of an earlier op's outcome (an un-budgeted continuation risks a
-// dropped response), and computes outer success/partial from the ops so far. patchesRemaining is
-// the un-processed work the caller re-issues -- for a mid-op pause the caller prepends the current
-// op rewritten to only its un-processed inner items.
+// can no longer exhaust the time budget un-paused. As with the bulk pause, a failed or partial op
+// or inner item stops the batch before any checkpoint, so a pause only ever hands back work after a
+// clean prefix; the success/partial roll-up is a defensive guard. patchesRemaining is the
+// un-processed work the caller re-issues -- for a mid-op pause the caller prepends the current op
+// rewritten to only its un-processed inner items.
 private Map _patchesPauseResult(Integer appId, Map backup, List patchResults, List patchesRemaining) {
     def opPartial = patchResults.any { it instanceof Map && (it.success == false || it.partial == true) }
     return [
@@ -13866,6 +13877,7 @@ def _applyNativeAppEdit(args) {
         def removed = []
         def addedResults = []
         String replaceStopAfter = null
+        def replaceStopItem = null
         // moveAction rich return ({beforePosition, afterPosition, indicesAfter}).
         // Hoisted for the same block-scope reason as the others above.
         def moveResult = null
@@ -13984,7 +13996,7 @@ def _applyNativeAppEdit(args) {
             }
             if (replaceActionsList != null) {
                 replaceActionsList.eachWithIndex { spec, i ->
-                    // Fork patch C: the first failed or partial item stops every later add and finalisation.
+                    // Fail closed: the first failed or partial item stops every later add and finalisation.
                     if (replaceStopAfter) { addedResults << _rmBulkNotAttempted(replaceStopAfter); return }
                     if (!(spec instanceof Map)) {
                         addedResults << [success: false, error: "replaceActions[${i}] is not a Map", spec: spec]
@@ -13995,7 +14007,7 @@ def _applyNativeAppEdit(args) {
                             mcpLog("warn", "rm-native", "hub_set_rule: replaceActions[${i}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
                         }
                     }
-                    if (_rmBulkItemBlocks(addedResults.last())) replaceStopAfter = "replaceActions[${i}]".toString()
+                    if (_rmBulkItemBlocks(addedResults.last())) { replaceStopAfter = "replaceActions[${i}]".toString(); replaceStopItem = addedResults.last() }
                 }
             }
         } catch (Exception e) {
@@ -14091,7 +14103,7 @@ def _applyNativeAppEdit(args) {
             return result
         }
         if (replaceStopAfter) {
-            return _rmBulkStoppedResult(appId, backup, replaceStopAfter, [removedIndices: removed ?: null, addedActions: addedResults])
+            return _rmBulkStoppedResult(appId, backup, replaceStopAfter, replaceStopItem, [removedIndices: removed ?: null, addedActions: addedResults])
         }
         // Trailing updateRule fires AFTER mutation block completes. Hoisted
         // out of the per-item try so a rejection here doesn't get routed
@@ -14118,14 +14130,6 @@ def _applyNativeAppEdit(args) {
         def repairHints = []
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the action mutation committed. The action rows are baked but the rule will not subscribe to its device events until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
-        }
-        // Inner-only partial (replaceActions list had partial inner items but the
-        // trailing updateRule click landed clean). Without this hint the outer
-        // envelope returned partial:true + success:false + repairHints:[] and the
-        // caller had to drill into addedActions[] to discover why -- the same C2
-        // antipattern this PR has been closing on the *NotLive flags.
-        if (itemsPartial && !updateRuleFailed) {
-            repairHints << "One or more inner replaceActions items reported partial. Drill into addedActions[] for per-item settingsSkipped + repairHints. Wait 5s and retry, or use removeAction/clearActions to clean up and re-add the failing spec."
         }
         // moveAction soft-return: on a slow hub the move-arrow click can commit
         // AFTER the post-click read; _rmMoveAction does one short re-check and,
@@ -14290,8 +14294,7 @@ def _applyNativeAppEdit(args) {
         def trigSkippedSize = (trigMutResult?.settingsSkipped as List)?.size() ?: 0
         def trigInnerPartial = trigSkippedSize > 0 || trigMutResult?.verificationFetchFailed == true
         // Inner-only partial hint (trigger inner skipped/verify-failed BUT the
-        // trailing updateRule landed clean). Mirrors the action-mutation
-        // dispatcher's inner-only repairHint above; without it the caller has to
+        // trailing updateRule landed clean); without it the caller has to
         // drill into settingsSkipped[] to discover why partial flipped true.
         if (trigInnerPartial && !updateRuleFailed) {
             repairHints << "modifyTrigger reported inner partial (settingsSkipped or verificationFetchFailed). Inspect settingsSkipped[] for per-field silent_rejection reasons. Re-attempt the modifyTrigger call, or use removeTrigger + addTrigger to rebuild the trigger atomically."
@@ -14473,20 +14476,30 @@ def _applyNativeAppEdit(args) {
                 (pm.replaceActions instanceof List && _rmSpecListTargetsRule(pm.replaceActions as List))
         }
         def patchValidRuleIds = patchBatchTargetsRule ? _rmValidRuleIds() : null
+        // Fail closed, as the top-level bulk paths do: the first failed or partial op, or inner item of an
+        // addTriggers/addActions/replaceActions op, stops every later op and the batch-end updateRule. Later
+        // ops and inner items are reported notAttempted, and the stop is decided before any budget checkpoint,
+        // so a pause never hands back a skipped tail.
+        String patchStopAfter = null
+        def patchStopItem = null
         try {
             // Indexed for-loop (not eachWithIndex) so the time-budget checkpoint can
             // cleanly break/return between ops -- a Groovy closure can't break out of a loop.
             int pi = -1
             for (def p : patchesList) {
                 pi++
+                if (patchStopAfter) {
+                    def skippedOp = (p instanceof Map && !((Map) p).isEmpty()) ? ((Map) p).keySet().first() : null
+                    patchResults << ([op: skippedOp] + _rmBulkNotAttempted(patchStopAfter))
+                    continue
+                }
+                String innerStopAfter = null
+                def innerStopItem = null
                 // Time-budget checkpoint -- BETWEEN patch ops, never before the first
-                // (pi > 0). Stops as soon as the time budget is exceeded regardless of an earlier
-                // op's outcome: patches don't abort on a per-op failure, but continuing un-budgeted
-                // after the budget is spent risks the transport dropping the whole response (losing
-                // every op's result). _patchesPauseResult surfaces any failed/partial op in the
-                // outer success/partial rather than masking it. Each op is a live POST; handing
-                // back the unprocessed specs lets the caller resume. CRITICAL: return BEFORE the
-                // batch-end trailing updateRule below so it does NOT fire -- the ops so far are
+                // (pi > 0). Continuing un-budgeted after the budget is spent risks the transport
+                // dropping the whole response (losing every op's result). Each op is a live POST;
+                // handing back the unprocessed specs lets the caller resume. CRITICAL: return BEFORE
+                // the batch-end trailing updateRule below so it does NOT fire -- the ops so far are
                 // committed at the settings level but not yet baked; the resume call's own batch-end
                 // updateRule bakes them once the remaining patches complete.
                 if (pi > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
@@ -14495,6 +14508,8 @@ def _applyNativeAppEdit(args) {
                 }
                 if (!(p instanceof Map)) {
                     patchResults << [success: false, error: "patches[${pi}] is not a Map", spec: p]
+                    patchStopAfter = "patches[${pi}]".toString()
+                    patchStopItem = patchResults.last()
                     continue
                 }
                 def pm = p as Map
@@ -14521,12 +14536,17 @@ def _applyNativeAppEdit(args) {
                         boolean innerPaused = false
                         for (def tspec : innerList) {
                             ii++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             if (ii > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                                 innerPaused = true
                                 break
                             }
                             try { innerResults << _rmAddTrigger(appId, tspec as Map) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].addTriggers[${ii}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         // Outer success rolls up inner success — mark the
                         // outer entry as failed if ANY inner item failed,
@@ -14534,7 +14554,8 @@ def _applyNativeAppEdit(args) {
                         // accurately reflect partial-batch failures.
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         def trigOpEntry = [success: innerOk, op: "addTriggers", results: innerResults]
-                        if (innerPaused) trigOpEntry.partial = true
+                        // pausedMidOp lets MRTR restate a later stop in the original request's indices.
+                        if (innerPaused) { trigOpEntry.partial = true; trigOpEntry.pausedMidOp = true }
                         patchResults << trigOpEntry
                         if (innerPaused) {
                             // Strip the internal clock from the un-processed inner specs (the
@@ -14554,16 +14575,21 @@ def _applyNativeAppEdit(args) {
                         boolean innerPaused = false
                         for (def aspec : innerList) {
                             ii++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             if (ii > 0 && canPausePatchBatch && _resumableBudgetExceeded(args?.__reqT0 as Long)) {
                                 innerPaused = true
                                 break
                             }
                             try { innerResults << _rmAddAction(appId, _rmWithClock(aspec as Map, args?.__reqT0 as Long), true, patchValidRuleIds) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].addActions[${ii}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         def actOpEntry = [success: innerOk, op: "addActions", results: innerResults]
-                        if (innerPaused) actOpEntry.partial = true
+                        if (innerPaused) { actOpEntry.partial = true; actOpEntry.pausedMidOp = true }
                         patchResults << actOpEntry
                         if (innerPaused) {
                             // Strip the internal clock from the un-processed inner specs (the
@@ -14585,6 +14611,8 @@ def _applyNativeAppEdit(args) {
                         if (seenReplaceRE) {
                             patchResults << [success: false, op: "replaceRequiredExpression",
                                 error: "patches[${pi}]: a rule has a single Required Expression; only one replaceRequiredExpression is valid per patches batch -- the second would replace the first. Remove the duplicate, or issue the second replace as a separate hub_set_rule call."]
+                            patchStopAfter = "patches[${pi}]".toString()
+                            patchStopItem = patchResults.last()
                             continue
                         }
                         seenReplaceRE = true
@@ -14719,9 +14747,16 @@ def _applyNativeAppEdit(args) {
                             throw clearExc
                         }
                         def innerResults = []
-                        (pm.replaceActions as List).each { aspec ->
+                        int ri = -1
+                        for (def aspec : (pm.replaceActions as List)) {
+                            ri++
+                            if (innerStopAfter) { innerResults << _rmBulkNotAttempted(innerStopAfter); continue }
                             try { innerResults << _rmAddAction(appId, _rmWithClock(aspec as Map, args?.__reqT0 as Long), true, patchValidRuleIds) }
                             catch (Exception e) { innerResults << [success: false, error: e.message ?: e.toString()] }
+                            if (_rmBulkItemBlocks(innerResults.last())) {
+                                innerStopAfter = "patches[${pi}].replaceActions[${ri}]".toString()
+                                innerStopItem = innerResults.last()
+                            }
                         }
                         def innerOk = innerResults.every { (it instanceof Map) && (it.success != false) && (it.partial != true) }
                         patchResults << [success: innerOk, op: "replaceActions", removedIndices: cleared, addedResults: innerResults]
@@ -14762,6 +14797,10 @@ def _applyNativeAppEdit(args) {
                     patchResults << [success: false, op: pm.keySet().first(), error: cleanedPatchErr, spec: p]
                     mcpLog("warn", "rm-native", "patches[${pi}] (${pm.keySet().first()}) failed: ${cleanedPatchErr}")
                 }
+                if (!patchResults.isEmpty() && _rmBulkItemBlocks(patchResults.last())) {
+                    patchStopAfter = innerStopAfter ?: "patches[${pi}]".toString()
+                    patchStopItem = innerStopItem ?: patchResults.last()
+                }
             }
             // Fire updateRule once at the end so the rule's actions[]
             // map and event subscriptions bake from the fully-loaded
@@ -14771,7 +14810,7 @@ def _applyNativeAppEdit(args) {
             // addRequiredExpression slot propagation in the
             // `addRequiredExpressionSpec` dispatcher branch and F1's
             // counterpart in the `addTriggerSpec` dispatcher branch).
-            try { _rmClickAppButton(appId, "updateRule") }
+            if (!patchStopAfter) try { _rmClickAppButton(appId, "updateRule") }
             catch (Exception updateExc) {
                 updateRuleFailed = true
                 // patchesNotLive is the batch-generic not-live slot: a patches batch may
@@ -14831,19 +14870,12 @@ def _applyNativeAppEdit(args) {
             // Recompute the success rollup after any deferred-restore reclassification above.
             if (anyRestored) opsOk = patchResults.count { it?.success != false }
         }
+        if (patchStopAfter && patchErr == null) {
+            return _rmBulkStoppedResult(appId, backup, patchStopAfter, patchStopItem, [patches: patchResults, health: health])
+        }
         def repairHints = []
         if (updateRuleFailed) {
             repairHints << "updateRule click was rejected after the patch ops committed. The patch settings are baked but the rule will not re-evaluate / re-subscribe until updateRule fires. Retry hub_set_rule(button='updateRule', confirm=true), or restore via backup if the retry also fails."
-        }
-        // Inner-only partial hint (one or more patch ops self-reported partial:true BUT
-        // the trailing updateRule click landed clean). Outer partial: already bubbles
-        // the inner-partial signal via `patchResults.any { ... partial == true }` in the
-        // OR-clause below; without this hint the outer repairHints stayed empty and the
-        // caller had to drill into patches[] to discover why partial flipped true.
-        // Sibling pattern from the action-mutation and modifyTrigger dispatchers'
-        // inner-only branches -- closes the same C2 antipattern at this dispatch site.
-        if (patchResults.any { it instanceof Map && it.partial == true } && !updateRuleFailed) {
-            repairHints << "One or more patch ops reported partial. Drill into patches[] for per-op settingsSkipped + repairHints. The patch ops landed but some inner fields didn't; address the per-op partials directly or re-issue the patches batch."
         }
         def out = [
             success: (patchErr == null) && (opsOk == patchResults.size()) && _rmHealthGatePass(health) && !updateRuleFailed,
@@ -15008,6 +15040,7 @@ def _applyNativeAppEdit(args) {
         def trigList = (addTriggersList ?: [])
         def actList = (addActionsList ?: [])
         String bulkStopAfter = null
+        def bulkStopItem = null
         try {
             // Indexed for-loops (not eachWithIndex) so the time-budget checkpoint can
             // break/return cleanly between items -- a Groovy closure can't break out of a loop.
@@ -15020,8 +15053,8 @@ def _applyNativeAppEdit(args) {
             // trailing updateRule below so it does NOT fire -- the items so far are committed at the
             // settings level but not yet baked; the resume call's own trailing updateRule bakes them
             // once the remaining items complete.
-            // Fork patch C: fail closed. After the first failed or partial item nothing further is written
-            // and finalisation is skipped, so a failed IF opener can never leave its body committed as
+            // Fail closed: after the first failed or partial item nothing further is written and
+            // finalisation is skipped, so a failed IF opener can never leave its body committed as
             // unconditional actions. The stop is decided before the budget checkpoint, so a pause never
             // hands back a skipped tail.
             int ti = -1
@@ -15042,7 +15075,7 @@ def _applyNativeAppEdit(args) {
                         mcpLog("warn", "rm-native", "hub_set_rule: addTriggers[${ti}] (${spec.capability}) failed -- ${te.message}")
                     }
                 }
-                if (_rmBulkItemBlocks(triggerResults.last())) bulkStopAfter = "addTriggers[${ti}]".toString()
+                if (_rmBulkItemBlocks(triggerResults.last())) { bulkStopAfter = "addTriggers[${ti}]".toString(); bulkStopItem = triggerResults.last() }
             }
             // Resolve the valid-rule-id set once for the whole batch (only when a
             // rule-targeting action is present) and thread it to each item.
@@ -15066,7 +15099,7 @@ def _applyNativeAppEdit(args) {
                         mcpLog("warn", "rm-native", "hub_set_rule: addActions[${ai}] (${spec.capability}/${spec.action}) failed -- ${ae.message}")
                     }
                 }
-                if (_rmBulkItemBlocks(actionResults.last())) bulkStopAfter = "addActions[${ai}]".toString()
+                if (_rmBulkItemBlocks(actionResults.last())) { bulkStopAfter = "addActions[${ai}]".toString(); bulkStopItem = actionResults.last() }
             }
         } catch (Exception e) {
             mcpLogError("rm-native", "addTriggers/addActions bulk failed for app ${appId}", e)
@@ -15076,7 +15109,7 @@ def _applyNativeAppEdit(args) {
             return bulkResult
         }
         if (bulkStopAfter) {
-            return _rmBulkStoppedResult(appId, backup, bulkStopAfter, [triggers: triggerResults, actions: actionResults])
+            return _rmBulkStoppedResult(appId, backup, bulkStopAfter, bulkStopItem, [triggers: triggerResults, actions: actionResults])
         }
         // Trailing updateRule fires AFTER per-item adds complete. Hoisted out
         // of the per-item try so a rejection here doesn't get routed through
@@ -15110,15 +15143,6 @@ def _applyNativeAppEdit(args) {
         def itemsPartial = (trigOk != triggerResults.size()) || (actOk != actionResults.size()) ||
             triggerResults.any { it instanceof Map && it.partial == true } ||
             actionResults.any { it instanceof Map && it.partial == true }
-        // Inner-only partial hint (bulk inner items reported partial BUT the trailing
-        // updateRule click landed clean). Without this hint the outer envelope returned
-        // partial:true + repairHints:[] (when updateRuleFailed is false) and the caller
-        // had to drill into triggers[]/actions[] to discover why -- same C2 antipattern
-        // the rest of this PR has been closing on the *NotLive flags. Sibling pattern
-        // from the action-mutation and modifyTrigger dispatchers' inner-only branches.
-        if (itemsPartial && !updateRuleFailed) {
-            repairHints << "One or more bulk trigger/action items reported partial. Drill into triggers[] and actions[] for per-item settingsSkipped + repairHints. Wait 5s and retry the affected items, or use removeAction/removeTrigger to clean up and re-add."
-        }
         return [
             success: trigOk == triggerResults.size() && actOk == actionResults.size() && _rmHealthGatePass(health) && !updateRuleFailed,
             partial: itemsPartial || updateRuleFailed,
