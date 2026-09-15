@@ -2071,17 +2071,39 @@ class TestRunner:
     def _variable_condition_states(settings: dict, var_name: str) -> list[str]:
         """state_<N> values of every condition slot whose variable picker holds var_name."""
         slots = [str(key).rsplit("_", 1)[1] for key, value in settings.items()
-                 if str(value) == var_name and re.search(r"Var[A-Za-z]*_\d+$", str(key))]
+                 if str(value) == var_name and re.search(r"(?:Var[A-Za-z]*|varName)_\d+$", str(key))]
         return [str(settings.get(f"state_{slot}")).lower() for slot in slots]
 
-    def _navigate_new_action(self, app_id: Any) -> str:
+    def _walk_setup_step(self, app_id: Any, step: dict, allow_open_block: bool) -> dict:
+        """One single-step walkStep used as setup.
+
+        A single step runs its own health check without the drive's pre-existing-issue exemption, so on a rule
+        with a deliberately open block it reports success:false. With allow_open_block, accept only that
+        verdict: every structural issue is an unclosed block and nothing else is wrong."""
+        if not allow_open_block:
+            return self._set_rule(app_id, {"walkStep": step}, strict=True)
+        result = self.client.call_tool("hub_manage_rule_machine", {"tool": "hub_set_rule", "args": {
+            "appId": app_id, "confirm": True, "walkStep": step}})
+        self._last_write_health = None
+        if result.get("success") is not False:
+            return result
+        health = result.get("health") or {}
+        issues = [str(issue) for issue in (health.get("structuralIssues") or [])]
+        assert (issues and all("never closed" in issue for issue in issues)
+                and not result.get("pageError") and not result.get("silentRejection")
+                and health.get("broken") is not True and not health.get("brokenMarkers")
+                and not health.get("validationErrors") and not health.get("configPageError")), \
+            f"setup step failed for a reason other than the expected open block: {result}"
+        return result
+
+    def _navigate_new_action(self, app_id: Any, *, allow_open_block: bool = False) -> str:
         """Open a new action editor and return its RM-assigned index.
 
         The editor is opened the way RM's own New Action button does (N with doActN). Navigating to doActPage by
         name on a rule with no pending action state renders RM's startsWith-on-null page error."""
-        self._set_rule(app_id, {"walkStep": {"page": "selectActions", "operation": "click",
-                                             "click": {"name": "N", "stateAttribute": "doActN"}}}, strict=True)
-        page = self._set_rule(app_id, {"walkStep": {"page": "doActPage", "operation": "introspect"}}, strict=True)
+        self._walk_setup_step(app_id, {"page": "selectActions", "operation": "click",
+                                       "click": {"name": "N", "stateAttribute": "doActN"}}, allow_open_block)
+        page = self._walk_setup_step(app_id, {"page": "doActPage", "operation": "introspect"}, allow_open_block)
         act_field = next((i.get("name") for i in ((page.get("after") or {}).get("inputs") or [])
                           if str(i.get("name")).startswith("actType.")), None)
         assert act_field, f"doActPage should reveal an actType.<n> picker: {page}"
@@ -6966,12 +6988,13 @@ class TestRunner:
         #   (2) WRITE composition -- a click (open trigger editor) + a capability write in one
         #                            call, with the write proven to land live via valueEcho;
         #   (3) failure halt      -- a bad step aborts the drive (success:false) without
-        #                            corrupting the rule.
-        # Each live drive is kept to <=2 steps on purpose: a drive does a full
-        # introspect+op+introspect+health per step, so a long drive is ONE heavy tool call
-        # that risks the cloud relay's ~10s 504 ceiling. The stopOnError step-success=false
-        # branch and the >2-step commit sequence are covered deterministically by the Spock
-        # unit tests; here we prove the drive layer works against the real wizard.
+        #                            corrupting the rule;
+        #   (4-6) structural outcomes on a second rule -- a complete four-step action drive, a drive
+        #                            that leaves its own Repeat open (fails), and a later valid drive
+        #                            inside that open block (passes, naming the pre-existing issue).
+        # Each step does its own page reads, so the four-step drives rely on the standard continuation
+        # when the relay budget is reached. The stopOnError step-success=false branch is covered
+        # deterministically by the Spock unit tests; here we prove the drive layer against the real wizard.
         app_id = self._create_native_rule("WalkDrive")
         try:
             # (1) read composition + page-carry + per-step health
@@ -7061,7 +7084,8 @@ class TestRunner:
 
             # (6) a later valid drive inside that existing open block passes and names the old issue.
             inside = self._set_rule(block_app, {"walkStep": {"operation": "drive",
-                "steps": _log_action_steps(self._navigate_new_action(block_app), "inside-open-repeat")}}, strict=True)
+                "steps": _log_action_steps(self._navigate_new_action(block_app, allow_open_block=True),
+                                          "inside-open-repeat")}}, strict=True)
             assert inside.get("success") is True \
                 and any("never closed" in str(issue) for issue in (inside.get("preExistingStructuralIssues") or [])), \
                 f"a valid drive inside an already-open block should pass and report the pre-existing issue: {inside}"
@@ -9073,7 +9097,7 @@ class TestRunner:
 
     @test("native_apps")
     def test_set_rule_patches(self) -> None:
-        # hub_set_rule edit -> patches (atomic multi-op).
+        # hub_set_rule edit -> patches (several ops in one call).
         app_id = self._create_native_rule("Patch")
         try:
             self._set_rule(app_id, {"patches": [
@@ -9287,7 +9311,11 @@ class TestRunner:
             "fail-closed create",
         )
         if sw_stop["relayDropped"]:
-            assert sw_stop["committed"], f"fail-closed create lost to relay 504 and never committed ({stop_label})"
+            if not sw_stop["committed"]:
+                # Never re-issue an uncertain create; the whole-test retry uses a fresh fixture label.
+                raise RelayLostResponseError(
+                    f"504 relay response loss on the fail-closed create {stop_label!r} left no committed rule; "
+                    "retry this test with a fresh fixture")
             stop_app_id = sw_stop["evidence"]
             stopped = None
         else:
@@ -9296,10 +9324,7 @@ class TestRunner:
             assert stop_app_id, f"fail-closed create did not return appId: {stopped}"
         self.created_native_app_ids.append(str(stop_app_id))
         try:
-            if stopped is None:
-                print("    fail-closed create: stop-envelope assertions skipped (relay 504); "
-                      "verifying the skipped sections by readback instead")
-            else:
+            if stopped is not None:
                 triggers = stopped.get("triggers") or []
                 actions = stopped.get("actions") or []
                 assert len(triggers) == 2 and len(actions) == 1 \
@@ -9318,6 +9343,12 @@ class TestRunner:
                 f"the action after the stop was written: {stop_settings}"
         finally:
             self._delete_native(stop_app_id)
+        if stopped is None:
+            # The persisted state checked out, but the lost response means the stop metadata was never
+            # asserted. Retry with a fresh fixture rather than passing on state alone.
+            raise RelayLostResponseError(
+                f"504 relay response loss erased the fail-closed create stop envelope for {stop_label!r}; "
+                "the committed rule was verified and deleted, retry this test with a fresh fixture")
 
     @test("native_apps")
     def test_set_rule_discover_meta(self) -> None:

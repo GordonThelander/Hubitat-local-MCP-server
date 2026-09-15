@@ -10677,13 +10677,11 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
     }
 
     def "walkStep drive reports success=false when the rule ends unhealthy even though every step passed"() {
-        // The drive success gate is `allOk && finalHealth.ok`. A drive whose steps ALL pass
-        // (allOk=true) but whose post-run health check comes back broken must still report
-        // success:false. The compiled-state read (/app/ruleBuilderJson, hit once per
-        // _rmCheckRuleHealth and once by the pre-drive structural baseline) is the lever: healthy for the step's own health
-        // check, broken on the trailing finalHealth read -- which isolates the finalHealth.ok
-        // conjunct (a step's own success is also health-gated, so a uniformly-broken rule
-        // couldn't distinguish the two AND-operands).
+        // A drive whose steps ALL pass but whose final health check comes back broken must still
+        // report success:false. Mutating steps in a drive defer their own probe to that final check;
+        // this read-only step still probes, so the compiled-state read (/app/ruleBuilderJson, hit once
+        // per _rmCheckRuleHealth and once by the pre-drive structural baseline) is the lever: healthy
+        // for the step's probe, broken on the final read, which isolates the final gate.
         given:
         enableWrite()
         def rb = [n: 0]
@@ -34444,6 +34442,71 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         flags.clicks?.contains("cancelCapab")
     }
 
+    // A doActPage whose state_1 field has no comparator beside it, with a chosen shape: revealed after the
+    // variable pick or already present, and with the given options.
+    private Closure stateOnlyDoActPage(Map flags, Map stateInput, boolean staticState) {
+        return { params ->
+            flags.seq = (flags.seq ?: 0) + 1
+            def inputs = [
+                [name: "actType.1", type: "enum", options: ["condActs": "Conditional Actions"]],
+                [name: "actSubType.1", type: "enum", options: ["getIfThen": "IF Expression THEN"]],
+                [name: "cond", type: "enum", options: ["a": "New condition"]],
+                [name: "rCapab_1", type: "enum", options: ["Variable", "Switch"]],
+                [name: "hasAll", type: "button"]
+            ]
+            if (staticState) inputs = inputs + [stateInput]
+            if (flags.rCapab) inputs = inputs + [[name: "xVar_1", type: "enum", options: ["myBool": "myBool"], value: flags.echoVar]]
+            if (flags.xVar && !staticState) inputs = inputs + [stateInput]
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "doActPage", title: "T", install: false, error: null,
+                             sections: [[title: "", input: inputs, paragraphs: ["seq ${flags.seq}".toString()]]]],
+                settings: [:], childApps: []
+            ])
+        }
+    }
+
+    def "addAction ifThen: a state_<N> offering non-true/false options with no comparator field is refused and cancelled"() {
+        given:
+        enableWrite()
+        def flags = [:]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, false,
+            stateOnlyDoActPage(flags, [name: "state_1", type: "enum", options: ["low", "high"]], false))
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then: "neither a Boolean nor a comparison slot, so nothing is guessed"
+        result.success == false
+        result.toString().contains("rather than true/false")
+        !writtenFields.containsKey("state_1")
+        !writtenFields.containsKey("RelrDev_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
+    def "addAction ifThen: an already-present state_<N> with no true/false options is refused and cancelled"() {
+        given: "state_1 is on the page before the variable is chosen, lists no options, and the picker echoes the variable"
+        enableWrite()
+        def flags = [echoVar: "myBool"]
+        def writtenFields = [:]
+        stubBooleanWizard(flags, writtenFields, true,
+            stateOnlyDoActPage(flags, [name: "state_1", type: "text"], true))
+
+        when:
+        def result = script.toolSetRule([appId: 100,
+            addAction: [capability: "ifThen", expression: [conditions: [[capability: "Variable", variable: "myBool", value: true]]]],
+            confirm: true])
+
+        then: "its Boolean type cannot be established, so nothing is written"
+        result.success == false
+        result.toString().contains("lists no true/false options")
+        !writtenFields.containsKey("state_1")
+        flags.clicks?.contains("cancelCapab")
+    }
+
     def "addAction ifThen: Boolean Variable condition rejects a value outside the revealed true/false options"() {
         given:
         enableWrite()
@@ -34830,6 +34893,51 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         posts.any { it.body?.containsKey("settings[stComment]") }
     }
 
+    def "walkStep drive: an href-context write drops the carried page, so the next step sees the field it revealed"() {
+        given:
+        enableWrite()
+        def values = [:]
+        def posts = []
+        script.metaClass._rmStructuralBaseline = { Integer id -> [] }
+        script.metaClass._rmCheckRuleHealth = { Integer id, String source = "auto" ->
+            [ok: true, unreadable: false, broken: false, brokenMarkers: [], orphanedActionRows: [], structuralIssues: [],
+             validationErrors: [], multipleFlagPoison: [], issues: [], configPageError: null]
+        }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> ruleConfigJson(100, "r", []) }
+        // gate is written with href context; beta only renders once gate holds a value.
+        hubGet.register('/installedapp/configure/json/100/subPage') { params ->
+            def inputs = [[name: "alpha", type: "text", value: values.alpha], [name: "gate", type: "text", value: values.gate]]
+            if (values.gate) inputs = inputs + [[name: "beta", type: "text", value: values.beta]]
+            ruleConfigJson(100, "r", inputs, null, values.clone())
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            statusJson(100, values.collect { k, v -> [name: k, type: "text", value: v] })
+        }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            ["alpha", "gate", "beta"].each { k -> if (body?.containsKey("settings[" + k + "]")) values[k] = body["settings[" + k + "]"] }
+            [status: 200, location: null, data: '']
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, walkStep: [operation: "drive", steps: [
+            [page: "subPage", operation: "write", write: [alpha: "a"]],
+            [page: "subPage", operation: "write", write: [gate: "g"],
+             hrefContext: [fromPage: "mainPage", hrefName: "subLink", hrefParams: [n: 1]]],
+            [page: "subPage", operation: "write", write: [beta: "b"]]
+        ]], confirm: true])
+
+        then: "every step committed"
+        result.steps*.success == [true, true, true]
+
+        and: "the third step found beta on the current page, not on the page carried from the first write"
+        result.steps[2].opResult?.carryRefetched != true
+        result.steps[2].opResult?.warning == null
+        values.beta == "b"
+    }
+
     def "walkStep drive: a field visible only in the previous write's POST response is written by the next step"() {
         given:
         enableWrite()
@@ -34924,18 +35032,22 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         then: "the step fails with the divergence after exactly one retry"
         persistent.steps[0].success == false
         persistent.steps[0].error?.contains("multiple=true flag flipped")
+        persistent.steps[0].error?.contains("Automatic recovery was already attempted")
+        persistent.steps[0].error?.contains("do not resend it")
+        persistent.repairHints?.any { it.contains("Do not re-run that step") }
+        !persistent.repairHints?.any { it.contains("re-run the drive from that step") }
         posts.count { p -> p.body?.keySet()?.any { it.toString().contains("tDev1") } } == 2
 
         when: "a raw settings write on the same sub-page meets the persistent flip"
         posts.clear()
-        def settingsResult = null
-        Exception settingsThrown = null
-        try { settingsResult = script.toolSetRule([appId: 100, pageName: "selectTriggers", settings: [tDev1: [8, 9]], confirm: true]) }
-        catch (Exception e) { settingsThrown = e }
+        def settingsResult = script.toolSetRule([appId: 100, pageName: "selectTriggers", settings: [tDev1: [8, 9]], confirm: true])
 
-        then: "it is refused rather than reported applied"
-        (settingsThrown?.message ?: settingsResult?.error?.toString())?.contains("multiple=true flag flipped")
-        settingsResult?.success != true
+        then: "it returns the public failure envelope with the divergence, the exhausted recovery and the backup"
+        settingsResult.success == false
+        settingsResult.error?.contains("multiple=true flag flipped")
+        settingsResult.error?.contains("Automatic recovery was already attempted")
+        settingsResult.backup?.backupKey != null
+        settingsResult.restoreHint?.contains(settingsResult.backup.backupKey)
     }
 
     def "settings with a sub-page pageName lists only confirmed keys and reports the keys that did not land"() {
@@ -35004,6 +35116,7 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         healthCalls == 0
 
         and: "a drive that changed nothing is not flagged"
+        readOnly.success == true
         readOnly.healthUnverified != true
     }
 
