@@ -11269,7 +11269,8 @@ class TestRunner:
                     "tool": "hub_delete_variable", "args": {"name": var_name, "confirm": True}})
             except McpToolError as exc:
                 refused = str(exc)
-            assert refused and "in use" in refused and "force=true" in refused,                 f"delete of a variable an RM rule uses was not refused: {refused}"
+            assert refused and "in use" in refused and "force=true" in refused, \
+                f"delete of a variable an RM rule uses was not refused: {refused}"
             got = self.client.call_tool("hub_manage_variables", {
                 "tool": "hub_get_variable", "args": {"name": var_name}})
             assert got.get("source") == "hub", f"refused delete still removed the variable: {got}"
@@ -11290,11 +11291,12 @@ class TestRunner:
         try:
             self.client.call_tool("hub_manage_rule_machine", {
                 "tool": "hub_set_rule_private_boolean", "args": {"ruleId": int(app_id), "value": False}})
-            res = self._set_rule(app_id, {"button": "updateRule"})
+            # strict: a relay-dropped response raises instead of returning a verdict-less sentinel.
+            res = self._set_rule(app_id, {"button": "updateRule"}, strict=True)
             settle = str((res or {}).get("subscriptionSettle") or "")
+            assert settle, f"updateRule on a device-triggered rule returned no settle verdict: {res}"
             assert "likely incomplete" not in settle, f"a gated rule was reported incomplete: {res}"
-            if settle:
-                assert settle.startswith("SUPPRESSED") or settle == "OK", f"unexpected settle verdict: {settle}"
+            assert settle.startswith("SUPPRESSED") or settle == "OK", f"unexpected settle verdict: {settle}"
         finally:
             self._delete_native(app_id)
 
@@ -11306,15 +11308,22 @@ class TestRunner:
             "addActions": [{"capability": "privateBoolean", "ruleIds": ["*"], "value": False}]},
             return_result=True)
         try:
-            act = ((created or {}).get("actions") or [{}])[0]
-            assert act.get("success") is not False, f"privateBoolean '*' action failed: {created}"
-            idx = act.get("actionIndex")
             settings = self._get_persisted_rule_config(app_id).get("settings") or {}
-            assert settings.get(f"privateT.{idx}") in (["*"], "*", '["*"]'),                 f"privateT did not persist the this-rule target: {settings}"
+            if created is not None:
+                act = (created.get("actions") or [{}])[0]
+                assert act.get("success") is not False, f"privateBoolean '*' action failed: {created}"
+                idx = act.get("actionIndex")
+            else:
+                # Relay-504 adoption leaves no create envelope; take the index from the committed rule.
+                idx = next((str(k).split(".", 1)[1] for k in settings if str(k).startswith("privateT.")), None)
+            assert idx is not None, f"no privateBoolean action index to check: created={created} settings={settings}"
+            assert settings.get(f"privateT.{idx}") in (["*"], "*", '["*"]'), \
+                f"privateT did not persist the this-rule target: {settings}"
             self._set_rule(app_id, {"modifyAction": {"index": int(idx), "mods": {"value": True}}})
             after = self._get_persisted_rule_config(app_id).get("settings") or {}
             targets = [v for k, v in after.items() if str(k).startswith("privateT.")]
-            assert targets and all(v in (["*"], "*", '["*"]') for v in targets),                 f"modifyAction dropped the '*' target: {after}"
+            assert targets and all(v in (["*"], "*", '["*"]') for v in targets), \
+                f"modifyAction dropped the '*' target: {after}"
             refused = None
             try:
                 self._set_rule(app_id, {"addAction": {"capability": "runRule", "ruleIds": ["*"]}}, strict=True)
