@@ -2115,7 +2115,7 @@ class TestRunner:
             # delete is silently skipped (try/except swallows the refusal),
             # leaving the variable stranded.
             self.client.call_tool("hub_manage_variables", {
-                "tool": "hub_delete_variable", "args": {"name": name, "confirm": True},
+                "tool": "hub_delete_variable", "args": {"name": name, "confirm": True, "force": True},
             })
         except Exception as exc:
             print(f"[WARN] _delete_variable_safe({name}) failed: {exc}")
@@ -11253,6 +11253,77 @@ class TestRunner:
         finally:
             for n in names:
                 self._delete_variable_safe(n)
+
+    @test("hub_variables")
+    def test_hub_variable_delete_refuses_rule_machine_consumer(self) -> None:
+        # A Rule Machine rule is not a child of this server, so only the hub's own in-use
+        # registry can see it. Without force the delete must refuse and leave both intact.
+        var_name = f"{PREFIX}InUseVar"
+        self._create_hub_variable_visible(var_name, "Number", "0")
+        app_id = self._create_native_rule("VarConsumer", {
+            "addActions": [{"capability": "setVariable", "variable": var_name, "value": 5}]})
+        try:
+            refused = None
+            try:
+                self.client.call_tool("hub_manage_variables", {
+                    "tool": "hub_delete_variable", "args": {"name": var_name, "confirm": True}})
+            except McpToolError as exc:
+                refused = str(exc)
+            assert refused and "in use" in refused and "force=true" in refused,                 f"delete of a variable an RM rule uses was not refused: {refused}"
+            got = self.client.call_tool("hub_manage_variables", {
+                "tool": "hub_get_variable", "args": {"name": var_name}})
+            assert got.get("source") == "hub", f"refused delete still removed the variable: {got}"
+            self._assert_rule_healthy(app_id)
+        finally:
+            self._delete_native(app_id)
+            self._delete_variable_safe(var_name)
+
+    @test("native_apps")
+    def test_set_rule_update_with_false_required_expression_is_suppressed(self) -> None:
+        # RM drops trigger subscriptions while the Required Expression is false. updateRule must
+        # report that as SUPPRESSED, not as an incomplete trigger.
+        app_id = self._create_native_rule("GatedTrigger", {
+            "addTrigger": {"capability": "Switch", "deviceIds": [int(self.get_test_switch_id())], "state": "on"},
+            "addRequiredExpression": {"conditions": [{"capability": "Private Boolean", "state": "true"}]},
+            "addActions": [{"capability": "log", "message": "E2E gated"}],
+        })
+        try:
+            self.client.call_tool("hub_manage_rule_machine", {
+                "tool": "hub_set_rule_private_boolean", "args": {"ruleId": int(app_id), "value": False}})
+            res = self._set_rule(app_id, {"button": "updateRule"})
+            settle = str((res or {}).get("subscriptionSettle") or "")
+            assert "likely incomplete" not in settle, f"a gated rule was reported incomplete: {res}"
+            if settle:
+                assert settle.startswith("SUPPRESSED") or settle == "OK", f"unexpected settle verdict: {settle}"
+        finally:
+            self._delete_native(app_id)
+
+    @test("native_apps")
+    def test_set_rule_private_boolean_this_rule_target(self) -> None:
+        # '*' is RM's own "this rule" target for Set Private Boolean. It must be written as-is,
+        # survive a modifyAction value change, and be refused on other rule-targeting actions.
+        app_id, created = self._create_native_rule("PbSelf", {
+            "addActions": [{"capability": "privateBoolean", "ruleIds": ["*"], "value": False}]},
+            return_result=True)
+        try:
+            act = ((created or {}).get("actions") or [{}])[0]
+            assert act.get("success") is not False, f"privateBoolean '*' action failed: {created}"
+            idx = act.get("actionIndex")
+            settings = self._get_persisted_rule_config(app_id).get("settings") or {}
+            assert settings.get(f"privateT.{idx}") in (["*"], "*", '["*"]'),                 f"privateT did not persist the this-rule target: {settings}"
+            self._set_rule(app_id, {"modifyAction": {"index": int(idx), "mods": {"value": True}}})
+            after = self._get_persisted_rule_config(app_id).get("settings") or {}
+            targets = [v for k, v in after.items() if str(k).startswith("privateT.")]
+            assert targets and all(v in (["*"], "*", '["*"]') for v in targets),                 f"modifyAction dropped the '*' target: {after}"
+            refused = None
+            try:
+                self._set_rule(app_id, {"addAction": {"capability": "runRule", "ruleIds": ["*"]}}, strict=True)
+            except (McpToolError, AssertionError) as exc:
+                refused = str(exc)
+            assert refused and "this rule" in refused, f"runRule '*' was not refused by name: {refused}"
+            self._assert_rule_healthy(app_id)
+        finally:
+            self._delete_native(app_id)
 
     # -----------------------------------------------------------------------
     # GROUP 5: trigger_types (1 batched test -- all trigger types in one rule)

@@ -8356,7 +8356,7 @@ private Map _rmFetchStatusJson(Integer appId) {
  * health source across EVERY rule engine (issue #254 + the VRB follow-up).
  * Returns a normalized map or null when appId is not a recognized rule shape:
  *
- *   - classic Rule Machine -> [ruleFormat:"rm", broken:<bool>, paused, predicate, capabsfalse]
+ *   - classic Rule Machine -> [ruleFormat:"rm", broken:<bool>, paused, predicate, actionList]
  *     from GET /app/ruleBuilderJson (the real `broken` boolean + predicate/condition
  *     structure, instead of scraping rendered HTML).
  *   - graph Visual Rule (VRB 2.0) -> [ruleFormat:"vrb-graph", broken:<validationErrors
@@ -8409,7 +8409,6 @@ private Map _ruleCompiledState(Integer appId) {
                 return [ruleFormat: "rm", broken: parsed.broken == true, validationErrors: [],
                         paused: parsed.paused instanceof Boolean ? parsed.paused : null,
                         predicate: pred,
-                        capabsfalse: (parsed.capabsfalse instanceof Map ? parsed.capabsfalse : null),
                         actionList: (parsed.actionList instanceof List ? parsed.actionList : null),
                         endpoint: "ruleBuilderJson"]
             }
@@ -8772,11 +8771,9 @@ Map _rmCheckRuleHealth(Integer appId, String source = "auto") {
             compiledActionList = _rmCoerceActionIndices(cs.actionList)   // null in -> null out
             if (cs.validationErrors) validationErrors = cs.validationErrors
             if (ruleFormat == "rm" && broken == true) {
-                // capabsfalse renders the live false-condition text (with current
-                // values) — it points at what is wrong.
-                def detail = (cs.capabsfalse instanceof Map && !cs.capabsfalse.isEmpty()) ?
-                    " False conditions: ${cs.capabsfalse.values().join('; ')}".toString() : ""
-                issues << "ruleBuilderJson reports broken:true (compiled-state boolean — authoritative).${detail}".toString()
+                // Not capabsfalse: it lists a rule's conditions whatever their current truth,
+                // so quoting it as "false conditions" points at the wrong cause.
+                issues << "ruleBuilderJson reports broken:true (compiled-state boolean — authoritative).".toString()
             } else if (ruleFormat == "vrb-graph" && !validationErrors.isEmpty()) {
                 issues << "Visual Rule (graph) has validation errors: ${validationErrors.join('; ')}".toString()
             }
@@ -10398,7 +10395,7 @@ To compare a **device attribute against a hub variable**, there is no direct sha
 
 ### `addRequiredExpression` operator contract
 
-Combine multiple conditions with `operator: 'AND'|'OR'|'XOR'` (one operator applied to every gap) OR `operators: ['AND','OR', ...]` (one per gap; length = `conditions.size()-1`) for mixed expressions like `P1 AND P2 OR P3 XOR P4`. RM 5.1: AND/OR/XOR have equal precedence, evaluated left-to-right.
+Combine multiple conditions with `operator: 'AND'|'OR'|'XOR'` (one operator applied to every gap) OR `operators: ['AND','OR', ...]` (one per gap; length = `conditions.size()-1`) for mixed expressions like `P1 AND P2 OR P3 XOR P4`. RM 5.1 walks the expression strictly left to right and stops early: once the left side of an OR is true the result is true, and once the left side of an AND is false the result is false, so later terms are never read (`Mode AND Evening OR Morning AND PB` never reads PB while Mode and Evening are true). Whenever AND and OR are mixed, group with `subExpression` to state the intent, e.g. `Mode AND (Evening OR Morning) AND PB`.
 
 ### `replaceRequiredExpression` -- change an existing Required Expression in place
 

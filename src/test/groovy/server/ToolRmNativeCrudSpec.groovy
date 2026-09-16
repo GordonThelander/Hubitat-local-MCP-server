@@ -4137,6 +4137,87 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.partial == false
     }
 
+    def "modifyAction carries a mixed this-rule privateBoolean target ['*','1809'] through the rebuild"() {
+        given:
+        def ma = wireModifyActionTransport(100, [1, 2, 3],
+            ["actType.2": "rulesActs", "actSubType.2": "getSetPrivateBoolean", "privateT.2": ["*", "1809"],
+             "pvTF.2": "false", "pvRuleType.2": "Rule Machine",
+             "privateT.4": ["*", "1809"], "pvTF.4": "true"])
+        def specs = []
+        wireModifyAddLeg(ma, specs, 4)
+
+        when:
+        def result = script._rmModifyAction(100, 2, [value: false])
+
+        then:
+        specs[0].capability == "privateBoolean"
+        specs[0].ruleIds*.toString() == ["*", "1809"]
+        result.verifiedTargets == ["*", "1809"]
+        result.success == true
+    }
+
+    def "this-rule target '*' is kept for privateBoolean and refused with a named message elsewhere"() {
+        expect:
+        script._rmNormalizeRuleIdsForWrite(["*", 1809], true) == ["*", 1809]
+        script._rmValidateRuleTargetExists("privateBoolean", ["*"], [] as Set) == null
+        script._rmValidateRuleTargetExists("privateBoolean", ["*", "1809"], [1809] as Set) == null
+
+        when:
+        script._rmValidateRuleTargetExists("runRule", ["*"], [1809] as Set)
+
+        then:
+        def e = thrown(IllegalArgumentException)
+        e.message.contains('"this rule" target')
+        e.message.contains("only for privateBoolean")
+        !e.message.contains("is not a valid numeric rule id")
+
+        when:
+        script._rmNormalizeRuleIdsForWrite(["*"])
+
+        then:
+        def e2 = thrown(IllegalArgumentException)
+        e2.message.contains('"this rule" target')
+    }
+
+    @spock.lang.Unroll
+    def "#cap addAction with the this-rule target '*': #outcome"() {
+        given:
+        installRuleTargetStubs()
+        hubGet.register('/hub2/appsList') { params -> appsListWithRule(555) }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params -> ruleConfigJson(100, "r", [[name: "N", type: "button"]]) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> posts << path; [status: 200, location: null, data: ''] }
+        def writes = []
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null, Map cache = null ->
+            writes << [field: key, value: value]
+            applied << key
+        }
+        Exception caught = null
+
+        when:
+        try { script._rmAddAction(100, actionSpec) }
+        catch (Exception e) { caught = e }
+
+        then:
+        if (written != null) {
+            assert writes.find { it.field?.toString()?.startsWith(fieldPrefix) }?.value == written
+        } else {
+            assert caught instanceof IllegalArgumentException
+            assert caught.message.contains('"this rule" target')
+            assert writes.isEmpty() && posts.isEmpty()
+        }
+
+        where:
+        cap              | fieldPrefix  | actionSpec                                                      | written     | outcome
+        "privateBoolean" | "privateT."  | [capability: "privateBoolean", ruleIds: ["*", 555.0], value: false] | ["*", 555] | "written mixed"
+        "privateBoolean" | "privateT."  | [capability: "privateBoolean", ruleIds: ["*"], value: true]       | ["*"]       | "written alone"
+        "runRule"        | "ruleAct."   | [capability: "runRule", ruleIds: ["*"]]                           | null        | "refused before any write"
+    }
+
     def "modifyAction reposition soft-failure STOPS the move loop and flips success false with the verifyHint"() {
         given: "the retargeted action needs two moves; the FIRST arrow click never commits"
         // ruleAct.4 IS committed, so the readback passes and the move soft-failure is the sole
@@ -38968,6 +39049,75 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.subscriptionSettle?.contains("rule has 1 trigger but")
         result.subscriptionSettle?.contains("The trigger is likely incomplete")
         !result.subscriptionSettle?.contains("The triggers are likely incomplete")
+    }
+
+    def "subscriptionSettle reports SUPPRESSED without a second click when #gate"() {
+        given:
+        enableWrite()
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        List<Map> posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            JsonOutput.toJson([
+                installedApp: [id: 100, label: label],
+                appSettings: [[name: "tDev1", deviceIdsForDeviceList: [8]]],
+                eventSubscriptions: [],
+                scheduledJobs: [], appState: appState, childAppCount: 0, childDeviceCount: 0
+            ])
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, button: "updateRule", confirm: true])
+
+        then:
+        result.subscriptionSettle?.startsWith("SUPPRESSED:")
+        result.subscriptionSettle?.contains(reason)
+        !result.subscriptionSettle?.contains("likely incomplete")
+        posts.count { it.path == "/installedapp/btn" && it.body.name == "updateRule" } == 1
+
+        where:
+        gate                          | label                                                              | appState                                    | reason
+        "Required Expression false"   | "R <span style='color:red'>(Required Expression false)</span>"     | []                                          | "Required Expression is false"
+        "paused in appState"          | "R"                                                                | [[name: "paused", value: true]]             | "paused"
+        "stopped in appState"         | "R"                                                                | [[name: "stopped", value: true]]            | "stopped"
+    }
+
+    def "subscriptionSettle still WARNs when a rule is only NAMED like a decoration"() {
+        given:
+        enableWrite()
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            JsonOutput.toJson([
+                installedApp: [id: 100, label: "Porch (Required Expression false)"],
+                appSettings: [[name: "tDev1", deviceIdsForDeviceList: [8]]],
+                eventSubscriptions: [],
+                scheduledJobs: [], appState: [], childAppCount: 0, childDeviceCount: 0
+            ])
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, button: "updateRule", confirm: true])
+
+        then:
+        result.subscriptionSettle?.contains("The trigger is likely incomplete")
     }
 
     def "subscriptionSettle WARN message: plural 'triggers are' when triggerCount=2"() {

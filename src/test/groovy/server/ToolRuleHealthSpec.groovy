@@ -297,7 +297,8 @@ class ToolRuleHealthSpec extends ToolSpecBase {
         h.ok == false
         h.broken == true
         h.issues.any { it.contains("broken:true") }
-        h.issues.any { it.contains("False conditions:") }
+        // capabsfalse lists conditions regardless of their truth, so it is not quoted as the cause
+        !h.issues.any { it.contains("False conditions") || it.contains("BAT-Motion1") }
         // the JSON caught a break the render scan missed -> cross-check fires
         h.issues.any { it.contains("cross-check") }
     }
