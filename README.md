@@ -1655,6 +1655,7 @@ For easier bug reporting:
 
 ## Version History
 
+- **v4.3.6** - ci: publish fork PR library bundles after e2e approval; ci: scan only the fork files the e2e job executes; fix: report unverified standalone rule edits and recovery outcomes. PRs: [#436](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/436), [#440](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/440), [#437](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/437)
 - **v4.3.5** - fix: build Boolean variable conditions and keep walkStep drive state between steps. PRs: [#426](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/426)
 - **v4.3.4** - fix: stop bulk rule edits at the first failed or partial item. PRs: [#425](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/425)
 - **v4.3.3** - docs: recommend mcp-remote for Claude Desktop on all platforms; fix: coordinate retained backups and recovery state. PRs: [#430](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/430), [#419](https://github.com/kingpanther13/Hubitat-local-MCP-server/pull/419)
