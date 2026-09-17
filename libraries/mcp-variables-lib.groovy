@@ -743,9 +743,8 @@ def toolDeleteHubVariable(args) {
 
     // Source detection: hub vs rule_engine namespace. Hub vars are deleted
     // through the Hub Variables system app's wizard; rule_engine vars are a
-    // map in state we can rewrite directly. Same in-use safety scan applies
-    // to both — child rules can reference a hub var by name in their
-    // triggers/conditions/actions JSON.
+    // map in state we can rewrite directly. The child-rule scan applies to
+    // both; a hub var is also checked against the hub's in-use registry.
     def hubVar = null
     try { hubVar = getGlobalVar(varName) }
     catch (Exception e) {
@@ -766,8 +765,8 @@ def toolDeleteHubVariable(args) {
     // serialized triggers/conditions/actions JSON, as a quoted value or a %name% substitution.
     def consumers = []
     try {
-        // Word-boundary match: look for "<varName>" (JSON-quoted) so a var
-        // named `temp` doesn't match rules referencing `temperature` etc.
+        // Word-boundary match: the JSON-quoted name or a %name% substitution, so a
+        // var named `temp` doesn't match rules referencing `temperature` etc.
         def needles = ["\"${varName}\"".toString(), "%${varName}%".toString()]
         getChildApps()?.each { child ->
             def ruleData = null
@@ -858,7 +857,8 @@ def toolDeleteHubVariable(args) {
             def cc = consumers.size()
             consumerNote = " (forced; ${cc} ${cc == 1 ? 'rule' : 'rules'} now broken: ${consumers.collect { "id=${it.id}" }.join(', ')})"
         }
-        mcpLog("warn", "developer-mode", "hub_delete_variable: removed hub var '${varName}' (type=${previousType}, previous value: ${auditValue})${connectorNote}${consumerNote}")
+        def registryNote = (platformInUse != false) ? " (forced; hub in-use registry: ${platformInUse == null ? 'unreadable' : 'true'})" : ""
+        mcpLog("warn", "developer-mode", "hub_delete_variable: removed hub var '${varName}' (type=${previousType}, previous value: ${auditValue})${connectorNote}${registryNote}${consumerNote}")
         return [
             success: true,
             name: varName,

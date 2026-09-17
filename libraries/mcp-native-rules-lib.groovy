@@ -1069,8 +1069,9 @@ private String _rmFindResidualCondTrig(Map configPage) {
 // Decide whether a just-clicked updateRule left an RM rule with pending
 // subscription work. Returns null if the rule has no trigger-bearing
 // settings at all (no lag to detect), otherwise returns a small map with
-// `unsettled` (Boolean) + `triggerCount` (Integer) + `subCount` (Integer)
-// so the caller can decide whether to auto-retry / warn.
+// `unsettled` (Boolean) + `triggerCount` (Integer) + `subCount` (Integer) +
+// `suppressedBy` (why RM is withholding subscriptions, or null) so the caller
+// can decide whether to auto-retry / warn. Also null when statusJson is unreadable.
 //
 // Unsettled = rule has at least one tDev<N> multi-device capability
 // setting (trigger is device-backed) but eventSubscriptions is empty.
@@ -1104,6 +1105,12 @@ private Map _rmCheckSubscriptionSettle(Integer appId) {
         subCount: subs.size(),
         suppressedBy: _rmTriggerSubscriptionGate(status)
     ]
+}
+
+private String _rmSuppressedSettleText(Object gate) {
+    def why = [requiredExpressionFalse: "its Required Expression is false (RM removes trigger subscriptions until it is true)",
+               paused: "the rule is paused", stopped: "the rule is stopped"][gate?.toString()] ?: "RM reports the rule as inactive (${gate})"
+    return "SUPPRESSED: eventSubscriptions=0 because ${why}. This is expected and says nothing about whether the trigger is complete; check the trigger again with updateRule once the rule is active.".toString()
 }
 
 // Why RM would hold no trigger subscriptions on purpose, or null. RM removes them while
@@ -1472,7 +1479,7 @@ private boolean _rmSpecListTargetsRule(List specs) {
 }
 
 // Normalize the rule id(s) written into a rule-targeting action field to the
-// integer-canonical form. A decimal-form Number (22624.0) would otherwise bake
+// integer-canonical form; with allowThisRule, RM's "this rule" target "*" passes through as-is. A decimal-form Number (22624.0) would otherwise bake
 // literally into the rule field and RM then mishandles it -- the same reason the
 // trigger paths canonicalize a device id to "72" rather than "72.0". Accepts a
 // scalar or a list; returns a list (RM's rule pickers are multi-select).
@@ -1489,7 +1496,7 @@ private List _rmNormalizeRuleIdsForWrite(Object ids, boolean allowThisRule = fal
     return idList.collect { id ->
         if (_rmIsThisRuleTarget(id)) {
             if (allowThisRule) return "*"
-            throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage("rule target"))
+            throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage("rule"))
         }
         def c = _rmCoerceRuleId(id)
         if (c == null) {
@@ -1559,7 +1566,15 @@ private Integer _rmCoerceRuleId(Object id) {
 private void _rmValidateRuleTargetExists(String label, Object ids, Set validRuleIds = null) {
     def idList = (ids instanceof List) ? ids : (ids != null ? [ids] : [])
     if (!idList) return
-    if (_rmTargetAllowsThisRule(label) && idList.every { _rmIsThisRuleTarget(it) }) return
+    // Shape checks need no rule list, so they run before the cannot-verify skip below.
+    idList.each { id ->
+        if (_rmIsThisRuleTarget(id)) {
+            if (!_rmTargetAllowsThisRule(label)) throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage(label))
+        } else if (_rmCoerceRuleId(id) == null) {
+            throw new IllegalArgumentException("${label} target rule id '${id}' is not a valid numeric rule id. Use hub_list_rules to find valid rule ids. RM is not touched.")
+        }
+    }
+    if (idList.every { _rmIsThisRuleTarget(it) }) return
     def liveIds = (validRuleIds != null) ? validRuleIds : _rmValidRuleIds()
     if (liveIds == null) {
         // Cannot verify (RMUtils absent / tree unreadable) -> skip; an empty set (verified
@@ -1569,14 +1584,8 @@ private void _rmValidateRuleTargetExists(String label, Object ids, Set validRule
         return
     }
     idList.each { id ->
-        if (_rmIsThisRuleTarget(id)) {
-            if (_rmTargetAllowsThisRule(label)) return
-            throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage(label))
-        }
+        if (_rmIsThisRuleTarget(id)) return
         def idInt = _rmCoerceRuleId(id)
-        if (idInt == null) {
-            throw new IllegalArgumentException("${label} target rule id '${id}' is not a valid numeric rule id. Use hub_list_rules to find valid rule ids. RM is not touched.")
-        }
         if (!liveIds.contains(idInt)) {
             throw new IllegalArgumentException("${label} target rule id '${id}' does not exist on the hub. Use hub_list_rules to find valid rule ids. RM is not touched.")
         }
@@ -12348,7 +12357,8 @@ private Map _rmValidateRequiredExpressionSpec(Map exprSpec, String label, boolea
     //   - operators: ["AND", "OR", "XOR", ...]  (one per gap, length = conditions.size()-1)
     // Operators-list path supports mixed expressions like
     // "P1 AND P2 OR P3 XOR P4" where each gap has a different operator.
-    // RM 5.1 walks the operators strictly left to right and stops as soon as the result is decided.
+    // RM 5.1 walks the operators strictly left to right: a true left side of OR or a false left
+    // side of AND ends the whole expression, so later terms are never read. XOR is undocumented.
     def opsList = null
     if (exprSpec.operators instanceof List) {
         opsList = (exprSpec.operators as List).collect { it?.toString()?.toUpperCase() }
@@ -15593,20 +15603,23 @@ def _applyNativeAppEdit(args) {
             def settleStatus = _rmCheckSubscriptionSettle(appId)
             if (settleStatus?.unsettled && settleStatus.suppressedBy) {
                 // A retry cannot add subscriptions RM is withholding, and the rule is not incomplete.
-                def why = [requiredExpressionFalse: "its Required Expression is false (RM removes trigger subscriptions until it is true)",
-                           paused: "the rule is paused", stopped: "the rule is stopped"][settleStatus.suppressedBy]
-                result.subscriptionSettle = "SUPPRESSED: eventSubscriptions=0 because ${why}. This is expected and says nothing about whether the trigger is complete; check the trigger again with updateRule once the rule is active.".toString()
+                result.subscriptionSettle = _rmSuppressedSettleText(settleStatus.suppressedBy)
             } else if (settleStatus?.unsettled) {
                 mcpLog("info", "rm-native", "updateRule subscription settle lag on app ${appId} -- retrying")
                 _rmClickAppButton(appId, "updateRule")
+                def firstStatus = settleStatus
                 settleStatus = _rmCheckSubscriptionSettle(appId)
-                def trigCount = settleStatus.triggerCount
+                def trigCount = (settleStatus ?: firstStatus).triggerCount
                 def trigWord = trigCount == 1 ? "trigger" : "triggers"
                 // Discriminate on count, not on stringified word: trigWord=="trigger"
                 // could in theory drift if the assignment above changed, and at count==0
                 // ("triggers", plural by default) the "triggers are" verb is correct anyway.
                 def trigVerb = (trigCount == 1) ? "trigger is" : "triggers are"
-                result.subscriptionSettle = settleStatus?.unsettled ?
+                result.subscriptionSettle = (settleStatus?.unsettled && settleStatus.suppressedBy) ?
+                    _rmSuppressedSettleText(settleStatus.suppressedBy) :
+                    settleStatus == null ?
+                    "UNKNOWN: updateRule was retried but the follow-up statusJson read failed, so whether the ${trigCount == 1 ? 'trigger' : 'triggers'} subscribed is unverified. Inspect statusJson.eventSubscriptions before relying on the rule." :
+                    settleStatus.unsettled ?
                     "WARN: rule has ${trigCount} ${trigWord} but eventSubscriptions=0 after two updateRule clicks. The ${trigVerb} likely incomplete (missing tstate, attached-condition, or other required field) OR a hub timing race. Inspect statusJson.eventSubscriptions; if still empty, call hub_set_rule(button='updateRule') again or check the wizard for missing fields." :
                     "OK after auto-retry"
             } else if (settleStatus != null) {

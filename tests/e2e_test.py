@@ -5565,6 +5565,10 @@ class TestRunner:
                                   "periodic": {"frequency": "Hourly"}}}, ("everyn",)),
                 ({"addAction": {"capability": "runRule", "ruleIds": [999999999]}},
                  ("'999999999'", "hub_list_rules")),
+                # RM's "this rule" sentinel is a privateBoolean-only target; elsewhere it is
+                # refused by name rather than as an unparseable rule id.
+                ({"addAction": {"capability": "runRule", "ruleIds": ["*"]}},
+                 ('"this rule" target', "privateBoolean")),
                 ({"addRequiredExpression": {"conditions": [{"capability": "Days of week"}]}},
                  ("structured condition shortcut",)),
                 ({"addRequiredExpression": {"conditions": [{"capability": "Lock codes"}]}},
@@ -5854,6 +5858,38 @@ class TestRunner:
                 f"the order sentinel did not render on the page at all: {page_text[:400]}"
             assert run_pos < sentinel_pos, \
                 f"position not preserved: Run Actions at {run_pos}, sentinel at {sentinel_pos}"
+
+            # RM's own "this rule" target: it must write verbatim and survive a modifyAction
+            # that changes only the boolean value (issue #434). The rebuild lands a NEW index,
+            # so the old privateT/pvTF keys must be gone and the new pair must hold "*" + the
+            # flipped value -- re-reading the old index would pass on a no-op.
+            pb_added = self._set_rule(caller_id, {
+                "addAction": {"capability": "privateBoolean", "ruleIds": ["*"], "value": False}},
+                strict=True)
+            pb_idx = pb_added.get("actionIndex")
+            pb_settings = self._get_persisted_rule_config(caller_id).get("settings") or {}
+            if pb_idx is None:
+                pb_idx = next((str(k).split(".", 1)[1] for k in pb_settings if str(k).startswith("privateT.")), None)
+            assert pb_idx is not None, f"privateBoolean '*' action reported no index: {pb_added}"
+            assert self._normalize_ruleact_ids(pb_settings.get(f"privateT.{pb_idx}")) == ["*"], \
+                f"privateT.{pb_idx} did not persist RM's this-rule target: {pb_settings}"
+            # pvTF is inverted: value False stores "true".
+            assert str(pb_settings.get(f"pvTF.{pb_idx}")).lower() == "true", \
+                f"pvTF.{pb_idx} did not store the requested value: {pb_settings}"
+
+            pb_mod = self._set_rule(caller_id, {
+                "modifyAction": {"index": int(pb_idx), "mods": {"value": True}}}, strict=True)
+            pb_new_idx = pb_mod.get("newActionIndex")
+            assert pb_new_idx is not None, f"privateBoolean modifyAction carried no newActionIndex: {pb_mod}"
+            assert pb_mod.get("verifiedTargets") == ["*"], \
+                f"modifyAction did not verify the this-rule target through the rebuild: {pb_mod}"
+            pb_after = self._get_persisted_rule_config(caller_id).get("settings") or {}
+            assert self._normalize_ruleact_ids(pb_after.get(f"privateT.{pb_new_idx}")) == ["*"], \
+                f"the rebuilt action lost the this-rule target: {pb_after}"
+            assert str(pb_after.get(f"pvTF.{pb_new_idx}")).lower() == "false", \
+                f"modifyAction did not flip pvTF on the rebuilt action: {pb_after}"
+            assert f"privateT.{pb_idx}" not in pb_after, \
+                f"the pre-rebuild privateBoolean row survived the retarget: {pb_after}"
 
             # Keep one live >1 ruleId request: a successful call proves the batch envelope and
             # exact echoed ids; a platform load-limiter refusal proves the parsed array reached
@@ -11289,48 +11325,16 @@ class TestRunner:
             "addActions": [{"capability": "log", "message": "E2E gated"}],
         })
         try:
-            self.client.call_tool("hub_manage_rule_machine", {
+            pb = self.client.call_tool("hub_manage_rule_machine", {
                 "tool": "hub_set_rule_private_boolean", "args": {"ruleId": int(app_id), "value": False}})
+            assert pb.get("success") is not False, \
+                f"could not set the Private Boolean false, so the Required Expression is not gated: {pb}"
             # strict: a relay-dropped response raises instead of returning a verdict-less sentinel.
             res = self._set_rule(app_id, {"button": "updateRule"}, strict=True)
             settle = str((res or {}).get("subscriptionSettle") or "")
-            assert settle, f"updateRule on a device-triggered rule returned no settle verdict: {res}"
-            assert "likely incomplete" not in settle, f"a gated rule was reported incomplete: {res}"
-            assert settle.startswith("SUPPRESSED") or settle == "OK", f"unexpected settle verdict: {settle}"
-        finally:
-            self._delete_native(app_id)
-
-    @test("native_apps")
-    def test_set_rule_private_boolean_this_rule_target(self) -> None:
-        # '*' is RM's own "this rule" target for Set Private Boolean. It must be written as-is,
-        # survive a modifyAction value change, and be refused on other rule-targeting actions.
-        app_id, created = self._create_native_rule("PbSelf", {
-            "addActions": [{"capability": "privateBoolean", "ruleIds": ["*"], "value": False}]},
-            return_result=True)
-        try:
-            settings = self._get_persisted_rule_config(app_id).get("settings") or {}
-            if created is not None:
-                act = (created.get("actions") or [{}])[0]
-                assert act.get("success") is not False, f"privateBoolean '*' action failed: {created}"
-                idx = act.get("actionIndex")
-            else:
-                # Relay-504 adoption leaves no create envelope; take the index from the committed rule.
-                idx = next((str(k).split(".", 1)[1] for k in settings if str(k).startswith("privateT.")), None)
-            assert idx is not None, f"no privateBoolean action index to check: created={created} settings={settings}"
-            assert settings.get(f"privateT.{idx}") in (["*"], "*", '["*"]'), \
-                f"privateT did not persist the this-rule target: {settings}"
-            self._set_rule(app_id, {"modifyAction": {"index": int(idx), "mods": {"value": True}}})
-            after = self._get_persisted_rule_config(app_id).get("settings") or {}
-            targets = [v for k, v in after.items() if str(k).startswith("privateT.")]
-            assert targets and all(v in (["*"], "*", '["*"]') for v in targets), \
-                f"modifyAction dropped the '*' target: {after}"
-            refused = None
-            try:
-                self._set_rule(app_id, {"addAction": {"capability": "runRule", "ruleIds": ["*"]}}, strict=True)
-            except (McpToolError, AssertionError) as exc:
-                refused = str(exc)
-            assert refused and "this rule" in refused, f"runRule '*' was not refused by name: {refused}"
-            self._assert_rule_healthy(app_id)
+            assert settle.startswith("SUPPRESSED"), \
+                f"a rule gated by a false Required Expression should report SUPPRESSED, got: {settle!r} ({res})"
+            assert "Required Expression is false" in settle, f"unexpected suppression reason: {settle}"
         finally:
             self._delete_native(app_id)
 

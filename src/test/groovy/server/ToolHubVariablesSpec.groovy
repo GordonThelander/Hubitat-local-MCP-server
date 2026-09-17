@@ -1056,6 +1056,8 @@ class ToolHubVariablesSpec extends ToolSpecBase {
         script.metaClass._hubVarPlatformInUse = { Integer a, String n -> false }
         // backupItemSource is called between clicks as wizard priming on this firmware.
         script.metaClass.backupItemSource = { String type, String id -> [:] }
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg -> logs << msg }
 
         when:
         def result = script.toolDeleteHubVariable([name: 'condemned', confirm: true])
@@ -1072,6 +1074,9 @@ class ToolHubVariablesSpec extends ToolSpecBase {
         result.name == 'condemned'
         result.platformInUse == false
         result.coverageNote.contains('webCoRE')
+
+        and: "an unforced delete of an unused variable carries no forced note"
+        logs.any { it.contains("removed hub var 'condemned'") && !it.contains("forced") }
     }
 
     @spock.lang.Unroll
@@ -1103,7 +1108,8 @@ class ToolHubVariablesSpec extends ToolSpecBase {
         "unreadable"   | null     | "is unknown"
     }
 
-    def "hub_delete_variable hub-namespace: force=true deletes a registered variable and reports it"() {
+    @spock.lang.Unroll
+    def "hub_delete_variable hub-namespace: force=true deletes when the registry is #note and says so"() {
         given:
         enableWrite()
         def calls = 0
@@ -1113,8 +1119,10 @@ class ToolHubVariablesSpec extends ToolSpecBase {
         }
         script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
         script.metaClass._findHubVariablesAppId = { -> 1424 }
-        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> registry }
         script.metaClass.backupItemSource = { String type, String id -> [:] }
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg -> logs << msg }
 
         when:
         def result = script.toolDeleteHubVariable([name: 'shared', confirm: true, force: true])
@@ -1122,7 +1130,15 @@ class ToolHubVariablesSpec extends ToolSpecBase {
         then:
         result.success == true
         result.deleted == true
-        result.platformInUse == true
+        result.platformInUse == registry
+
+        and: "the audit line says the delete was forced past the registry"
+        logs.any { it.contains("removed hub var 'shared'") && it.contains("(forced; hub in-use registry: ${note})") }
+
+        where:
+        registry | note
+        true     | "true"
+        null     | "unreadable"
     }
 
     @spock.lang.Unroll
