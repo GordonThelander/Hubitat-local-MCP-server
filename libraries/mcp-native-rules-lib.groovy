@@ -3632,7 +3632,7 @@ private Map _rmActionSchemaForDiscover() {
                 name: "privateBoolean",
                 family: "rules",
                 requiredFields: [
-                    [name: "ruleIds", type: "List<Integer>"],
+                    [name: "ruleIds", type: "List<Integer | \"*\">", description: "\"*\" is RM's this-rule target and may stand alone or sit beside numeric rule ids"],
                     [name: "value", type: "Boolean"]
                 ],
                 optionalFields: [
