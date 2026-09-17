@@ -298,7 +298,7 @@ Note: raw `pvTF.<N>` stores the inverse of the rendered True/False (`true`=False
 
 | Field | Type | Notes |
 |---|---|---|
-| `ruleIds` | List\<Integer\> | Required |
+| `ruleIds` | List\<Integer \| "\*"\> | Required. `"*"` is RM's "this rule" target and may appear alone or with ids (`["*", 1809]`). |
 | `value` | Boolean | Required |
 | `rawSettings` | Map | |
 

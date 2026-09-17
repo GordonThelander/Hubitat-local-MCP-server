@@ -8356,7 +8356,7 @@ private Map _rmFetchStatusJson(Integer appId) {
  * health source across EVERY rule engine (issue #254 + the VRB follow-up).
  * Returns a normalized map or null when appId is not a recognized rule shape:
  *
- *   - classic Rule Machine -> [ruleFormat:"rm", broken:<bool>, paused, predicate, capabsfalse]
+ *   - classic Rule Machine -> [ruleFormat:"rm", broken:<bool>, paused, predicate, actionList]
  *     from GET /app/ruleBuilderJson (the real `broken` boolean + predicate/condition
  *     structure, instead of scraping rendered HTML).
  *   - graph Visual Rule (VRB 2.0) -> [ruleFormat:"vrb-graph", broken:<validationErrors
@@ -8409,7 +8409,6 @@ private Map _ruleCompiledState(Integer appId) {
                 return [ruleFormat: "rm", broken: parsed.broken == true, validationErrors: [],
                         paused: parsed.paused instanceof Boolean ? parsed.paused : null,
                         predicate: pred,
-                        capabsfalse: (parsed.capabsfalse instanceof Map ? parsed.capabsfalse : null),
                         actionList: (parsed.actionList instanceof List ? parsed.actionList : null),
                         endpoint: "ruleBuilderJson"]
             }
@@ -8772,11 +8771,9 @@ Map _rmCheckRuleHealth(Integer appId, String source = "auto") {
             compiledActionList = _rmCoerceActionIndices(cs.actionList)   // null in -> null out
             if (cs.validationErrors) validationErrors = cs.validationErrors
             if (ruleFormat == "rm" && broken == true) {
-                // capabsfalse renders the live false-condition text (with current
-                // values) — it points at what is wrong.
-                def detail = (cs.capabsfalse instanceof Map && !cs.capabsfalse.isEmpty()) ?
-                    " False conditions: ${cs.capabsfalse.values().join('; ')}".toString() : ""
-                issues << "ruleBuilderJson reports broken:true (compiled-state boolean — authoritative).${detail}".toString()
+                // Not capabsfalse: it lists a rule's conditions whatever their current truth,
+                // so quoting it as "false conditions" points at the wrong cause.
+                issues << "ruleBuilderJson reports broken:true (compiled-state boolean — authoritative).".toString()
             } else if (ruleFormat == "vrb-graph" && !validationErrors.isEmpty()) {
                 issues << "Visual Rule (graph) has validation errors: ${validationErrors.join('; ')}".toString()
             }
@@ -10340,7 +10337,7 @@ For the live machine-readable per-field schema (action enums, required and optio
 - **Rule-local Variable** (`capability='setLocalVariable'`): identical shape and source modes to `setVariable` (`variable` target + exactly one of `value`/`sourceVariable`/`fromDevice`/`math`), EXCEPT the `variable` target is validated against the rule's LOCAL variables (`state.allLocalVars`) instead of hub globals. Use this -- not `setVariable` -- when a local and a hub variable share a name and you mean the local; it cannot silently target the global. `sourceVariable`/`math` operands may be either local or hub (RM's source picker spans both; validated against the live revealed enum). Create a local first via `addLocalVariable`; list current locals via `hub_list_rule_local_variables` (in `hub_read_rules`). The picker section headers ` --LOCAL VARIABLES--` / ` --HUB VARIABLES--` are rejected as targets.
 - **Logging / Messaging**: `capability='log' + message`. `capability='notification' + deviceIds + message`. `capability='httpGet' + url`. `capability='httpPost' + url + body + optional contentType`. `capability='ping' + ip`.
 - **Music/Sound** (`capability='volume'`/`'mute'`/`'chime'`/`'siren'`): `volume + deviceIds + level`. `mute + action='mute'/'unmute' + deviceIds`. `chime + deviceIds + optional playStop/soundNumber`. `siren + deviceIds + optional sirenAction`.
-- **Rules** (`capability='privateBoolean'`/`'runRule'`/`'cancelTimers'`/`'pauseRule'`): `privateBoolean + ruleIds + value (Boolean)`. `runRule + ruleIds` (runs actions). `cancelTimers + ruleIds`. `pauseRule + action='pause'/'resume' + ruleIds`. Raw `pvTF.<N>` and `pR.<N>` store the inverse of the rendered True/False (`pR`: `false`=pause, `true`=resume); the rendered paragraph is ground truth, so do not "fix" readbacks against the raw field. For all four, each `ruleIds` target must resolve to an existing Rule Machine rule -- checked against the live RM rule list before any write -- and a target id that is not an existing rule is rejected fail-loud ("RM is not touched"), steering to `hub_list_rules`, rather than baking a dangling rule reference that renders broken and never fires. On a hub whose rule list can't be resolved (RM not installed or the app-tree read failed) the check is skipped and the write proceeds. A hub with zero rules is NOT a can't-resolve case: every rule target is then rejected fail-loud.
+- **Rules** (`capability='privateBoolean'`/`'runRule'`/`'cancelTimers'`/`'pauseRule'`): `privateBoolean + ruleIds + value (Boolean)`; its `ruleIds` may include `"*"`, RM's "this rule" target, alone or mixed (`["*", 1809]`), and `modifyAction` keeps it. `"*"` is refused by name on the other three, where it has not been observed. `runRule + ruleIds` (runs actions). `cancelTimers + ruleIds`. `pauseRule + action='pause'/'resume' + ruleIds`. Raw `pvTF.<N>` and `pR.<N>` store the inverse of the rendered True/False (`pR`: `false`=pause, `true`=resume); the rendered paragraph is ground truth, so do not "fix" readbacks against the raw field. For all four, each `ruleIds` target must resolve to an existing Rule Machine rule -- checked against the live RM rule list before any write -- and a target id that is not an existing rule is rejected fail-loud ("RM is not touched"), steering to `hub_list_rules`, rather than baking a dangling rule reference that renders broken and never fires. On a hub whose rule list can't be resolved (RM not installed or the app-tree read failed) the check is skipped and the write proceeds. A hub with zero rules is NOT a can't-resolve case: every rule target is then rejected fail-loud.
 - **Activate a Scene / Room Lighting group**: RM 5.1 has no dedicated activate-scene action subtype. Each Scene / Room Lighting instance spawns an activator device with the switch capability -- activate it via the Switch action: `capability='switch' + action='on' + deviceIds=[<activatorDeviceId>]` (use `action='off'` to send an off/deactivate command, whose effect is configuration-dependent). The `activate_scene` action lives ONLY on the legacy custom rule engine (the `hub_*_custom_rule` tools / `hub_get_tool_guide(section='rules')`), not on this native addAction surface.
 - **Device control**: `capability='capture' + deviceIds`. `capability='restore'` (no fields). `capability='refresh' + deviceIds`. `capability='poll' + deviceIds`. `capability='disableDevice' + action='disable'/'enable' + deviceIds`.
 - **Flow control** (delay/wait/repeat/exit/comment/conditional):
@@ -10398,7 +10395,7 @@ To compare a **device attribute against a hub variable**, there is no direct sha
 
 ### `addRequiredExpression` operator contract
 
-Combine multiple conditions with `operator: 'AND'|'OR'|'XOR'` (one operator applied to every gap) OR `operators: ['AND','OR', ...]` (one per gap; length = `conditions.size()-1`) for mixed expressions like `P1 AND P2 OR P3 XOR P4`. RM 5.1: AND/OR/XOR have equal precedence, evaluated left-to-right.
+Combine multiple conditions with `operator: 'AND'|'OR'|'XOR'` (one operator applied to every gap) OR `operators: ['AND','OR', ...]` (one per gap; length = `conditions.size()-1`) for mixed expressions like `P1 AND P2 OR P3 XOR P4`. RM 5.1 walks the expression strictly left to right and stops early: once the left side of an OR is true the result is true, and once the left side of an AND is false the result is false, so later terms are never read (`Mode AND Evening OR Morning AND PB` never reads PB while Mode and Evening are true). Whenever AND and OR are mixed, group with `subExpression` to state the intent, e.g. `Mode AND (Evening OR Morning) AND PB`.
 
 ### `replaceRequiredExpression` -- change an existing Required Expression in place
 
@@ -10553,7 +10550,12 @@ Create a new hub variable (global variable visible to apps and Rule Machine), on
 
 Useful for sweeping orphaned `BAT_E2E_*` artifacts after CI runs, removing stale lease variables, or general cleanup.
 
-**Why the reference-safety refusal matters:** the tool refuses by default when a child rule app references the variable because deletion would silently break those rules — null lookups → false conditions, and a literal `%varname%` left in substitutions. Pass `force=true` to proceed anyway after acknowledging the breakage.
+**Why the reference-safety refusal matters:** deleting a variable something still uses silently breaks it — null lookups → false conditions, and a literal `%varname%` left in substitutions. Without `force=true` the tool refuses when:
+- the hub's own in-use registry marks a hub variable as used (what Settings → Hub Variables shows in orange; Rule Machine and other registering apps appear there);
+- that registry cannot be read, since unknown is not the same as unused;
+- one of this server's child rules names the variable, quoted or as a `%name%` substitution.
+
+Apps that never register their use, such as webCoRE pistons, cannot be seen by any of these checks; the response's `coverageNote` says so and `platformInUse` reports what the registry said. Pass `force=true` to proceed anyway after acknowledging the breakage.
 
 ### hub_list_variable_changes
 

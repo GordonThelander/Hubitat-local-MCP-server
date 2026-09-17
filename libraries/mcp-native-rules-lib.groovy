@@ -109,7 +109,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     addRequiredExpression: [
                         type: "object",
-                        description: """Add an RM 5.1 Required Expression (the pre-trigger gate that conditions whether the rule may fire); returns conditionIndices. Spec: {conditions:[{capability, deviceIds?, state?, comparator?, value?, attribute?, not?, rawSettings?}, ...], operator:'AND'|'OR'|'XOR' OR operators:[...] (one per gap, for mixed expressions; equal precedence, left-to-right)}. comparator is REQUIRED with attribute (Custom Attribute) and with variable+value (Variable); ASCII !=/<>/== auto-map to RM glyphs, and a free-valued (String) variable/attribute offers `*contains*` (substring match; negate with not:true). STPage capability list and extended shapes (Mode, Between two times, Variable incl. compareToVariable, device-relative compareToDevice, nested subExpression): guide:true or hub_get_tool_guide(section='set_rule_reference_conditions'); cross-cutting fail-loud steers: section='set_rule_reference_guards'."""
+                        description: """Add an RM 5.1 Required Expression (the pre-trigger gate that conditions whether the rule may fire); returns conditionIndices. Spec: {conditions:[{capability, deviceIds?, state?, comparator?, value?, attribute?, not?, rawSettings?}, ...], operator:'AND'|'OR'|'XOR' OR operators:[...] (one per gap; RM walks left to right and stops early, so group mixed AND/OR with subExpression)}. comparator is REQUIRED with attribute (Custom Attribute) and with variable+value (Variable); ASCII !=/<>/== auto-map to RM glyphs, and a free-valued (String) variable/attribute offers `*contains*` (substring match; negate with not:true). STPage capability list and extended shapes (Mode, Between two times, Variable incl. compareToVariable, device-relative compareToDevice, nested subExpression): guide:true or hub_get_tool_guide(section='set_rule_reference_conditions'); cross-cutting fail-loud steers: section='set_rule_reference_guards'."""
                     ],
                     replaceRequiredExpression: [
                         type: "object",
@@ -169,7 +169,7 @@ On MCP 2026-07-28, eligible slow writes continue automatically across bounded St
                     ],
                     addAction: [
                         type: "object",
-                        description: """Add an RM ACTION (structured). DISCRIMINATOR: use `capability` NOT `type` (`{type:'log'}` is rejected); returns actionIndex (no trailing updateRule — doActPage self-bakes). Capability names: switch, dimmer, color, colorTemp, button, runCommand, lock, thermostat, hsm, shade, fan, mode, setVariable/setLocalVariable, log, notification, httpGet, httpPost, ping, volume, mute, chime, siren, privateBoolean, runRule, cancelTimers, pauseRule, capture, restore, refresh, poll, disableDevice, fileWrite/fileAppend/fileDelete, zwavePoll; flow control — delay, delayPerMode, cancelDelay, repeat, stopRepeat, repeatWhile, waitExpression, waitEvents, ifThen, elseIf, else, endIf, exitRule, comment. Expression-based ones (ifThen/elseIf/repeatWhile/waitExpression) take expression={conditions:[...], operator|operators}. LIMIT: only ONE waitEvents per rule. Rule-targeting caps (runRule/cancelTimers/pauseRule/privateBoolean) validate each ruleIds entry against the live RM rule list before any write; a rule id that is not an existing rule is rejected -- use hub_list_rules for valid ids. (On a hub whose rule list can't be resolved -- RM not installed or app-tree unreadable -- the check is skipped; a hub with zero rules instead rejects every rule target.) Per-condition shape: {capability, deviceIds:[N], state?, comparator?, value?, attribute?, not?, rawSettings?} (deviceIds MUST be an array — a bare integer silently stores {N:null}); nested subExpression not supported here (use addRequiredExpression). Optional: delay {hours, minutes, seconds, cancelable}; rawSettings {field:value} with @N = the auto action index (e.g. {'flashRate.@N':750}). Per-field specs, the shape guards, and variable-sourced values: pass {discover: true} for the live schema, hub_get_tool_guide(section='set_rule_reference_actions'), or docs/rm_action_subtype_schemas.md. Extended expression shapes (Mode, Between two times, Variable, compareToDevice): section='set_rule_reference_conditions'."""
+                        description: """Add an RM ACTION (structured). DISCRIMINATOR: use `capability` NOT `type` (`{type:'log'}` is rejected); returns actionIndex (no trailing updateRule — doActPage self-bakes). Capability names: switch, dimmer, color, colorTemp, button, runCommand, lock, thermostat, hsm, shade, fan, mode, setVariable/setLocalVariable, log, notification, httpGet, httpPost, ping, volume, mute, chime, siren, privateBoolean, runRule, cancelTimers, pauseRule, capture, restore, refresh, poll, disableDevice, fileWrite/fileAppend/fileDelete, zwavePoll; flow control — delay, delayPerMode, cancelDelay, repeat, stopRepeat, repeatWhile, waitExpression, waitEvents, ifThen, elseIf, else, endIf, exitRule, comment. Expression-based ones (ifThen/elseIf/repeatWhile/waitExpression) take expression={conditions:[...], operator|operators}. LIMIT: only ONE waitEvents per rule. Rule-targeting caps (runRule/cancelTimers/pauseRule/privateBoolean) validate each ruleIds entry against the live RM rule list before any write; a rule id that is not an existing rule is rejected -- use hub_list_rules for valid ids. privateBoolean also takes '*', RM's "this rule" target, alone or mixed (e.g. ['*', 1809]). (On a hub whose rule list can't be resolved -- RM not installed or app-tree unreadable -- the check is skipped; a hub with zero rules instead rejects every rule target.) Per-condition shape: {capability, deviceIds:[N], state?, comparator?, value?, attribute?, not?, rawSettings?} (deviceIds MUST be an array — a bare integer silently stores {N:null}); nested subExpression not supported here (use addRequiredExpression). Optional: delay {hours, minutes, seconds, cancelable}; rawSettings {field:value} with @N = the auto action index (e.g. {'flashRate.@N':750}). Per-field specs, the shape guards, and variable-sourced values: pass {discover: true} for the live schema, hub_get_tool_guide(section='set_rule_reference_actions'), or docs/rm_action_subtype_schemas.md. Extended expression shapes (Mode, Between two times, Variable, compareToDevice): section='set_rule_reference_conditions'."""
                     ],
                     guide: [type: "boolean", description: "Set true to return the full hub_set_rule capability reference inline (same content as hub_get_tool_guide(section='set_rule_reference')), without a separate call. Makes NO change to any rule."],
                     buttonRule: [type: "object", description: "Create a Button Rule under an existing Button Controller: {controllerId, buttonNumber, event}. Returns buttonRuleId with the Button trigger auto-seeded — then author actions via addAction on that appId. The controller must already have a button device.", properties: [controllerId: [type: "integer", description: "Button Controller-5.1 appId"], buttonNumber: [type: "integer", description: "button number (>=1)"], event: [type: "string", enum: ["pushed", "held", "doubleTapped", "released"]]]],
@@ -1069,8 +1069,9 @@ private String _rmFindResidualCondTrig(Map configPage) {
 // Decide whether a just-clicked updateRule left an RM rule with pending
 // subscription work. Returns null if the rule has no trigger-bearing
 // settings at all (no lag to detect), otherwise returns a small map with
-// `unsettled` (Boolean) + `triggerCount` (Integer) + `subCount` (Integer)
-// so the caller can decide whether to auto-retry / warn.
+// `unsettled` (Boolean) + `triggerCount` (Integer) + `subCount` (Integer) +
+// `suppressedBy` (why RM is withholding subscriptions, or null) so the caller
+// can decide whether to auto-retry / warn. Also null when statusJson is unreadable.
 //
 // Unsettled = rule has at least one tDev<N> multi-device capability
 // setting (trigger is device-backed) but eventSubscriptions is empty.
@@ -1101,8 +1102,31 @@ private Map _rmCheckSubscriptionSettle(Integer appId) {
     return [
         unsettled: subs.isEmpty(),
         triggerCount: triggerDevs.size(),
-        subCount: subs.size()
+        subCount: subs.size(),
+        suppressedBy: _rmTriggerSubscriptionGate(status)
     ]
+}
+
+private String _rmSuppressedSettleText(Object gate) {
+    def why = [requiredExpressionFalse: "its Required Expression is false (RM removes trigger subscriptions until it is true)",
+               paused: "the rule is paused", stopped: "the rule is stopped"][gate?.toString()] ?: "RM reports the rule as inactive (${gate})"
+    return "SUPPRESSED: eventSubscriptions=0 because ${why}. This is expected and says nothing about whether the trigger is complete; check the trigger again with updateRule once the rule is active.".toString()
+}
+
+// Why RM would hold no trigger subscriptions on purpose, or null. RM removes them while
+// the Required Expression is false, and a paused or stopped rule has none either.
+private String _rmTriggerSubscriptionGate(Map status) {
+    def appState = status?.appState
+    if (appState instanceof List) {
+        if (_readAppStateBoolean(status, "stopped", false)) return "stopped"
+        if (_readAppStateBoolean(status, "paused", false)) return "paused"
+    }
+    // RM's own decoration is a styled span; a rule merely named "... (Paused)" is plain text.
+    def label = status?.installedApp?.label?.toString() ?: ""
+    if (label.contains(">(Required Expression false)</span>")) return "requiredExpressionFalse"
+    if (label.contains(">(Paused)</span>")) return "paused"
+    if (label.contains(">(Stopped)</span>")) return "stopped"
+    return null
 }
 
 // Collect the hub's authoritative /hub2/appsList tree keyed by app id, for hub_list_rules'
@@ -1455,7 +1479,7 @@ private boolean _rmSpecListTargetsRule(List specs) {
 }
 
 // Normalize the rule id(s) written into a rule-targeting action field to the
-// integer-canonical form. A decimal-form Number (22624.0) would otherwise bake
+// integer-canonical form; with allowThisRule, RM's "this rule" target "*" passes through as-is. A decimal-form Number (22624.0) would otherwise bake
 // literally into the rule field and RM then mishandles it -- the same reason the
 // trigger paths canonicalize a device id to "72" rather than "72.0". Accepts a
 // scalar or a list; returns a list (RM's rule pickers are multi-select).
@@ -1467,15 +1491,33 @@ private boolean _rmSpecListTargetsRule(List specs) {
 // id, and there normalizeRuleId would truncate a fractional Number to a DIFFERENT existing
 // rule via toInteger() -- the exact silent corruption _rmCoerceRuleId exists to prevent.
 // Throwing keeps the guard and the write on the same integer-valued contract on every path.
-private List _rmNormalizeRuleIdsForWrite(Object ids) {
+private List _rmNormalizeRuleIdsForWrite(Object ids, boolean allowThisRule = false) {
     def idList = (ids instanceof List) ? ids : (ids != null ? [ids] : [])
     return idList.collect { id ->
+        if (_rmIsThisRuleTarget(id)) {
+            if (allowThisRule) return "*"
+            throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage("rule"))
+        }
         def c = _rmCoerceRuleId(id)
         if (c == null) {
             throw new IllegalArgumentException("rule target id '${id}' is not an integer-valued rule id. Use hub_list_rules to find valid rule ids. RM is not touched.")
         }
         return c
     }
+}
+
+// RM stores a rule-targeting action aimed at its own rule as "*", alone or mixed with
+// real ids (privateT.<N> = ["*","1809"]). Seen live only on Set Private Boolean.
+private boolean _rmIsThisRuleTarget(Object id) {
+    return id?.toString()?.trim() == "*"
+}
+
+private boolean _rmTargetAllowsThisRule(Object capability) {
+    return capability?.toString() == "privateBoolean"
+}
+
+private String _rmThisRuleUnsupportedMessage(Object label) {
+    return "${label} target '*' is Rule Machine's \"this rule\" target. It is supported only for privateBoolean actions; for this action use the rule's own numeric id (hub_list_rules) or edit it in the RM wizard. RM is not touched.".toString()
 }
 
 // Coerce a rule-target id to an integer-valued Integer, or null when it is not
@@ -1524,6 +1566,15 @@ private Integer _rmCoerceRuleId(Object id) {
 private void _rmValidateRuleTargetExists(String label, Object ids, Set validRuleIds = null) {
     def idList = (ids instanceof List) ? ids : (ids != null ? [ids] : [])
     if (!idList) return
+    // Shape checks need no rule list, so they run before the cannot-verify skip below.
+    idList.each { id ->
+        if (_rmIsThisRuleTarget(id)) {
+            if (!_rmTargetAllowsThisRule(label)) throw new IllegalArgumentException(_rmThisRuleUnsupportedMessage(label))
+        } else if (_rmCoerceRuleId(id) == null) {
+            throw new IllegalArgumentException("${label} target rule id '${id}' is not a valid numeric rule id. Use hub_list_rules to find valid rule ids. RM is not touched.")
+        }
+    }
+    if (idList.every { _rmIsThisRuleTarget(it) }) return
     def liveIds = (validRuleIds != null) ? validRuleIds : _rmValidRuleIds()
     if (liveIds == null) {
         // Cannot verify (RMUtils absent / tree unreadable) -> skip; an empty set (verified
@@ -1533,10 +1584,8 @@ private void _rmValidateRuleTargetExists(String label, Object ids, Set validRule
         return
     }
     idList.each { id ->
+        if (_rmIsThisRuleTarget(id)) return
         def idInt = _rmCoerceRuleId(id)
-        if (idInt == null) {
-            throw new IllegalArgumentException("${label} target rule id '${id}' is not a valid numeric rule id. Use hub_list_rules to find valid rule ids. RM is not touched.")
-        }
         if (!liveIds.contains(idInt)) {
             throw new IllegalArgumentException("${label} target rule id '${id}' does not exist on the hub. Use hub_list_rules to find valid rule ids. RM is not touched.")
         }
@@ -3583,7 +3632,7 @@ private Map _rmActionSchemaForDiscover() {
                 name: "privateBoolean",
                 family: "rules",
                 requiredFields: [
-                    [name: "ruleIds", type: "List<Integer>"],
+                    [name: "ruleIds", type: "List<Integer | \"*\">", description: "\"*\" is RM's this-rule target and may stand alone or sit beside numeric rule ids"],
                     [name: "value", type: "Boolean"]
                 ],
                 optionalFields: [
@@ -4545,7 +4594,7 @@ private Map _rmModifyAction(Integer appId, Integer actionIdx, Map mods, Long req
             mcpLog("warn", "rm-native", "_rmModifyAction: post-rebuild readback failed for app ${appId} (${verifyExc.message}) -- cannot verify the new target landed")
         }
     }
-    def expectedTargets = _rmNormalizeRuleIdsForWrite(spec.ruleIds).collect { it?.toString() }.sort(false)
+    def expectedTargets = _rmNormalizeRuleIdsForWrite(spec.ruleIds, actSubType == "getSetPrivateBoolean").collect { it?.toString() }.sort(false)
     boolean targetsVerified = !budgetPaused && !verificationFetchFailed && verifiedTargets != null &&
         verifiedTargets.sort(false) == expectedTargets && fieldMismatches.isEmpty()
     int movesRemaining = movesUp - movesDone
@@ -6598,7 +6647,7 @@ Map _rmAddAction(Integer appId, Map actionSpec, boolean intraBatch = false, Set 
         fields = [
             "pvRuleType.@N": "Rule Machine",
             "pvTF.@N": !(actionSpec.value as Boolean),
-            "privateT.@N": _rmNormalizeRuleIdsForWrite(actionSpec.ruleIds ?: deviceIds)
+            "privateT.@N": _rmNormalizeRuleIdsForWrite(actionSpec.ruleIds ?: deviceIds, true)
         ]
     } else if (cap == "runRule") {
         actType = "rulesActs"
@@ -12314,7 +12363,8 @@ private Map _rmValidateRequiredExpressionSpec(Map exprSpec, String label, boolea
     //   - operators: ["AND", "OR", "XOR", ...]  (one per gap, length = conditions.size()-1)
     // Operators-list path supports mixed expressions like
     // "P1 AND P2 OR P3 XOR P4" where each gap has a different operator.
-    // RM 5.1's spec: AND/OR/XOR have equal precedence, evaluated left-to-right.
+    // RM 5.1 walks the operators strictly left to right: a true left side of OR or a false left
+    // side of AND ends the whole expression, so later terms are never read. XOR is undocumented.
     def opsList = null
     if (exprSpec.operators instanceof List) {
         opsList = (exprSpec.operators as List).collect { it?.toString()?.toUpperCase() }
@@ -15561,17 +15611,25 @@ def _applyNativeAppEdit(args) {
         def clickedUpdateRule = (button == "updateRule") || (implicitCommitButton == "updateRule")
         if (clickedUpdateRule) {
             def settleStatus = _rmCheckSubscriptionSettle(appId)
-            if (settleStatus?.unsettled) {
+            if (settleStatus?.unsettled && settleStatus.suppressedBy) {
+                // A retry cannot add subscriptions RM is withholding, and the rule is not incomplete.
+                result.subscriptionSettle = _rmSuppressedSettleText(settleStatus.suppressedBy)
+            } else if (settleStatus?.unsettled) {
                 mcpLog("info", "rm-native", "updateRule subscription settle lag on app ${appId} -- retrying")
                 _rmClickAppButton(appId, "updateRule")
+                def firstStatus = settleStatus
                 settleStatus = _rmCheckSubscriptionSettle(appId)
-                def trigCount = settleStatus.triggerCount
+                def trigCount = (settleStatus ?: firstStatus).triggerCount
                 def trigWord = trigCount == 1 ? "trigger" : "triggers"
                 // Discriminate on count, not on stringified word: trigWord=="trigger"
                 // could in theory drift if the assignment above changed, and at count==0
                 // ("triggers", plural by default) the "triggers are" verb is correct anyway.
                 def trigVerb = (trigCount == 1) ? "trigger is" : "triggers are"
-                result.subscriptionSettle = settleStatus?.unsettled ?
+                result.subscriptionSettle = (settleStatus?.unsettled && settleStatus.suppressedBy) ?
+                    _rmSuppressedSettleText(settleStatus.suppressedBy) :
+                    settleStatus == null ?
+                    "UNKNOWN: updateRule was retried but the follow-up statusJson read failed, so whether the ${trigCount == 1 ? 'trigger' : 'triggers'} subscribed is unverified. Inspect statusJson.eventSubscriptions before relying on the rule." :
+                    settleStatus.unsettled ?
                     "WARN: rule has ${trigCount} ${trigWord} but eventSubscriptions=0 after two updateRule clicks. The ${trigVerb} likely incomplete (missing tstate, attached-condition, or other required field) OR a hub timing race. Inspect statusJson.eventSubscriptions; if still empty, call hub_set_rule(button='updateRule') again or check the wizard for missing fields." :
                     "OK after auto-retry"
             } else if (settleStatus != null) {

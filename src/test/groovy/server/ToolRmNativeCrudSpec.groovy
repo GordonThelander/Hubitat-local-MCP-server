@@ -3026,7 +3026,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         thrownEx.message.contains("Unstubbed hubInternalGet")
     }
 
-    def "replaceActions with a bogus rule target is rejected BEFORE clearActions wipes the rule"() {
+    @spock.lang.Unroll
+    def "replaceActions with a bad rule target (#label) is rejected BEFORE clearActions wipes the rule"() {
         // Wipe-then-drop guard: the replaceActions path clears the rule's actions before re-adding
         // the incoming list, so a bogus rule target must be caught pre-flight (ahead of the clear)
         // or the rule is destroyed and then the item is dropped. Assert the reject envelope AND
@@ -3065,18 +3066,21 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
             [status: 200, location: null, data: '']
         }
 
-        when: "replaceActions carries a runRule action pointed at a non-existent rule id"
-        def result = script.toolSetRule([appId: 100,
-            replaceActions: [[capability: "runRule", ruleIds: [999999]]], confirm: true])
+        when: "replaceActions carries a rule-targeting action with a bad target"
+        def result = script.toolSetRule([appId: 100, replaceActions: [spec], confirm: true])
 
-        then: "the operation fails loud, naming the quoted missing id and steering to hub_list_rules"
+        then: "the operation fails loud with the target-specific message"
         result.success == false
-        result.error?.toString()?.contains("'999999'")
-        result.error?.toString()?.contains("does not exist")
-        result.error?.toString()?.contains("hub_list_rules")
+        expected.every { result.error?.toString()?.contains(it) }
 
         and: "clearActions never ran -- no trashActs submit POST fired, so the seeded action survives"
         !posts.any { it.path == "/installedapp/update/json" && it.body?.containsKey("settings[trashActs]") }
+
+        where:
+        label                  | spec                                                                 | expected
+        "missing id"           | [capability: "runRule", ruleIds: [999999]]                           | ["'999999'", "does not exist", "hub_list_rules"]
+        "runRule this-rule"    | [capability: "runRule", ruleIds: ["*"]]                              | ['"this rule" target', "only for privateBoolean"]
+        "privateBoolean mixed" | [capability: "privateBoolean", ruleIds: ["*", 999999], value: false] | ["'999999'", "does not exist"]
     }
 
     def "_rmNormalizeRuleIdsForWrite canonicalizes decimal-form ids and wraps a scalar"() {
@@ -3236,7 +3240,8 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         thrownEx.message.contains("Unstubbed hubInternalGet")
     }
 
-    def "patches replaceActions with a bogus rule target is rejected as a per-op failure, before clearActions"() {
+    @spock.lang.Unroll
+    def "patches replaceActions with a bad rule target (#label) is rejected as a per-op failure, before clearActions"() {
         // The patches path has a DIFFERENT error-capture shape than the top-level replaceActions:
         // a per-op try/catch turns the pre-flight throw into a {success:false} patch entry rather
         // than propagating. Assert the per-op failure AND that clearActions never ran.
@@ -3272,19 +3277,69 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         }
 
         when: "a patches batch's replaceActions op targets a non-existent rule id"
-        def result = script.toolSetRule([appId: 100,
-            patches: [[replaceActions: [[capability: "runRule", ruleIds: [999999]]]]], confirm: true])
+        def result = script.toolSetRule([appId: 100, patches: [[replaceActions: [spec]]], confirm: true])
 
-        then: "the replaceActions patch op reports success:false naming the quoted missing id and hub_list_rules (per-op catch shape)"
+        then: "the replaceActions patch op reports success:false with the target-specific message (per-op catch shape)"
         def rp = (result.patches as List)?.find { it.op == "replaceActions" }
         rp != null
         rp.success == false
-        rp.error?.toString()?.contains("'999999'")
-        rp.error?.toString()?.contains("does not exist")
-        rp.error?.toString()?.contains("hub_list_rules")
+        expected.every { rp.error?.toString()?.contains(it) }
 
         and: "clearActions never ran -- no trashActs submit POST fired, so the seeded action survives"
         !posts.any { it.path == "/installedapp/update/json" && it.body?.containsKey("settings[trashActs]") }
+
+        where:
+        label                  | spec                                                                 | expected
+        "missing id"           | [capability: "runRule", ruleIds: [999999]]                           | ["'999999'", "does not exist", "hub_list_rules"]
+        "runRule this-rule"    | [capability: "runRule", ruleIds: ["*"]]                              | ['"this rule" target', "only for privateBoolean"]
+        "privateBoolean mixed" | [capability: "privateBoolean", ruleIds: ["*", 999999], value: false] | ["'999999'", "does not exist"]
+    }
+
+    @spock.lang.Unroll
+    def "#route: a privateBoolean this-rule target passes the pre-clear guard"() {
+        given:
+        installRuleTargetStubs()
+        enableWrite()
+        def selectActionsSchema = [
+            [name: "actType.1", type: "enum", options: ["switchActs"]],
+            [name: "cancelTrash", type: "button"],
+            [name: "trashActs", type: "enum", multiple: true]
+        ]
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params ->
+            JsonOutput.toJson([
+                app: [id: 100, name: "Rule-5.1", label: "r", trueLabel: "r", installed: true, version: 7,
+                      appType: [name: "Rule-5.1", namespace: "hubitat"]],
+                configPage: [name: "selectActions", title: "Actions", error: null, sections: [[title: "", input: selectActionsSchema]]],
+                settings: ["actType.1": "switchActs"],
+                childApps: []
+            ])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100, [[name: "actType.1", value: "switchActs"]]) }
+        hubGet.register('/hub2/appsList') { params -> appsListWithRule(555) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+        def spec = [capability: "privateBoolean", ruleIds: ["*", 555], value: false]
+
+        when:
+        def result = null
+        try {
+            result = script.toolSetRule(route == "replaceActions" ?
+                [appId: 100, replaceActions: [spec], confirm: true] :
+                [appId: 100, patches: [[replaceActions: [spec]]], confirm: true])
+        } catch (Exception ignored) { /* the rebuild past the clear is unstubbed */ }
+
+        then: "no target refusal, and the guard let the clear run"
+        !result?.toString()?.contains('"this rule" target')
+        !result?.toString()?.contains("does not exist")
+        posts.any { it.path == "/installedapp/update/json" && it.body?.containsKey("settings[trashActs]") }
+
+        where:
+        route << ["replaceActions", "patches"]
     }
 
     @spock.lang.Unroll
@@ -4135,6 +4190,102 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.verifiedTargets == ["300"]
         result.success == true
         result.partial == false
+    }
+
+    def "modifyAction carries a mixed this-rule privateBoolean target ['*','1809'] through the rebuild"() {
+        given:
+        def ma = wireModifyActionTransport(100, [1, 2, 3],
+            ["actType.2": "rulesActs", "actSubType.2": "getSetPrivateBoolean", "privateT.2": ["*", "1809"],
+             "pvTF.2": "false", "pvRuleType.2": "Rule Machine",
+             "privateT.4": ["*", "1809"], "pvTF.4": "true"])
+        def specs = []
+        wireModifyAddLeg(ma, specs, 4)
+
+        when:
+        def result = script._rmModifyAction(100, 2, [value: false])
+
+        then:
+        specs[0].capability == "privateBoolean"
+        specs[0].ruleIds*.toString() == ["*", "1809"]
+        result.verifiedTargets == ["*", "1809"]
+        result.success == true
+    }
+
+    def "this-rule target '*' is kept for privateBoolean and refused with a named message elsewhere"() {
+        expect:
+        script._rmNormalizeRuleIdsForWrite(["*", 1809], true) == ["*", 1809]
+        script._rmValidateRuleTargetExists("privateBoolean", ["*"], [] as Set) == null
+        script._rmValidateRuleTargetExists("privateBoolean", ["*", "1809"], [1809] as Set) == null
+
+        when: "the rule list is unverifiable, shape checks still refuse"
+        script._rmValidateRuleTargetExists("runRule", ["*"], null)
+
+        then:
+        def eNull = thrown(IllegalArgumentException)
+        eNull.message.startsWith("runRule target '*' is Rule Machine")
+
+        when:
+        script._rmValidateRuleTargetExists("privateBoolean", ["*", "1810"], [1809] as Set)
+
+        then: "the '*' fast path does not skip the numeric id beside it"
+        def eMixed = thrown(IllegalArgumentException)
+        eMixed.message.contains("'1810'")
+        eMixed.message.contains("does not exist")
+
+        when:
+        script._rmValidateRuleTargetExists("runRule", ["*"], [1809] as Set)
+
+        then:
+        def e = thrown(IllegalArgumentException)
+        e.message.contains('"this rule" target')
+        e.message.contains("only for privateBoolean")
+        !e.message.contains("is not a valid numeric rule id")
+
+        when:
+        script._rmNormalizeRuleIdsForWrite(["*"])
+
+        then:
+        def e2 = thrown(IllegalArgumentException)
+        e2.message.startsWith("rule target '*' is Rule Machine")
+    }
+
+    @spock.lang.Unroll
+    def "#cap addAction with the this-rule target '*': #outcome"() {
+        given:
+        installRuleTargetStubs()
+        hubGet.register('/hub2/appsList') { params -> appsListWithRule(555) }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params -> ruleConfigJson(100, "r", [[name: "N", type: "button"]]) }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 -> posts << path; [status: 200, location: null, data: ''] }
+        def writes = []
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null, Map cache = null ->
+            writes << [field: key, value: value]
+            applied << key
+        }
+        Exception caught = null
+
+        when:
+        try { script._rmAddAction(100, actionSpec) }
+        catch (Exception e) { caught = e }
+
+        then:
+        if (written != null) {
+            assert writes.find { it.field?.toString()?.startsWith(fieldPrefix) }?.value == written
+        } else {
+            assert caught instanceof IllegalArgumentException
+            assert caught.message.contains('"this rule" target')
+            assert writes.isEmpty() && posts.isEmpty()
+        }
+
+        where:
+        cap              | fieldPrefix  | actionSpec                                                      | written     | outcome
+        "privateBoolean" | "privateT."  | [capability: "privateBoolean", ruleIds: ["*", 555.0], value: false] | ["*", 555] | "written mixed"
+        "privateBoolean" | "privateT."  | [capability: "privateBoolean", ruleIds: ["*"], value: true]       | ["*"]       | "written alone"
+        "runRule"        | "ruleAct."   | [capability: "runRule", ruleIds: ["*"]]                           | null        | "refused before any write"
     }
 
     def "modifyAction reposition soft-failure STOPS the move loop and flips success false with the verifyHint"() {
@@ -39022,6 +39173,121 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.subscriptionSettle?.contains("rule has 1 trigger but")
         result.subscriptionSettle?.contains("The trigger is likely incomplete")
         !result.subscriptionSettle?.contains("The triggers are likely incomplete")
+    }
+
+    def "subscriptionSettle reports SUPPRESSED without a second click when #gate"() {
+        given:
+        enableWrite()
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        List<Map> posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            JsonOutput.toJson([
+                installedApp: [id: 100, label: label],
+                appSettings: [[name: "tDev1", deviceIdsForDeviceList: [8]]],
+                eventSubscriptions: [],
+                scheduledJobs: [], appState: appState, childAppCount: 0, childDeviceCount: 0
+            ])
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, button: "updateRule", confirm: true])
+
+        then:
+        result.subscriptionSettle?.startsWith("SUPPRESSED:")
+        result.subscriptionSettle?.contains(reason)
+        !result.subscriptionSettle?.contains("likely incomplete")
+        posts.count { it.path == "/installedapp/btn" && it.body.name == "updateRule" } == 1
+
+        where:
+        gate                          | label                                                              | appState                                    | reason
+        "Required Expression false"   | "R <span style='color:red'>(Required Expression false)</span>"     | []                                          | "Required Expression is false"
+        "paused in appState"          | "R"                                                                | [[name: "paused", value: true]]             | "paused"
+        "stopped in appState"         | "R"                                                                | [[name: "stopped", value: true]]            | "stopped"
+    }
+
+    def "subscriptionSettle reports UNKNOWN, not a failure, when the post-retry status read fails"() {
+        given:
+        enableWrite()
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        // The read right after the automatic second updateRule click fails once.
+        int updateClicks = 0
+        boolean failNextRead = false
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/btn" && body?.name == "updateRule" && ++updateClicks == 2) failNextRead = true
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            if (failNextRead) {
+                failNextRead = false
+                throw new RuntimeException("statusJson read timed out")
+            }
+            JsonOutput.toJson([
+                installedApp: [id: 100, label: "r"],
+                appSettings: [[name: "tDev1", deviceIdsForDeviceList: [8]]],
+                eventSubscriptions: [],
+                scheduledJobs: [], appState: [], childAppCount: 0, childDeviceCount: 0
+            ])
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, button: "updateRule", confirm: true])
+
+        then:
+        updateClicks == 2
+        result.subscriptionSettle?.startsWith("UNKNOWN:")
+        result.subscriptionSettle?.contains("trigger subscribed is unverified")
+        !(result.error?.toString()?.contains("triggerCount"))
+    }
+
+    def "subscriptionSettle SUPPRESSED text falls back for an unmapped gate"() {
+        expect:
+        script._rmSuppressedSettleText("somethingNew").contains("RM reports the rule as inactive (somethingNew)")
+        !script._rmSuppressedSettleText("somethingNew").contains("null")
+    }
+
+    def "subscriptionSettle still WARNs when a rule is only NAMED like a decoration"() {
+        given:
+        enableWrite()
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            [status: 200, location: null, data: '']
+        }
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params ->
+            ruleConfigJson(100, "r", [[name: "updateRule", type: "button"]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params ->
+            JsonOutput.toJson([
+                installedApp: [id: 100, label: "Porch (Required Expression false)"],
+                appSettings: [[name: "tDev1", deviceIdsForDeviceList: [8]]],
+                eventSubscriptions: [],
+                scheduledJobs: [], appState: [], childAppCount: 0, childDeviceCount: 0
+            ])
+        }
+
+        when:
+        def result = script.toolSetRule([appId: 100, button: "updateRule", confirm: true])
+
+        then:
+        result.subscriptionSettle?.contains("The trigger is likely incomplete")
     }
 
     def "subscriptionSettle WARN message: plural 'triggers are' when triggerCount=2"() {
