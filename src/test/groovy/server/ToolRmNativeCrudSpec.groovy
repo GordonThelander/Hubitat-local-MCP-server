@@ -25795,6 +25795,114 @@ class ToolRmNativeCrudSpec extends ToolSpecBase {
         result.partial != true
     }
 
+    def "addAction setVariable sourceVariable into a String target uses valStringOp=Copy variable, not numOp"() {
+        // Captured from the RM UI on fw 2.5.1.183: a String target renders no numOp.<N>; its
+        // source picker is valStringOp.<N>, whose "Copy variable" option reveals xVar3.<N>
+        // (stored: valStringOp.1="Copy variable", xVar3.1="AMGateA_Shared"). Writing numOp for a
+        // String target is refused not_in_schema and leaves a partial row (issue #439).
+        // The stub reveals ONLY valStringOp for this target, and gates xVar3.1 on it.
+        given:
+        enableWrite()
+        def writtenFields = [:]
+        def fetchSeq = 0
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            if (path == "/installedapp/update/json") {
+                body?.each { k, v ->
+                    def key = _settingKeyOf(k)
+                    if (key != null) writtenFields[key] = v
+                }
+            }
+            [status: 200, location: null, data: '']
+        }
+        script.metaClass.getAllGlobalVars = { -> ["msg": [name: "msg", type: "string", value: "x"], "fallback": [name: "fallback", type: "string", value: "y"]] }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params ->
+            ruleConfigJson(100, "r", [[name: "actType.1", type: "enum", options: ["modeActs": "Set Mode / Variable"]]])
+        }
+        hubGet.register('/installedapp/configure/json/100/doActPage') { params ->
+            def seq = ++fetchSeq
+            def extraInputs = [
+                [name: "xVarV.1", type: "enum", options: ["msg": "msg"]],
+                [name: "valStringOp.1", type: "enum", options: ["Set string": "Set string", "Copy variable": "Copy variable"]]
+            ]
+            if (writtenFields["valStringOp.1"] == "Copy variable") {
+                extraInputs << [name: "xVar3.1", type: "enum", options: ["fallback": "fallback", "msg": "msg"]]
+            }
+            modeActsDoActPageJson(100, extraInputs, { seq })
+        }
+        hubGet.register('/installedapp/configure/json/100/mainPage') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+
+        when:
+        def result = script.toolSetRule([
+            appId: 100,
+            addAction: [capability: "setVariable", variable: "msg", sourceVariable: "fallback"],
+            confirm: true
+        ])
+
+        then: "the String selector is written, and numOp never is"
+        writtenFields["valStringOp.1"] == "Copy variable"
+        !writtenFields.containsKey("numOp.1")
+
+        and: "the source lands in the revealed xVar3.1"
+        writtenFields["xVar3.1"] == "fallback"
+
+        and: "the action bakes cleanly"
+        result.success == true
+        result.settingsSkipped == null || result.settingsSkipped.isEmpty()
+        result.partial != true
+    }
+
+    @spock.lang.Unroll
+    def "addAction setVariable sourceVariable into a #type target is refused before any write"() {
+        given:
+        enableWrite()
+        def posts = []
+        script.metaClass.uploadHubFile = { String fn, byte[] b -> }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << path
+            [status: 200, location: null, data: '']
+        }
+        script.metaClass.getAllGlobalVars = { -> ["flag": [name: "flag", type: type, value: null], "other": [name: "other", type: type, value: null]] }
+        hubGet.register('/installedapp/configure/json/100') { params -> ruleConfigJson(100, "r", []) }
+        hubGet.register('/installedapp/configure/json/100/selectActions') { params ->
+            ruleConfigJson(100, "r", [[name: "actType.1", type: "enum", options: ["modeActs": "Set Mode / Variable"]]])
+        }
+        hubGet.register('/installedapp/statusJson/100') { params -> statusJson(100) }
+
+        when:
+        def result = script.toolSetRule([
+            appId: 100,
+            addAction: [capability: "setVariable", variable: "flag", sourceVariable: "other"],
+            confirm: true
+        ])
+
+        then:
+        result.success == false
+        result.error?.contains("not supported yet")
+        result.error?.contains(type)
+        !posts.contains("/installedapp/update/json")
+
+        where:
+        type << ["boolean", "datetime"]
+    }
+
+    def "_rmAssertNumOpLanded names the selector field it checked"() {
+        when:
+        script._rmAssertNumOpLanded(3, [], [[key: "valStringOp.3", reason: "not_in_schema"]], "source-variable", "valStringOp")
+
+        then:
+        def e = thrown(IllegalArgumentException)
+        e.message.startsWith("setVariable: valStringOp.3 write did not land (reason: not_in_schema)")
+
+        when:
+        script._rmAssertNumOpLanded(3, ["numOp.3"], [], "source-variable")
+
+        then:
+        noExceptionThrown()
+    }
+
     def "addAction setVariable rejects missing variable field"() {
         given:
         enableWrite()

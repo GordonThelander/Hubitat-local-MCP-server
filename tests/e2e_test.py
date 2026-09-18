@@ -8407,6 +8407,7 @@ class TestRunner:
         var_name = f"{PREFIX}sv_modes"          # Number target
         str_var_name = f"{PREFIX}sv_str"        # String target (numeric-target-only reject)
         bool_var_name = f"{PREFIX}sv_bool"      # Boolean target (numeric-target-only reject)
+        str_src_name = f"{PREFIX}sv_str_src"    # String copy source (issue #439)
 
         # Create a var via hub_create_variable (guaranteed to CREATE a missing var in the hub
         # namespace, unlike hub_set_variable whose missing-var semantics are ambiguous), then wait
@@ -8455,6 +8456,7 @@ class TestRunner:
             {"name": var_name, "type": "Number", "value": "0"},
             {"name": str_var_name, "type": "String", "value": "init"},
             {"name": bool_var_name, "type": "Boolean", "value": "false"},
+            {"name": str_src_name, "type": "String", "value": "copied"},
         ])
         # The matrix is split across SMALL rules (<=3 setVariable actions each): the classic wizard
         # re-POSTs the FULL rule page per submitOnChange, so piling many actions into one rule trips
@@ -8668,6 +8670,33 @@ class TestRunner:
                     f"negative type-filter rejection did not name a filtered-attribute-enum frame: {neg}"
                 assert "tCustomAttr" in neg_err or "switch" in neg_err, \
                     f"negative rejection should name the attribute field or the requested attribute; error={neg_err}"
+
+                # sourceVariable into a String target (issue #439): a String var renders no numOp,
+                # so the copy goes through valStringOp="Copy variable", which reveals xVar3.<N>.
+                # Captured from the RM UI first; the persisted pair is the proof, not the envelope.
+                copy_entry = self._patch_rule(app_c, [
+                    {"addAction": {"capability": "setVariable", "variable": str_var_name,
+                                   "sourceVariable": str_src_name}},
+                ])[0]
+                assert copy_entry.get("success") is not False, \
+                    f"String-target sourceVariable copy failed: {copy_entry}"
+                copy_settings = self._get_persisted_rule_config(app_c).get("settings") or {}
+                copy_idx = next((str(k).split(".", 1)[1] for k, v in copy_settings.items()
+                                 if str(k).startswith("valStringOp.") and v == "Copy variable"), None)
+                assert copy_idx is not None, \
+                    f"no valStringOp.<N>='Copy variable' persisted for the String copy: {copy_settings}"
+                assert copy_settings.get(f"xVarV.{copy_idx}") == str_var_name \
+                    and copy_settings.get(f"xVar3.{copy_idx}") == str_src_name, \
+                    f"String copy target/source did not persist on index {copy_idx}: {copy_settings}"
+                assert f"numOp.{copy_idx}" not in copy_settings, \
+                    f"String copy wrongly wrote numOp.{copy_idx}: {copy_settings}"
+                # A Boolean target's copy picker is uncaptured, so it is refused before any write.
+                bool_copy = self._patch_rule(app_c, [
+                    {"addAction": {"capability": "setVariable", "variable": bool_var_name,
+                                   "sourceVariable": bool_var_name}},
+                ], expected_refusals=1)[0]
+                assert "not supported yet" in (bool_copy.get("error") or ""), \
+                    f"Boolean-target copy should be refused by name, got: {bool_copy}"
                 self._assert_rule_healthy(app_c)
             finally:
                 self._delete_native(app_c)
@@ -8675,6 +8704,7 @@ class TestRunner:
             self._delete_variable_safe(var_name)
             self._delete_variable_safe(str_var_name)
             self._delete_variable_safe(bool_var_name)
+            self._delete_variable_safe(str_src_name)
 
     @test("native_apps")
     def test_set_rule_walker_enum_required_expression(self) -> None:
