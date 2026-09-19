@@ -8407,7 +8407,8 @@ class TestRunner:
         var_name = f"{PREFIX}sv_modes"          # Number target
         str_var_name = f"{PREFIX}sv_str"        # String target (numeric-target-only reject)
         bool_var_name = f"{PREFIX}sv_bool"      # Boolean target (numeric-target-only reject)
-        str_src_name = f"{PREFIX}sv_str_src"    # String copy source (issue #439)
+        str_src_name = f"{PREFIX}sv_str_src"    # String copy source
+        num_src_name = f"{PREFIX}sv_num_src"    # Number copy source (Rule D runs the copy)
 
         # Create a var via hub_create_variable (guaranteed to CREATE a missing var in the hub
         # namespace, unlike hub_set_variable whose missing-var semantics are ambiguous), then wait
@@ -8457,6 +8458,7 @@ class TestRunner:
             {"name": str_var_name, "type": "String", "value": "init"},
             {"name": bool_var_name, "type": "Boolean", "value": "false"},
             {"name": str_src_name, "type": "String", "value": "copied"},
+            {"name": num_src_name, "type": "Number", "value": "7"},
         ])
         # The matrix is split across SMALL rules (<=3 setVariable actions each): the classic wizard
         # re-POSTs the FULL rule page per submitOnChange, so piling many actions into one rule trips
@@ -8671,9 +8673,9 @@ class TestRunner:
                 assert "tCustomAttr" in neg_err or "switch" in neg_err, \
                     f"negative rejection should name the attribute field or the requested attribute; error={neg_err}"
 
-                # sourceVariable into a String target (issue #439): a String var renders no numOp,
-                # so the copy goes through valStringOp="Copy variable", which reveals xVar3.<N>.
-                # Captured from the RM UI first; the persisted pair is the proof, not the envelope.
+                # sourceVariable into a String target: a String var renders no numOp, so the copy
+                # goes through valStringOp="Copy variable", which reveals xVar3.<N>. The persisted
+                # settings are the proof, not the envelope.
                 copy_entry = self._patch_rule(app_c, [
                     {"addAction": {"capability": "setVariable", "variable": str_var_name,
                                    "sourceVariable": str_src_name}},
@@ -8691,8 +8693,8 @@ class TestRunner:
                     and copy_settings.get(f"xVar3.{copy_idx}") == str_src_name, \
                     f"String copy selector/target/source did not persist on index {copy_idx}: {copy_settings}"
                 # What the copy itself WROTE. The persisted rule can still hold numOp/customDev at
-                # this index: the refused fromDevice case above leaves settings without an actType,
-                # so the next add reuses that index.
+                # this index: the refused numeric-target fromDevice case above (the switch
+                # attribute) leaves settings without an actType, so the next add reuses that index.
                 copy_applied = [str(k) for k in (copy_entry.get("settingsApplied") or [])]
                 assert not any(k.startswith("numOp.") for k in copy_applied), \
                     f"String copy wrote a numOp field: settingsApplied={copy_applied}"
@@ -8706,11 +8708,41 @@ class TestRunner:
                 self._assert_rule_healthy(app_c)
             finally:
                 self._delete_native(app_c)
+
+            # Rule D: Number copy, then RUN the actions. The persisted settings alone do not prove
+            # it: without valOffset.<N> RM throws "Ambiguous method overloading ... Long#plus" at
+            # run time and leaves the target unchanged, although the rule saves and reads healthy.
+            self.client.call_tool("hub_manage_variables", {
+                "tool": "hub_set_variable", "args": {"name": var_name, "value": 0}})
+            copy_spec = {"capability": "setVariable", "variable": var_name,
+                         "sourceVariable": num_src_name}
+            app_d = self._create_native_rule("SetVarNumCopy", {"addActions": [copy_spec]})
+            try:
+                d_settings = self._get_persisted_rule_config(app_d).get("settings") or {}
+                d_idx = next((str(k).split(".", 1)[1] for k, v in d_settings.items()
+                              if str(k).startswith("numOp.") and v == "variable"), None)
+                assert d_idx is not None, f"no numOp.<N>='variable' persisted: {d_settings}"
+                assert d_settings.get(f"xVar3.{d_idx}") == num_src_name                     and str(d_settings.get(f"valOffset.{d_idx}")) in ("0", "0.0"),                     f"Number copy source/offset did not persist on index {d_idx}: {d_settings}"
+                self._assert_rule_healthy(app_d)
+                self.client.call_tool("hub_manage_rule_machine", {
+                    "tool": "hub_call_rule", "args": {"ruleId": app_d, "action": "actions"}})
+                got = None
+                deadline = time.time() + 15.0
+                while time.time() < deadline:
+                    got = self.client.call_tool("hub_manage_variables", {
+                        "tool": "hub_get_variable", "args": {"name": var_name}}).get("value")
+                    if str(got) in ("7", "7.0"):
+                        break
+                    time.sleep(1.0)
+                assert str(got) in ("7", "7.0"),                     f"running the Number copy did not set {var_name} to 7 (got {got!r})"
+            finally:
+                self._delete_native(app_d)
         finally:
             self._delete_variable_safe(var_name)
             self._delete_variable_safe(str_var_name)
             self._delete_variable_safe(bool_var_name)
             self._delete_variable_safe(str_src_name)
+            self._delete_variable_safe(num_src_name)
 
     @test("native_apps")
     def test_set_rule_walker_enum_required_expression(self) -> None:
