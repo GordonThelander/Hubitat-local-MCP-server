@@ -154,8 +154,9 @@ Maps to `actType=modeActs`, `actSubType=getSetVariable`.
 `value`, `sourceVariable`, `fromDevice`, and `math` are mutually exclusive; exactly
 one source mode is required. The `value` path always writes `numOp=number` +
 `valNumber` -- the hub's wire format does not expose separate type-specific constant
-slots for string/boolean/datetime at this subtype. Use `sourceVariable` to copy from a
-Number, Decimal or String variable, or `rawSettings` to supply advanced wire fields directly.
+slots for string/boolean/datetime at this subtype. Use `sourceVariable` to copy into a
+Number, Decimal or String target, or `rawSettings` to supply advanced wire fields directly.
+The restriction is on the target; the source is validated separately against the revealed enum.
 A `sourceVariable` copy into a Boolean or DateTime target is refused before any write: their
 copy picker has not been captured, and writing `numOp` for them is rejected `not_in_schema`.
 
