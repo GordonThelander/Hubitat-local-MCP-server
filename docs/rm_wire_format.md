@@ -160,7 +160,9 @@ The restriction is on the target; the source is validated separately against the
 A `sourceVariable` copy into a Boolean or DateTime target is refused before any write: their
 copy picker has not been captured, and writing `numOp` for them is rejected `not_in_schema`.
 
-**Reveal order (all source modes write `xVarV.<N>` then `numOp.<N>` first):**
+**Reveal order (every mode writes `xVarV.<N>` first, then its selector: `numOp.<N>` for a Number/Decimal target, `valStringOp.<N>` for a String target):**
+- `sourceVariable`, Number/Decimal target: `numOp="variable"` -> reveals `xVar3.<N>` -> write the source name.
+- `sourceVariable`, String target: `valStringOp.<N>="Copy variable"` -> reveals `xVar3.<N>` -> write the source name. `numOp.<N>` is never rendered for a String target, so writing it fails `not_in_schema`.
 - `fromDevice`: `numOp="device attribute"` -> reveals `customDev.<N>`; write device -> reveals `tCustomAttr.<N>` (filtered) -> write attribute.
 - `math`: `numOp="variable math"` -> reveals `xVar3.<N>` + `valMathOp.<N>`; a `(constant)` first operand reveals `valConst.<N>`; a binary operator reveals `xVar4.<N>`; a `(constant)` second operand reveals `valConst2.<N>`. Unary operators stop after the operator write.
 
