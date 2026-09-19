@@ -8681,15 +8681,21 @@ class TestRunner:
                 assert copy_entry.get("success") is not False, \
                     f"String-target sourceVariable copy failed: {copy_entry}"
                 copy_settings = self._get_persisted_rule_config(app_c).get("settings") or {}
-                copy_idx = next((str(k).split(".", 1)[1] for k, v in copy_settings.items()
-                                 if str(k).startswith("valStringOp.") and v == "Copy variable"), None)
+                copy_idx = copy_entry.get("actionIndex") or next(
+                    (str(k).split(".", 1)[1] for k, v in copy_settings.items()
+                     if str(k).startswith("valStringOp.") and v == "Copy variable"), None)
                 assert copy_idx is not None, \
                     f"no valStringOp.<N>='Copy variable' persisted for the String copy: {copy_settings}"
-                assert copy_settings.get(f"xVarV.{copy_idx}") == str_var_name \
+                assert copy_settings.get(f"valStringOp.{copy_idx}") == "Copy variable" \
+                    and copy_settings.get(f"xVarV.{copy_idx}") == str_var_name \
                     and copy_settings.get(f"xVar3.{copy_idx}") == str_src_name, \
-                    f"String copy target/source did not persist on index {copy_idx}: {copy_settings}"
-                assert f"numOp.{copy_idx}" not in copy_settings, \
-                    f"String copy wrongly wrote numOp.{copy_idx}: {copy_settings}"
+                    f"String copy selector/target/source did not persist on index {copy_idx}: {copy_settings}"
+                # What the copy itself WROTE. The persisted rule can still hold numOp/customDev at
+                # this index: the refused fromDevice case above leaves settings without an actType,
+                # so the next add reuses that index.
+                copy_applied = [str(k) for k in (copy_entry.get("settingsApplied") or [])]
+                assert not any(k.startswith("numOp.") for k in copy_applied), \
+                    f"String copy wrote a numOp field: settingsApplied={copy_applied}"
                 # A Boolean target's copy picker is uncaptured, so it is refused before any write.
                 bool_copy = self._patch_rule(app_c, [
                     {"addAction": {"capability": "setVariable", "variable": bool_var_name,
@@ -15019,9 +15025,11 @@ class TestRunner:
         for var_name in list(self.created_variable_names):
             try:
                 print(f"  Deleting tracked variable {var_name}")
+                # force: teardown must not be stopped by the in-use refusal, which can still
+                # see a registration from a rule deleted moments earlier.
                 self.client.call_tool("hub_manage_variables", {
                     "tool": "hub_delete_variable",
-                    "args": {"name": var_name, "confirm": True},
+                    "args": {"name": var_name, "confirm": True, "force": True},
                 })
             except Exception as exc:
                 print(f"  [WARN] Failed to delete variable {var_name}: {exc}")
